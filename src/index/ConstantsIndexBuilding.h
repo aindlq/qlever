@@ -66,21 +66,21 @@ constexpr inline std::string_view QLEVER_INTERNAL_INDEX_INFIX = ".internal";
 // unique elements of the vocabulary are identified via hash maps. Typically, 6
 // is a good value. On systems with very few CPUs, a lower value might be
 // beneficial.
-constexpr inline size_t NUM_PARALLEL_ITEM_MAPS = 10;
+constexpr inline size_t NUM_PARALLEL_ITEM_MAPS = 24;
 
 // The number of threads that are parsing in parallel, when the parallel Turtle
 // parser is used.
-constexpr inline size_t NUM_PARALLEL_PARSER_THREADS = 8;
+constexpr inline size_t NUM_PARALLEL_PARSER_THREADS = 24;
 
 // Increasing the following two constants increases the RAM usage without much
 // benefit to the performance.
 
 // The number of unparsed blocks of triples, that may wait for parsing at the
 // same time
-constexpr inline size_t QUEUE_SIZE_BEFORE_PARALLEL_PARSING = 10;
+constexpr inline size_t QUEUE_SIZE_BEFORE_PARALLEL_PARSING = 24;
 // The number of parsed blocks of triples, that may wait for parsing at the same
 // time
-constexpr inline size_t QUEUE_SIZE_AFTER_PARALLEL_PARSING = 10;
+constexpr inline size_t QUEUE_SIZE_AFTER_PARALLEL_PARSING = 24;
 
 // The blocksize parameter of the parallel vocabulary merging. Higher values
 // mean higher memory consumption, whereas a too low value will impact the
