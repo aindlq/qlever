@@ -7,6 +7,8 @@
 
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_join.h>
+#include <absl/strings/strip.h>
+#include <absl/strings/ascii.h>
 
 #include "engine/CallFixedSize.h"
 #include "engine/ExportQueryExecutionTrees.h"
@@ -32,14 +34,22 @@ Service::Service(QueryExecutionContext* qec,
 // ____________________________________________________________________________
 std::string Service::getCacheKeyImpl() const {
   if (RuntimeParameters().get<"cache-service-results">()) {
+    auto trimmedLines =
+      absl::StrSplit(parsedServiceClause_.graphPatternAsString_, '\n');
+
+    // The absl::StrJoin function can take a "formatter" lambda.
+    std::string trimmedGraphPattern = absl::StrJoin(
+      trimmedLines, "\n", [](std::string* out, std::string_view line) {
+        absl::StrAppend(out, absl::StripAsciiWhitespace(line));
+      });
+
     return absl::StrCat(
-        "SERVICE ", parsedServiceClause_.silent_ ? "SILENT " : "",
-        parsedServiceClause_.serviceIri_.toStringRepresentation(), " {\n",
-        parsedServiceClause_.graphPatternAsString_, "\n}");
+      "SERVICE ", parsedServiceClause_.silent_ ? "SILENT " : "",
+      parsedServiceClause_.serviceIri_.toStringRepresentation(), " {\n",
+      trimmedGraphPattern, "\n}");
   }
   return absl::StrCat("SERVICE ", cacheBreaker_);
 }
-
 // ____________________________________________________________________________
 std::string Service::getDescriptor() const {
   return absl::StrCat(
