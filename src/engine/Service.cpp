@@ -35,7 +35,6 @@ std::string Service::getCacheKeyImpl() const {
     return absl::StrCat(
         "SERVICE ", parsedServiceClause_.silent_ ? "SILENT " : "",
         parsedServiceClause_.serviceIri_.toStringRepresentation(), " {\n",
-        parsedServiceClause_.prologue_, "\n",
         parsedServiceClause_.graphPatternAsString_, "\n}");
   }
   return absl::StrCat("SERVICE ", cacheBreaker_);

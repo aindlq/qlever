@@ -584,7 +584,6 @@ TEST_F(ServiceTest, getCacheKeyWithCaching) {
     EXPECT_THAT(service.getCacheKey(),
                 AllOf(StartsWith("SERVICE"), Not(HasSubstr("SILENT")),
                       HasSubstr("<http://localhorst/api>"),
-                      HasSubstr("PREFIX doof: <http://doof.org>"),
                       HasSubstr(parsedServiceClause.graphPatternAsString_)));
   }
   {
@@ -607,7 +606,6 @@ TEST_F(ServiceTest, getCacheKeyWithCaching) {
     EXPECT_THAT(service.getCacheKey(),
                 AllOf(StartsWith("SERVICE"), HasSubstr("SILENT"),
                       HasSubstr("<http://localhorst/api>"),
-                      HasSubstr("PREFIX doof: <http://doof.org>"),
                       HasSubstr(parsedServiceClause.graphPatternAsString_)));
   }
 }
