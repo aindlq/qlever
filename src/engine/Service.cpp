@@ -6,8 +6,11 @@
 #ifndef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
 #include "engine/Service.h"
 
+#include <cstring>
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_join.h>
+#include <absl/strings/strip.h>
+#include <absl/strings/ascii.h>
 
 #include "backports/StartsWithAndEndsWith.h"
 #include "engine/CallFixedSize.h"
@@ -39,15 +42,27 @@ Service::Service(QueryExecutionContext* qec,
 // ____________________________________________________________________________
 std::string Service::getCacheKeyImpl() const {
   if (getRuntimeParameter<&RuntimeParameters::cacheServiceResults_>()) {
+    // Split the graph pattern into individual lines.
+    auto trimmedLines =
+      absl::StrSplit(parsedServiceClause_.graphPatternAsString_, '\n');
+
+    // Join the lines back together, but trim the whitespace from each line
+    // before joining. This makes the cache key independent of formatting.
+    std::string trimmedGraphPattern = absl::StrJoin(
+      trimmedLines, "\n", [](std::string* out, std::string_view line) {
+        absl::StrAppend(out, absl::StripAsciiWhitespace(line));
+      });
+
+    // Use normalized `trimmedGraphPattern` to build the cache key.
     return absl::StrCat(
-        "SERVICE ", parsedServiceClause_.silent_ ? "SILENT " : "",
-        parsedServiceClause_.serviceIri_.toStringRepresentation(), " {\n",
-        parsedServiceClause_.prologue_, "\n",
-        parsedServiceClause_.graphPatternAsString_, "\n}");
+      "SERVICE ", parsedServiceClause_.silent_ ? "SILENT " : "",
+      parsedServiceClause_.serviceIri_.toStringRepresentation(), " {\n",
+      trimmedGraphPattern, "\n}");
   }
+
+  // If caching is disabled, this part remains the same.
   return absl::StrCat("SERVICE ", cacheBreaker_);
 }
-
 // ____________________________________________________________________________
 std::string Service::getDescriptor() const {
   return absl::StrCat(
