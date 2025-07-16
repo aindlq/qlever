@@ -55,7 +55,7 @@ class RdfParserBase {
   // How to handle integer overflow and invalid literals (see below).
   TurtleParserIntegerOverflowBehavior integerOverflowBehavior_ =
       TurtleParserIntegerOverflowBehavior::Error;
-  bool invalidLiteralsAreSkipped_ = false;
+  bool invalidLiteralsAreSkipped_ = true;
 
   const EncodedIriManager* encodedIriManager_;
 
