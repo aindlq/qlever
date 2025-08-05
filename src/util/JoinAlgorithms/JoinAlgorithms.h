@@ -505,7 +505,9 @@ Iterator simd_lower_bound_avx512(Iterator begin, Iterator end,
 }
 
 // AVX-512 implementation.
-CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection, typename Action, typename ElementFromSmallerNotFoundAction, typename CheckCancellation)
+template <typename RangeSmaller, typename RangeLarger, typename Projection,
+          typename Action, typename ElementFromSmallerNotFoundAction,
+          typename CheckCancellation>
 void gallopingJoin_AVX512_impl(
     const RangeSmaller& smaller, const RangeLarger& larger,
     Projection const& projection, Action const& action,
@@ -602,7 +604,9 @@ void gallopingJoin_AVX512_impl(
 
 #if defined(__AVX2__)
 // AVX2 implementation.
-CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection, typename Action, typename ElementFromSmallerNotFoundAction, typename CheckCancellation)
+template <typename RangeSmaller, typename RangeLarger, typename Projection,
+          typename Action, typename ElementFromSmallerNotFoundAction,
+          typename CheckCancellation>
 void gallopingJoin_AVX2_impl(
     const RangeSmaller& smaller, const RangeLarger& larger,
     Projection const& projection, Action const& action,
@@ -719,7 +723,9 @@ void gallopingJoin_AVX2_impl(
 #endif
 
 // Scalar fallback implementation.
-CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection, typename Action, typename ElementFromSmallerNotFoundAction, typename CheckCancellation)
+template <typename RangeSmaller, typename RangeLarger, typename Projection,
+          typename Action, typename ElementFromSmallerNotFoundAction,
+          typename CheckCancellation>
 void gallopingJoin_Scalar_impl(
     const RangeSmaller& smaller, const RangeLarger& larger,
     Projection const& projection, Action const& action,
