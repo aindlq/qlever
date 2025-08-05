@@ -317,7 +317,7 @@ void Join::join(const IdTable& a, const IdTable& b, IdTable* result) const {
       keepJoinColumn_);
   
   // Create a generic projection to extract the uint64_t value from an Id.
-  auto idProjection = [](const Id& id) { return id.value(); };
+  auto idProjection = [](const Id& id) { return id.getBits(); };
 
   // The addRow action needs to know the beginning of the original columns
   // to calculate the row index.
