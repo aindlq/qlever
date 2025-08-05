@@ -581,13 +581,11 @@ void gallopingJoin_AVX512_impl(
     auto endSameLarge = std::find_if_not(
         itLarge, endLarge, [&](const auto& row) { return eq(row, *itSmall); });
 
+    const size_t numLarge = std::distance(itLarge, endSameLarge);
     for (auto tempItSmall = itSmall; tempItSmall != endSameSmall;
          ++tempItSmall) {
       checkCancellation();
-      for (auto innerItLarge = itLarge; innerItLarge != endSameLarge;
-           ++innerItLarge) {
-        action(tempItSmall, innerItLarge);
-      }
+      action(tempItSmall, itLarge, numLarge);
     }
     itSmall = endSameSmall;
     itLarge = endSameLarge;
@@ -701,13 +699,11 @@ void gallopingJoin_AVX2_impl(
     auto endSameLarge = std::find_if_not(
         itLarge, endLarge, [&](const auto& row) { return eq(row, *itSmall); });
 
+    const size_t numLarge = std::distance(itLarge, endSameLarge);
     for (auto tempItSmall = itSmall; tempItSmall != endSameSmall;
          ++tempItSmall) {
       checkCancellation();
-      for (auto innerItLarge = itLarge; innerItLarge != endSameLarge;
-           ++innerItLarge) {
-        action(tempItSmall, innerItLarge);
-      }
+      action(tempItSmall, itLarge, numLarge);
     }
     itSmall = endSameSmall;
     itLarge = endSameLarge;
