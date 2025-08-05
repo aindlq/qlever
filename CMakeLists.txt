@@ -129,6 +129,15 @@ FetchContent_Declare(
 add_compile_definitions(SPATIALJOIN_NO_BZIP2=True SPATIALJOIN_NO_ZLIB=True)
 
 ################################
+# x86-simd-sort
+################################
+FetchContent_Declare(
+        x86-simd-sort
+        GIT_REPOSITORY https://github.com/intel/x86-simd-sort.git
+        GIT_TAG 8a7208187d99f0cb67e38c57ab1c7c85aad07aca
+)
+
+################################
 # Threading
 ################################
 find_package(Threads REQUIRED)
@@ -348,7 +357,7 @@ FetchContent_Declare(
 ################################
 # Apply FetchContent
 ################################
-FetchContent_MakeAvailable(googletest ctre abseil re2 fsst s2 nlohmann-json antlr range-v3 spatialjoin)
+FetchContent_MakeAvailable(googletest ctre abseil re2 fsst s2 nlohmann-json antlr range-v3 spatialjoin x86-simd-sort)
 # Disable some warnings in RE2 and GTEST
 target_compile_options(s2 PRIVATE -Wno-sign-compare -Wno-unused-parameter -Wno-class-memaccess -Wno-comment -Wno-redundant-move -Wno-unknown-warning-option -Wno-maybe-uninitialized -Wno-class-memaccess -Wno-unused-but-set-variable -Wno-unused-function)
 target_compile_options(re2 PRIVATE -Wno-unused-parameter)
@@ -360,6 +369,7 @@ target_compile_options(fsst PRIVATE -Wno-extra -Wno-all -Wno-error)
 target_compile_options(fsst12 PRIVATE -Wno-extra -Wno-all -Wno-error)
 include_directories(${fsst_SOURCE_DIR})
 include_directories(${range-v3_SOURCE_DIR}/include)
+include_directories(${x86-simd-sort_SOURCE_DIR}/include)
 target_compile_options(antlr4_static PRIVATE -Wno-all -Wno-extra -Wno-error -Wno-deprecated-declarations)
 # Only required because a lot of classes that do not explicitly link against antlr4_static use the headers.
 include_directories(SYSTEM "${antlr_SOURCE_DIR}/runtime/Cpp/runtime/src")

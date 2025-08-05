@@ -11,6 +11,9 @@
 #include "engine/idTable/IdTable.h"
 #include "global/Constants.h"
 #include "util/Log.h"
+#if defined(__AVX512F__) || defined(__AVX2__)
+#include "x86simdsort-static-incl.h"
+#endif
 
 class Engine {
  public:
@@ -18,6 +21,34 @@ class Engine {
   static void sort(IdTable* tab, const size_t keyColumn) {
     LOG(DEBUG) << "Sorting " << tab->size() << " elements ..." << std::endl;
     IdTableStatic<WIDTH> stab = std::move(*tab).toStatic<WIDTH>();
+
+#if defined(__AVX512F__) || defined(__AVX2__)
+    if constexpr (USE_SIMD_SORT) {
+      if (keyColumn < stab.numColumns()) {
+        LOG(DEBUG) << "Using SIMD sort." << std::endl;
+        auto keyColData = (uint64_t*)stab.getColumn(keyColumn).data();
+        auto permutation = x86simdsortStatic::argsort(keyColData, stab.size());
+
+        IdTableStatic<WIDTH> sortedStab(stab.getAllocator());
+        sortedStab.resize(stab.size());
+        // TODO<joka921> This permutation can also be parallelized.
+        for (size_t i = 0; i < WIDTH; ++i) {
+          auto oldColumn = stab.getColumn(i);
+          auto newColumn = sortedStab.getColumn(i);
+          for (size_t j = 0; j < stab.size(); ++j) {
+            newColumn[j] = oldColumn[permutation[j]];
+          }
+        }
+        stab = std::move(sortedStab);
+        *tab = std::move(stab).toDynamic();
+        LOG(TRACE) << "Sort done.\n";
+        return;
+      }
+    }
+#endif
+
+    // Fallback to parallel or standard sort.
+    LOG(DEBUG) << "Falling back to parallel/standard sort." << std::endl;
     if constexpr (USE_PARALLEL_SORT) {
       ad_utility::parallel_sort(
           stab.begin(), stab.end(),
