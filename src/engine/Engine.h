@@ -12,7 +12,7 @@
 #include "global/Constants.h"
 #include "util/Log.h"
 #if defined(__AVX512F__) || defined(__AVX2__)
-#include "x86simdsort-static-incl.h"
+#include <x86simdsort-static-incl.h>
 #endif
 
 class Engine {
