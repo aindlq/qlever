@@ -9,6 +9,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <immintrin.h>
+#include <limits>
 #include <optional>
 #include <ranges>
 
@@ -456,6 +458,484 @@ CPP_template(typename RangeSmaller, typename RangeLarger, typename LessThan,
     }
   }
 }
+
+namespace detail {
+/// The actual implementations of the galloping join for different SIMD levels.
+/// These are dispatched by the public `gallopingJoin_SIMD` function.
+
+#if defined(__AVX512F__)
+// AVX-512 implementation.
+CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection,
+             typename Action, typename ElementFromSmallerNotFoundAction,
+             typename CheckCancellation)
+void gallopingJoin_AVX512_impl(
+    const RangeSmaller& smaller, const RangeLarger& larger,
+    Projection const& projection, Action const& action,
+    ElementFromSmallerNotFoundAction elementFromSmallerNotFoundAction,
+    CheckCancellation checkCancellation) {
+  auto itSmall = std::begin(smaller);
+  auto endSmall = std::end(smaller);
+  auto itLarge = std::begin(larger);
+  auto endLarge = std::end(larger);
+
+  if (itSmall == endSmall || itLarge == endLarge) {
+    if constexpr (!ad_utility::isSimilar<ElementFromSmallerNotFoundAction,
+                                           Noop>) {
+      while (itSmall != endSmall) {
+        elementFromSmallerNotFoundAction(itSmall);
+        ++itSmall;
+      }
+    }
+    return;
+  }
+
+  auto lessThan = [&](const auto& a, const auto& b) {
+    return projection(a) < projection(b);
+  };
+  auto eq = [&](const auto& a, const auto& b) {
+    return projection(a) == projection(b);
+  };
+
+  auto exponentialSearch = [&checkCancellation, &lessThan, &endLarge](
+                               auto itL, auto itS) {
+    checkCancellation();
+    size_t step = 1;
+    auto lower = itL;
+    while (lessThan(*itL, *itS)) {
+      lower = itL;
+      itL += step;
+      step *= 2;
+      if (itL >= endLarge) {
+        return std::pair{lower, endLarge};
+      }
+    }
+    return std::pair{lower, std::min(itL + 1, endLarge)};
+  };
+
+  // Vectorized binary search using AVX-512. It uses a standard binary search
+  // to narrow down the range to 8 elements, then uses a single SIMD
+  // comparison and a popcount to find the exact position.
+  auto simd_lower_bound_avx512 =
+      [&projection](auto begin, auto end,
+                    uint64_t needle_key) -> decltype(begin) {
+    constexpr size_t V = 8;
+    auto len = std::distance(begin, end);
+
+    while (len > V) {
+      auto half = len / 2;
+      auto mid = begin + half;
+      if (projection(*mid) < needle_key) {
+        begin = mid + 1;
+        len = len - half - 1;
+      } else {
+        end = mid;
+        len = half;
+      }
+    }
+
+    if (len > 0) {
+      uint64_t data[V];
+      for (size_t i = 0; i < len; ++i) {
+        data[i] = projection(*(begin + i));
+      }
+      // Pad with max value to ensure elements outside the range are not
+      // considered.
+      for (size_t i = len; i < V; ++i) {
+        data[i] = std::numeric_limits<uint64_t>::max();
+      }
+
+      __m512i v_data = _mm512_loadu_si512(data);
+      __m512i v_needle = _mm512_set1_epi64(needle_key);
+
+      // Create a mask where the i-th bit is 1 if data[i] < needle_key.
+      __mmask8 less_mask = _mm512_cmplt_epu64_mask(v_data, v_needle);
+
+      // The number of elements smaller than the needle is the popcount of the
+      // mask. This is exactly the offset for the lower_bound.
+      return begin + _mm_popcnt_u32(less_mask);
+    }
+
+    return begin;
+  };
+
+  while (itSmall < endSmall && itLarge < endLarge) {
+    checkCancellation();
+    const auto& elLarge = *itLarge;
+    while (lessThan(*itSmall, elLarge)) {
+      if constexpr (!ad_utility::isSimilar<ElementFromSmallerNotFoundAction,
+                                           Noop>) {
+        elementFromSmallerNotFoundAction(itSmall);
+      }
+      ++itSmall;
+      if (itSmall >= endSmall) {
+        return;
+      }
+    }
+
+    auto [lower, upper] = exponentialSearch(itLarge, itSmall);
+    const uint64_t needle_key = projection(*itSmall);
+
+    itLarge = simd_lower_bound_avx512(lower, upper, needle_key);
+
+    if (itLarge == endLarge) {
+      break;
+    }
+    checkCancellation();
+
+    auto endSameSmall = std::find_if_not(
+        itSmall, endSmall, [&](const auto& row) { return eq(row, *itLarge); });
+    auto endSameLarge = std::find_if_not(
+        itLarge, endLarge, [&](const auto& row) { return eq(row, *itSmall); });
+
+    for (auto tempItSmall = itSmall; tempItSmall != endSameSmall;
+         ++tempItSmall) {
+      checkCancellation();
+      for (auto innerItLarge = itLarge; innerItLarge != endSameLarge;
+           ++innerItLarge) {
+        action(tempItSmall, innerItLarge);
+      }
+    }
+    itSmall = endSameSmall;
+    itLarge = endSameLarge;
+  }
+  if constexpr (!ad_utility::isSimilar<ElementFromSmallerNotFoundAction,
+                                       Noop>) {
+    while (itSmall != endSmall) {
+      elementFromSmallerNotFoundAction(itSmall);
+      ++itSmall;
+    }
+  }
+}
+#endif
+
+#if defined(__AVX2__)
+// AVX2 implementation.
+CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection,
+             typename Action, typename ElementFromSmallerNotFoundAction,
+             typename CheckCancellation)
+void gallopingJoin_AVX2_impl(
+    const RangeSmaller& smaller, const RangeLarger& larger,
+    Projection const& projection, Action const& action,
+    ElementFromSmallerNotFoundAction elementFromSmallerNotFoundAction,
+    CheckCancellation checkCancellation) {
+  auto itSmall = std::begin(smaller);
+  auto endSmall = std::end(smaller);
+  auto itLarge = std::begin(larger);
+  auto endLarge = std::end(larger);
+
+  if (itSmall == endSmall || itLarge == endLarge) {
+    if constexpr (!ad_utility::isSimilar<ElementFromSmallerNotFoundAction,
+                                           Noop>) {
+      while (itSmall != endSmall) {
+        elementFromSmallerNotFoundAction(itSmall);
+        ++itSmall;
+      }
+    }
+    return;
+  }
+
+  auto lessThan = [&](const auto& a, const auto& b) {
+    return projection(a) < projection(b);
+  };
+  auto eq = [&](const auto& a, const auto& b) {
+    return projection(a) == projection(b);
+  };
+
+  auto exponentialSearch = [&checkCancellation, &lessThan, &endLarge](
+                               auto itL, auto itS) {
+    checkCancellation();
+    size_t step = 1;
+    auto lower = itL;
+    while (lessThan(*itL, *itS)) {
+      lower = itL;
+      itL += step;
+      step *= 2;
+      if (itL >= endLarge) {
+        return std::pair{lower, endLarge};
+      }
+    }
+    return std::pair{lower, std::min(itL + 1, endLarge)};
+  };
+
+  auto simd_lower_bound_avx2 =
+      [&projection](auto begin, auto end,
+                    uint64_t needle_key) -> decltype(begin) {
+    constexpr size_t V = 4;
+    while (static_cast<size_t>(std::distance(begin, end)) > 2 * V) {
+      auto mid = begin + (std::distance(begin, end) / 2) - (V / 2);
+      uint64_t data[V];
+      for (size_t i = 0; i < V; ++i) {
+        data[i] = projection(*(mid + i));
+      }
+      if (needle_key <= data[V - 1]) {
+        end = mid + V;
+      } else {
+        begin = mid + V;
+      }
+    }
+    return std::lower_bound(
+        begin, end, needle_key,
+        [&](const auto& row, uint64_t key) { return projection(row) < key; });
+  };
+
+  while (itSmall < endSmall && itLarge < endLarge) {
+    checkCancellation();
+    const auto& elLarge = *itLarge;
+    while (lessThan(*itSmall, elLarge)) {
+      if constexpr (!ad_utility::isSimilar<ElementFromSmallerNotFoundAction,
+                                           Noop>) {
+        elementFromSmallerNotFoundAction(itSmall);
+      }
+      ++itSmall;
+      if (itSmall >= endSmall) {
+        return;
+      }
+    }
+
+    auto [lower, upper] = exponentialSearch(itLarge, itSmall);
+    const uint64_t needle_key = projection(*itSmall);
+
+    itLarge = simd_lower_bound_avx2(lower, upper, needle_key);
+
+    if (itLarge == endLarge) {
+      break;
+    }
+    checkCancellation();
+
+    auto endSameSmall = std::find_if_not(
+        itSmall, endSmall, [&](const auto& row) { return eq(row, *itLarge); });
+    auto endSameLarge = std::find_if_not(
+        itLarge, endLarge, [&](const auto& row) { return eq(row, *itSmall); });
+
+    for (auto tempItSmall = itSmall; tempItSmall != endSameSmall;
+         ++tempItSmall) {
+      checkCancellation();
+      for (auto innerItLarge = itLarge; innerItLarge != endSameLarge;
+           ++innerItLarge) {
+        action(tempItSmall, innerItLarge);
+      }
+    }
+    itSmall = endSameSmall;
+    itLarge = endSameLarge;
+  }
+  if constexpr (!ad_utility::isSimilar<ElementFromSmallerNotFoundAction,
+                                       Noop>) {
+    while (itSmall != endSmall) {
+      elementFromSmallerNotFoundAction(itSmall);
+      ++itSmall;
+    }
+  }
+}
+#endif
+
+// Scalar fallback implementation.
+CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection,
+             typename Action, typename ElementFromSmallerNotFoundAction,
+             typename CheckCancellation)
+void gallopingJoin_Scalar_impl(
+    const RangeSmaller& smaller, const RangeLarger& larger,
+    Projection const& projection, Action const& action,
+    ElementFromSmallerNotFoundAction elementFromSmallerNotFoundAction,
+    CheckCancellation checkCancellation) {
+  auto lessThan = [&](const auto& a, const auto& b) {
+    return projection(a) < projection(b);
+  };
+  gallopingJoin(smaller, larger, lessThan, action,
+                elementFromSmallerNotFoundAction, checkCancellation);
+}
+
+}  // namespace detail
+
+/**
+ * @brief Perform the galloping join algorithm using SIMD instructions to
+ * accelerate the search. This function dispatches to the best available
+ * implementation (AVX-512, AVX2, or scalar) at compile time.
+ * @tparam Projection A function object that takes a reference to an element
+ * from the input ranges and returns a `uint64_t` key used for the join
+ * comparison. The ranges must be sorted by this key.
+ * @param smaller The left input to the join. Must not contain UNDEF values.
+ * Should be much smaller than `larger`.
+ * @param larger The right input to the join. Must not contain UNDEF values.
+ * @param projection An instance of the `Projection` type.
+ * @param action For each pair of equal entries (entryFromSmaller,
+ * entryFromLarger), this function is called with the iterators to the matching
+ * entries as arguments.
+ * @param elementFromSmallerNotFoundAction Is called for each element in
+ * `smaller` that has no matching counterpart in `larger`.
+ * @param checkCancellation Is called frequently to allow cancelling the
+ * operation.
+ */
+CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection,
+             typename Action, typename ElementFromSmallerNotFoundAction = Noop,
+             typename CheckCancellation = Noop)(
+    requires ql::ranges::random_access_range<RangeSmaller> CPP_and
+        ql::ranges::random_access_range<RangeLarger> CPP_and
+            std::invocable<Projection,
+                           const ql::ranges::range_reference_t<RangeSmaller>&>
+                CPP_and std::is_same_v<
+                    uint64_t, std::invoke_result_t<
+                                  Projection, const ql::ranges::range_reference_t<
+                                                  RangeSmaller>&>>) void
+gallopingJoin_SIMD(const RangeSmaller& smaller, const RangeLarger& larger,
+                   Projection const& projection, Action const& action,
+                   ElementFromSmallerNotFoundAction
+                       elementFromSmallerNotFoundAction = {},
+                   CheckCancellation checkCancellation = {}) {
+#if defined(__AVX512F__)
+  detail::gallopingJoin_AVX512_impl(smaller, larger, projection, action,
+                                    elementFromSmallerNotFoundAction,
+                                    checkCancellation);
+#elif defined(__AVX2__)
+  detail::gallopingJoin_AVX2_impl(smaller, larger, projection, action,
+                                  elementFromSmallerNotFoundAction,
+                                  checkCancellation);
+#else
+  detail::gallopingJoin_Scalar_impl(smaller, larger, projection, action,
+                                    elementFromSmallerNotFoundAction,
+                                    checkCancellation);
+#endif
+}
+
+namespace detail {
+  // Helper to find the first element in a range that is not equal to the needle.
+  // This is a SIMD-accelerated version of `std::find_if_not`.
+  #if defined(__AVX512F__)
+  template <typename Iterator, typename Projection>
+  Iterator find_first_not_equal_avx512(Iterator begin, Iterator end,
+                                       uint64_t needle_key,
+                                       Projection const& projection) {
+    constexpr size_t V = 8;
+    __m512i v_needle = _mm512_set1_epi64(needle_key);
+  
+    while (static_cast<size_t>(std::distance(begin, end)) >= V) {
+      uint64_t data[V];
+      for (size_t i = 0; i < V; ++i) {
+        data[i] = projection(*(begin + i));
+      }
+      __m512i v_data = _mm512_loadu_si512(data);
+      __mmask8 eq_mask = _mm512_cmpeq_epu64_mask(v_data, v_needle);
+  
+      // If all elements in the vector are equal to the needle, the mask is all
+      // 1s (0xFF). We can safely skip the whole block.
+      if (eq_mask == 0xFF) {
+        begin += V;
+        continue;
+      }
+  
+      // Otherwise, we find the first element that is NOT equal. The first 0 in
+      // the mask corresponds to this. We can find its index by counting the
+      // trailing ones, which is the same as counting the trailing zeros of the
+      // inverted mask.
+      return begin + _mm_tzcnt_u32(~eq_mask);
+    }
+  
+    // Fallback for the remainder.
+    while (begin != end && projection(*begin) == needle_key) {
+      ++begin;
+    }
+    return begin;
+  }
+  #endif
+  }  // namespace detail
+  
+  
+  /**
+   * @brief Perform a standard merge join (zipper join) using SIMD instructions
+   * to accelerate pointer advancing and range finding.
+   * @param a The left input range. Must be sorted by the projected key.
+   * @param b The right input range. Must be sorted by the projected key.
+   * @param projection A function object to extract a `uint64_t` key for
+   * comparison.
+   * @param action An action to perform for each match. Called with
+   * `(iterator_from_a, iterator_from_b, num_matches_in_b)`. The user is
+   * responsible for creating the cross product.
+   * @param elementFromSmallerNotFoundAction Action for non-matching elements
+   * from the left input (`a`).
+   * @param checkCancellation Cancellation callback.
+   */
+  CPP_template(typename RangeA, typename RangeB, typename Projection,
+               typename Action, typename ElementFromSmallerNotFoundAction = Noop,
+               typename CheckCancellation = Noop)(
+      requires ql::ranges::random_access_range<RangeA> CPP_and
+          ql::ranges::random_access_range<RangeB> CPP_and
+              std::invocable<Projection,
+                             const ql::ranges::range_reference_t<RangeA>&>
+                  CPP_and std::is_same_v<
+                      uint64_t,
+                      std::invoke_result_t<
+                          Projection,
+                          const ql::ranges::range_reference_t<RangeA>&>>) void
+  zipperJoin_SIMD(const RangeA& a, const RangeB& b, Projection const& projection,
+                  Action const& action,
+                  ElementFromSmallerNotFoundAction
+                      elementFromSmallerNotFoundAction = {},
+                  CheckCancellation checkCancellation = {}) {
+  #if defined(__AVX512F__)
+    auto itA = std::begin(a);
+    auto endA = std::end(a);
+    auto itB = std::begin(b);
+    auto endB = std::end(b);
+  
+    if (itA == endA || itB == endB) {
+      return;
+    }
+  
+    while (itA < endA && itB < endB) {
+      checkCancellation();
+      uint64_t keyA = projection(*itA);
+      uint64_t keyB = projection(*itB);
+  
+      if (keyA < keyB) {
+        auto newItA = detail::simd_lower_bound_avx512(itA, endA, keyB);
+        if constexpr (!ad_utility::isSimilar<ElementFromSmallerNotFoundAction,
+                                             Noop>) {
+          for (; itA < newItA; ++itA) {
+            elementFromSmallerNotFoundAction(itA);
+          }
+        }
+        itA = newItA;
+        continue;
+      }
+  
+      if (keyB < keyA) {
+        itB = detail::simd_lower_bound_avx512(itB, endB, keyA);
+        continue;
+      }
+  
+      // If we are here, keyA == keyB, we have a match.
+      // Find the end of the equal range for both inputs.
+      auto endSameA =
+          detail::find_first_not_equal_avx512(itA + 1, endA, keyA, projection);
+      auto endSameB =
+          detail::find_first_not_equal_avx512(itB + 1, endB, keyA, projection);
+      
+      // Perform the action for the cross product.
+      const size_t numB = std::distance(itB, endSameB);
+      for (auto tempItA = itA; tempItA < endSameA; ++tempItA) {
+          action(tempItA, itB, numB);
+      }
+      
+      itA = endSameA;
+      itB = endSameB;
+    }
+  
+    // Handle remaining elements from the left side if an action is provided.
+    if constexpr (!ad_utility::isSimilar<ElementFromSmallerNotFoundAction, Noop>) {
+      while (itA < endA) {
+        elementFromSmallerNotFoundAction(itA);
+        ++itA;
+      }
+    }
+  #else
+    // Fallback for AVX2 or scalar.
+    // This could also be implemented with AVX2 helpers, but for simplicity,
+    // we fall back to the generic `zipperJoinWithUndef` which is correct,
+    // though not as fast.
+    auto lessThan = [&](const auto& valA, const auto& valB){ return projection(valA) < projection(valB); };
+    auto addRow = [&action](auto itA, auto itB){ action(itA, itB, 1); };
+    ad_utility::zipperJoinWithUndef(a, b, lessThan, addRow, ad_utility::noop, ad_utility::noop, elementFromSmallerNotFoundAction, checkCancellation);
+  #endif
+  }
 
 /**
  * @brief Perform an OPTIONAL join for the following special case: The `right`
@@ -1242,7 +1722,7 @@ CPP_template(typename LeftSide, typename RightSide, typename LessThan,
     auto equalToCurrentElRight =
         getEqualToCurrentEl(currentBlocksRight, currentEl);
 
-    auto getNextBlocks = [this, &currentEl, &blockStatus](Blocks& target,
+    auto getNextBlocks = [this, ¤tEl, &blockStatus](Blocks& target,
                                                           Side& side) {
       // Explicit this to avoid false positive warning in clang.
       this->removeEqualToCurrentEl(side.currentBlocks_, currentEl);

@@ -315,11 +315,26 @@ void Join::join(const IdTable& a, const IdTable& b, IdTable* result) const {
   auto rowAdder = ad_utility::AddCombinedRowToIdTable(
       1, aPermuted, bPermuted, std::move(*result), cancellationHandle_,
       keepJoinColumn_);
+  
+  // Create a generic projection to extract the uint64_t value from an Id.
+  auto idProjection = [](const Id& id) { return id.value(); };
+
+  // The addRow action needs to know the beginning of the original columns
+  // to calculate the row index.
   auto addRow = [beginLeft = joinColumnL.begin(),
                  beginRight = joinColumnR.begin(),
                  &rowAdder](const auto& itLeft, const auto& itRight) {
     rowAdder.addRow(itLeft - beginLeft, itRight - beginRight);
   };
+  
+  // The action for the SIMD join, which operates on iterators to the Id columns.
+  auto simdAction =
+      [&addRow](auto itA, auto itB, size_t numB) {
+        for (size_t i = 0; i < numB; ++i) {
+          addRow(itA, itB + i);
+        }
+      };
+
 
   // The UNDEF values are right at the start, so this calculation works.
   size_t numUndefA =
@@ -332,35 +347,60 @@ void Join::join(const IdTable& a, const IdTable& b, IdTable* result) const {
   std::pair undefRangeB{joinColumnR.begin(), joinColumnR.begin() + numUndefB};
 
   auto cancellationCallback = [this]() { checkCancellation(); };
-
-  // Determine whether we should use the galloping join optimization.
+  
+  // The logic to choose the join algorithm.
   if (a.size() / b.size() > GALLOP_THRESHOLD && numUndefA == 0 &&
       numUndefB == 0) {
-    // The first argument to the galloping join will always be the smaller
-    // input, so we need to switch the rows when adding them.
-    auto inverseAddRow = [&addRow](const auto& rowA, const auto& rowB) {
-      addRow(rowB, rowA);
+    auto inverseSimdAction = [&addRow](auto itB, auto itA, size_t numA) {
+        for (size_t i = 0; i < numA; ++i) {
+          addRow(itA + i, itB);
+        }
     };
-    ad_utility::gallopingJoin(joinColumnR, joinColumnL, ql::ranges::less{},
-                              inverseAddRow, {}, cancellationCallback);
+    ad_utility::gallopingJoin_SIMD(joinColumnR, joinColumnL, idProjection,
+                                   inverseSimdAction, ad_utility::noop,
+                                   cancellationCallback);
   } else if (b.size() / a.size() > GALLOP_THRESHOLD && numUndefA == 0 &&
              numUndefB == 0) {
-    ad_utility::gallopingJoin(joinColumnL, joinColumnR, ql::ranges::less{},
-                              addRow, {}, cancellationCallback);
+    ad_utility::gallopingJoin_SIMD(joinColumnL, joinColumnR, idProjection,
+                                   simdAction, ad_utility::noop,
+                                   cancellationCallback);
   } else {
+    // This is the main change: We check for UNDEFs. If there are none, we
+    // use our new SIMD-accelerated zipper join. Otherwise, we fall back to
+    // the old, correct-but-slower version that can handle UNDEFs.
+#if defined(__AVX512F__) || defined(__AVX2__)
+    if (numUndefA == 0 && numUndefB == 0) {
+      // No UNDEFs, use the fast SIMD path.
+      ad_utility::zipperJoin_SIMD(joinColumnL, joinColumnR, idProjection,
+                                  simdAction, ad_utility::noop,
+                                  cancellationCallback);
+    } else {
+      // Fallback for cases with UNDEF values.
+      auto findSmallerUndefRangeLeft = [undefRangeA](auto&&...) {
+        return ad_utility::IteratorRange{undefRangeA.first, undefRangeA.second};
+      };
+      auto findSmallerUndefRangeRight = [undefRangeB](auto&&...) {
+        return ad_utility::IteratorRange{undefRangeB.first, undefRangeB.second};
+      };
+      auto numOutOfOrder = ad_utility::zipperJoinWithUndef(
+          joinColumnL, joinColumnR, ql::ranges::less{}, addRow,
+          findSmallerUndefRangeLeft, findSmallerUndefRangeRight, {},
+          cancellationCallback);
+      AD_CORRECTNESS_CHECK(numOutOfOrder == 0);
+    }
+#else
+    // Original path if no SIMD is available.
     auto findSmallerUndefRangeLeft = [undefRangeA](auto&&...) {
       return ad_utility::IteratorRange{undefRangeA.first, undefRangeA.second};
     };
     auto findSmallerUndefRangeRight = [undefRangeB](auto&&...) {
       return ad_utility::IteratorRange{undefRangeB.first, undefRangeB.second};
     };
-
     auto numOutOfOrder = [&]() {
       if (numUndefB == 0 && numUndefA == 0) {
         return ad_utility::zipperJoinWithUndef(
             joinColumnL, joinColumnR, ql::ranges::less{}, addRow,
             ad_utility::noop, ad_utility::noop, {}, cancellationCallback);
-
       } else {
         return ad_utility::zipperJoinWithUndef(
             joinColumnL, joinColumnR, ql::ranges::less{}, addRow,
@@ -369,6 +409,7 @@ void Join::join(const IdTable& a, const IdTable& b, IdTable* result) const {
       }
     }();
     AD_CORRECTNESS_CHECK(numOutOfOrder == 0);
+#endif
   }
   *result = std::move(rowAdder).resultTable();
   // The column order in the result is now
