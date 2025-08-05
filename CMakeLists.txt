@@ -369,7 +369,7 @@ target_compile_options(fsst PRIVATE -Wno-extra -Wno-all -Wno-error)
 target_compile_options(fsst12 PRIVATE -Wno-extra -Wno-all -Wno-error)
 include_directories(${fsst_SOURCE_DIR})
 include_directories(${range-v3_SOURCE_DIR}/include)
-include_directories(${x86-simd-sort_SOURCE_DIR}/include)
+include_directories(${x86-simd-sort_SOURCE_DIR}/src)
 target_compile_options(antlr4_static PRIVATE -Wno-all -Wno-extra -Wno-error -Wno-deprecated-declarations)
 # Only required because a lot of classes that do not explicitly link against antlr4_static use the headers.
 include_directories(SYSTEM "${antlr_SOURCE_DIR}/runtime/Cpp/runtime/src")
