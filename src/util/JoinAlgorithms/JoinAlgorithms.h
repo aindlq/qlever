@@ -102,12 +102,7 @@ CPP_concept HasAddRows = CPP_requires_ref(HasAddRowsRequires, F, It1, It2);
  * ranges is not within `Range1` and has already been processed by something
  * else.
  */
-CPP_template(typename Range1, typename Range2, typename LessThan,
-             typename CompatibleRowAction, typename FindSmallerUndefRangesLeft,
-             typename FindSmallerUndefRangesRight,
-             typename ElFromFirstNotFoundAction = decltype(noop),
-             typename CheckCancellation = decltype(noop),
-             typename CoverUndefRanges = std::true_type)(
+CPP_template(typename Range1, typename Range2, typename LessThan, typename CompatibleRowAction, typename FindSmallerUndefRangesLeft, typename FindSmallerUndefRangesRight, typename ElFromFirstNotFoundAction = decltype(noop), typename CheckCancellation = decltype(noop), typename CoverUndefRanges = std::true_type)(
     requires ql::ranges::random_access_range<Range1> CPP_and
         ql::ranges::random_access_range<Range2>)
     [[nodiscard]] auto zipperJoinWithUndef(
@@ -360,9 +355,7 @@ CPP_template(typename Range1, typename Range2, typename LessThan,
  * a proper exception. Typically implementations will just
  * CancellationHandle::throwIfCancelled().
  */
-CPP_template(typename RangeSmaller, typename RangeLarger, typename LessThan,
-             typename Action, typename ElementFromSmallerNotFoundAction = Noop,
-             typename CheckCancellation = Noop)(
+CPP_template(typename RangeSmaller, typename RangeLarger, typename LessThan, typename Action, typename ElementFromSmallerNotFoundAction = Noop, typename CheckCancellation = Noop)(
     requires ql::ranges::random_access_range<RangeSmaller> CPP_and
         ql::ranges::random_access_range<
             RangeLarger>) void gallopingJoin(const RangeSmaller& smaller,
@@ -464,10 +457,55 @@ namespace detail {
 /// These are dispatched by the public `gallopingJoin_SIMD` function.
 
 #if defined(__AVX512F__)
+// Vectorized binary search using AVX-512. It uses a standard binary search
+// to narrow down the range to 8 elements, then uses a single SIMD
+// comparison and a popcount to find the exact position.
+template <typename Iterator, typename Projection>
+Iterator simd_lower_bound_avx512(Iterator begin, Iterator end,
+                                 uint64_t needle_key,
+                                 const Projection& projection) {
+  constexpr size_t V = 8;
+  auto len = std::distance(begin, end);
+
+  while (len > V) {
+    auto half = len / 2;
+    auto mid = begin + half;
+    if (projection(*mid) < needle_key) {
+      begin = mid + 1;
+      len = len - half - 1;
+    } else {
+      end = mid;
+      len = half;
+    }
+  }
+
+  if (len > 0) {
+    uint64_t data[V];
+    for (size_t i = 0; i < len; ++i) {
+      data[i] = projection(*(begin + i));
+    }
+    // Pad with max value to ensure elements outside the range are not
+    // considered.
+    for (size_t i = len; i < V; ++i) {
+      data[i] = std::numeric_limits<uint64_t>::max();
+    }
+
+    __m512i v_data = _mm512_loadu_si512(data);
+    __m512i v_needle = _mm512_set1_epi64(needle_key);
+
+    // Create a mask where the i-th bit is 1 if data[i] < needle_key.
+    __mmask8 less_mask = _mm512_cmplt_epu64_mask(v_data, v_needle);
+
+    // The number of elements smaller than the needle is the popcount of the
+    // mask. This is exactly the offset for the lower_bound.
+    return begin + _mm_popcnt_u32(less_mask);
+  }
+
+  return begin;
+}
+
 // AVX-512 implementation.
-CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection,
-             typename Action, typename ElementFromSmallerNotFoundAction,
-             typename CheckCancellation)
+CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection, typename Action, typename ElementFromSmallerNotFoundAction, typename CheckCancellation)
 void gallopingJoin_AVX512_impl(
     const RangeSmaller& smaller, const RangeLarger& larger,
     Projection const& projection, Action const& action,
@@ -512,52 +550,6 @@ void gallopingJoin_AVX512_impl(
     return std::pair{lower, std::min(itL + 1, endLarge)};
   };
 
-  // Vectorized binary search using AVX-512. It uses a standard binary search
-  // to narrow down the range to 8 elements, then uses a single SIMD
-  // comparison and a popcount to find the exact position.
-  auto simd_lower_bound_avx512 =
-      [&projection](auto begin, auto end,
-                    uint64_t needle_key) -> decltype(begin) {
-    constexpr size_t V = 8;
-    auto len = std::distance(begin, end);
-
-    while (len > V) {
-      auto half = len / 2;
-      auto mid = begin + half;
-      if (projection(*mid) < needle_key) {
-        begin = mid + 1;
-        len = len - half - 1;
-      } else {
-        end = mid;
-        len = half;
-      }
-    }
-
-    if (len > 0) {
-      uint64_t data[V];
-      for (size_t i = 0; i < len; ++i) {
-        data[i] = projection(*(begin + i));
-      }
-      // Pad with max value to ensure elements outside the range are not
-      // considered.
-      for (size_t i = len; i < V; ++i) {
-        data[i] = std::numeric_limits<uint64_t>::max();
-      }
-
-      __m512i v_data = _mm512_loadu_si512(data);
-      __m512i v_needle = _mm512_set1_epi64(needle_key);
-
-      // Create a mask where the i-th bit is 1 if data[i] < needle_key.
-      __mmask8 less_mask = _mm512_cmplt_epu64_mask(v_data, v_needle);
-
-      // The number of elements smaller than the needle is the popcount of the
-      // mask. This is exactly the offset for the lower_bound.
-      return begin + _mm_popcnt_u32(less_mask);
-    }
-
-    return begin;
-  };
-
   while (itSmall < endSmall && itLarge < endLarge) {
     checkCancellation();
     const auto& elLarge = *itLarge;
@@ -575,7 +567,7 @@ void gallopingJoin_AVX512_impl(
     auto [lower, upper] = exponentialSearch(itLarge, itSmall);
     const uint64_t needle_key = projection(*itSmall);
 
-    itLarge = simd_lower_bound_avx512(lower, upper, needle_key);
+    itLarge = simd_lower_bound_avx512(lower, upper, needle_key, projection);
 
     if (itLarge == endLarge) {
       break;
@@ -610,9 +602,7 @@ void gallopingJoin_AVX512_impl(
 
 #if defined(__AVX2__)
 // AVX2 implementation.
-CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection,
-             typename Action, typename ElementFromSmallerNotFoundAction,
-             typename CheckCancellation)
+CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection, typename Action, typename ElementFromSmallerNotFoundAction, typename CheckCancellation)
 void gallopingJoin_AVX2_impl(
     const RangeSmaller& smaller, const RangeLarger& larger,
     Projection const& projection, Action const& action,
@@ -729,9 +719,7 @@ void gallopingJoin_AVX2_impl(
 #endif
 
 // Scalar fallback implementation.
-CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection,
-             typename Action, typename ElementFromSmallerNotFoundAction,
-             typename CheckCancellation)
+CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection, typename Action, typename ElementFromSmallerNotFoundAction, typename CheckCancellation)
 void gallopingJoin_Scalar_impl(
     const RangeSmaller& smaller, const RangeLarger& larger,
     Projection const& projection, Action const& action,
@@ -765,9 +753,7 @@ void gallopingJoin_Scalar_impl(
  * @param checkCancellation Is called frequently to allow cancelling the
  * operation.
  */
-CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection,
-             typename Action, typename ElementFromSmallerNotFoundAction = Noop,
-             typename CheckCancellation = Noop)(
+CPP_template(typename RangeSmaller, typename RangeLarger, typename Projection, typename Action, typename ElementFromSmallerNotFoundAction = Noop, typename CheckCancellation = Noop)(
     requires ql::ranges::random_access_range<RangeSmaller> CPP_and
         ql::ranges::random_access_range<RangeLarger> CPP_and
             std::invocable<Projection,
@@ -826,7 +812,7 @@ namespace detail {
       // the mask corresponds to this. We can find its index by counting the
       // trailing ones, which is the same as counting the trailing zeros of the
       // inverted mask.
-      return begin + _mm_tzcnt_u32(~eq_mask);
+      return begin + __builtin_ctz(~eq_mask);
     }
   
     // Fallback for the remainder.
@@ -853,9 +839,7 @@ namespace detail {
    * from the left input (`a`).
    * @param checkCancellation Cancellation callback.
    */
-  CPP_template(typename RangeA, typename RangeB, typename Projection,
-               typename Action, typename ElementFromSmallerNotFoundAction = Noop,
-               typename CheckCancellation = Noop)(
+CPP_template(typename RangeA, typename RangeB, typename Projection, typename Action, typename ElementFromSmallerNotFoundAction = Noop, typename CheckCancellation = Noop)(
       requires ql::ranges::random_access_range<RangeA> CPP_and
           ql::ranges::random_access_range<RangeB> CPP_and
               std::invocable<Projection,
@@ -886,7 +870,7 @@ namespace detail {
       uint64_t keyB = projection(*itB);
   
       if (keyA < keyB) {
-        auto newItA = detail::simd_lower_bound_avx512(itA, endA, keyB);
+        auto newItA = detail::simd_lower_bound_avx512(itA, endA, keyB, projection);
         if constexpr (!ad_utility::isSimilar<ElementFromSmallerNotFoundAction,
                                              Noop>) {
           for (; itA < newItA; ++itA) {
@@ -898,7 +882,7 @@ namespace detail {
       }
   
       if (keyB < keyA) {
-        itB = detail::simd_lower_bound_avx512(itB, endB, keyA);
+        itB = detail::simd_lower_bound_avx512(itB, endB, keyA, projection);
         continue;
       }
   
@@ -953,8 +937,7 @@ namespace detail {
  * @param compatibleRowAction Same as in `zipperJoinWithUndef`
  * @param elFromFirstNotFoundAction Same as in `zipperJoinWithUndef`
  */
-CPP_template(typename CompatibleActionT, typename NotFoundActionT,
-             typename CancellationFuncT)(
+CPP_template(typename CompatibleActionT, typename NotFoundActionT, typename CancellationFuncT)(
     requires BinaryIteratorFunction<CompatibleActionT, IdTableView<0>> CPP_and UnaryIteratorFunction<
         NotFoundActionT, IdTableView<0>>
         CPP_and std::invocable<
@@ -1297,8 +1280,7 @@ static constexpr size_t FETCH_BLOCKS = 3;
 // After adding the Cartesian product we start a new round with a new
 // `currentEl` (5 in this example). New blocks are added to one of the buffers
 // if they become empty at one point in the algorithm.
-CPP_template(typename LeftSide, typename RightSide, typename LessThan,
-             typename CompatibleRowAction, typename IsUndef = AlwaysFalse)(
+CPP_template(typename LeftSide, typename RightSide, typename LessThan, typename CompatibleRowAction, typename IsUndef = AlwaysFalse)(
     requires IsJoinSide<LeftSide> CPP_and IsJoinSide<RightSide> CPP_and
         InvocableWithExactReturnType<
             IsUndef, bool,
@@ -1722,7 +1704,7 @@ CPP_template(typename LeftSide, typename RightSide, typename LessThan,
     auto equalToCurrentElRight =
         getEqualToCurrentEl(currentBlocksRight, currentEl);
 
-    auto getNextBlocks = [this, ¤tEl, &blockStatus](Blocks& target,
+    auto getNextBlocks = [this, &currentEl, &blockStatus](Blocks& target,
                                                           Side& side) {
       // Explicit this to avoid false positive warning in clang.
       this->removeEqualToCurrentEl(side.currentBlocks_, currentEl);
