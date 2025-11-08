@@ -348,21 +348,28 @@ class ConcurrentCache {
   using SyncCache = ad_utility::Synchronized<CacheAndInProgressMap, std::mutex>;
 
   // delete the operation with the key from the hash map of the operations that
-  // are in progress, and add it to the cache using the computationResult
+  // are in progress, and add it to the cache using the computationResult.
+  // Returns the value that is now stored in the cache for this key.
   // Will crash if the key cannot be found in the hash map
-  void moveFromInProgressToCache(Key key,
-                                 std::shared_ptr<Value> computationResult) {
+  std::shared_ptr<const Value> moveFromInProgressToCache(
+      const Key& key, std::shared_ptr<Value> computationResult) {
     // Obtain a lock for the whole operation, making it atomic.
     auto lockPtr = _cacheAndInProgressMap.wlock();
     AD_CONTRACT_CHECK(lockPtr->_inProgress.contains(key));
     bool pinned = lockPtr->_inProgress[key].first;
     if (pinned) {
-      lockPtr->_cache.insertPinned(std::move(key),
-                                   std::move(computationResult));
+      if (!lockPtr->_cache.containsAndMakePinnedIfExists(key)) {
+        lockPtr->_cache.insertPinned(key, computationResult);
+      }
     } else {
-      lockPtr->_cache.insert(std::move(key), std::move(computationResult));
+      if (!lockPtr->_cache.contains(key)) {
+        lockPtr->_cache.insert(key, computationResult);
+      }
     }
     lockPtr->_inProgress.erase(key);
+    // After the insertion logic, the result for the `key` is guaranteed to be
+    // in the cache.
+    return lockPtr->_cache[key];
   }
 
  private:
@@ -419,16 +426,19 @@ class ConcurrentCache {
         // The actual computation
         shared_ptr<Value> result = make_shared<Value>(computeFunction());
         if (suitableForCache(*result)) {
-          moveFromInProgressToCache(key, result);
+          auto resultFromCache = moveFromInProgressToCache(key, result);
           // Signal other threads who are waiting for the results.
-          resultInProgress->finish(result);
+          resultInProgress->finish(
+              std::const_pointer_cast<Value>(resultFromCache));
+          // The result was not in the cache before, but it is now.
+          return {std::move(resultFromCache), CacheStatus::computed};
         } else {
           AD_CONTRACT_CHECK(!pinned);
           _cacheAndInProgressMap.wlock()->_inProgress.erase(key);
           resultInProgress->finish(nullptr);
+          // result was not cached
+          return {std::move(result), CacheStatus::computed};
         }
-        // result was not cached
-        return {std::move(result), CacheStatus::computed};
       } catch (...) {
         // Other threads may try this computation again in the future
         _cacheAndInProgressMap.wlock()->_inProgress.erase(key);

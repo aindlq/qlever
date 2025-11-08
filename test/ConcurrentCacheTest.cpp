@@ -565,3 +565,62 @@ TEST(ConcurrentCache, computeButDontStore) {
       42, []() { return "blubb"; }, true, alwaysSuitable);
   EXPECT_EQ(res._resultPointer, nullptr);
 }
+
+// _____________________________________________________________________________
+TEST(ConcurrentCache, raceConditionOnConcurrentInsert) {
+  SimpleConcurrentLruCache a{3ul};
+  StartStopSignal signal;
+
+  // Thread A starts a long computation for key 0.
+  auto futA = std::async(std::launch::async, [&]() {
+    return a.computeOnce(0, waiting_function("resultA"s, 5, &signal), false,
+                         returnTrue);
+  });
+
+  // Wait until thread A has registered the computation as "in progress".
+  signal.hasStartedSignal_.wait();
+  {
+    auto lock = a.getStorage().wlock();
+    ASSERT_EQ(1ul, lock->_inProgress.size());
+    ASSERT_FALSE(lock->_cache.contains(0));
+  }
+
+  // Thread B starts a computation for the same key and will wait for thread A.
+  auto futB = std::async(std::launch::async, [&]() {
+    return a.computeOnce(0, waiting_function("resultB"s, 1), false,
+                         returnTrue);
+  });
+
+  // Give thread B time to register as waiting. A better way would be to use
+  // another signal, but this is easier to implement and should be reliable
+  // enough for this test case.
+  std::this_thread::sleep_for(20ms);
+
+  // The main thread (acting as thread C) inserts a result for the same key 0
+  // while A is still computing. This is possible because tryInsertIfNotPresent
+  // does not check the _inProgress map.
+  a.tryInsertIfNotPresent(false, 0, std::make_shared<std::string>("resultC"));
+  ASSERT_TRUE(a.cacheContains(0));
+
+  // Allow thread A to finish.
+  signal.mayFinishSignal_.notify();
+
+  // When thread A tries to insert its result, it will find that the key is
+  // already present. The fix prevents an exception from being thrown. Instead,
+  // the result from thread A is discarded, and the existing value ("resultC")
+  // is kept. Thread A's `computeOnce` call will then return the existing
+  // value.
+  auto resultA = futA.get();
+  ASSERT_EQ(*resultA._resultPointer, "resultC");
+
+  // Thread B, which was waiting for the result from thread A, will also
+  // receive the value that is now in the cache.
+  auto resultB = futB.get();
+  ASSERT_EQ(*resultB._resultPointer, "resultC");
+
+  // The cache should still contain the value inserted by thread C.
+  auto result = a.getIfContained(0);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_EQ(*result.value()._resultPointer, "resultC");
+  ASSERT_EQ(a.getStorage().wlock()->_inProgress.size(), 0ul);
+}
