@@ -566,3 +566,62 @@ TEST(ConcurrentCache, computeButDontStore) {
       42, []() { return "blubb"; }, true, alwaysSuitable);
   EXPECT_EQ(res._resultPointer, nullptr);
 }
+
+// Test that `tryInsertIfNotPresent` does not lead to a race condition, when
+// another thread is currently computing the same value.
+TEST(ConcurrentCache, tryInsertIfNotPresentRaceCondition) {
+  SimpleConcurrentLruCache cache{};
+  StartStopSignal signal;
+  auto compute = [&]() {
+    return cache.computeOnce(42, waiting_function("slow", 5, &signal), false,
+                             returnTrue);
+  };
+
+  auto fut = std::async(std::launch::async, compute);
+  signal.hasStartedSignal_.wait();
+  // The other thread is now in the middle of the computation. `tryInsert`
+  // should not do anything, because another thread is already computing the
+  // result.
+  cache.tryInsertIfNotPresent(false, 42, std::make_shared<std::string>("fast"));
+  signal.mayFinishSignal_.notify();
+  fut.get();
+
+  // The "slow" computation should have won, because it was first.
+  EXPECT_THAT(*cache.getIfContained(42)->_resultPointer, "slow");
+}
+
+// Test for the original race condition where a fast `tryInsertIfNotPresent`
+// runs concurrently with a slow `computeOnce`.
+TEST(ConcurrentCache, raceConditionOnConcurrentInsert) {
+  SimpleConcurrentLruCache a{};
+  StartStopSignal signal;
+
+  // This thread simulates a long-running computation via `computeOnce`.
+  auto slowComputeFuture = std::async(std::launch::async, [&]() {
+    return a.computeOnce(0, waiting_function("slow", 10, &signal), false,
+                         returnTrue);
+  });
+
+  // Wait until the slow computation has started and registered itself
+  // in the `_inProgress` map.
+  signal.hasStartedSignal_.wait();
+
+  // This call simulates a fast, lazy computation that finishes while the
+  // slow one is still running. Before the fix, this would have inserted
+  // "fast" into the cache, causing the slow computation to fail when it
+  // tried to insert its own result.
+  a.tryInsertIfNotPresent(false, 0, std::make_shared<std::string>("fast"));
+
+  // Allow the slow computation to finish.
+  signal.mayFinishSignal_.notify();
+
+  // Wait for the slow computation to complete.
+  auto slowResult = slowComputeFuture.get();
+
+  // After the fix, the `tryInsertIfNotPresent` call should have been a no-op
+  // because a computation was already in progress. The slow computation
+  // should have "won" and its result should be in the cache.
+  EXPECT_EQ(*slowResult._resultPointer, "slow");
+  EXPECT_TRUE(a.cacheContains(0));
+  EXPECT_THAT(*a.getIfContained(0)->_resultPointer, "slow");
+}

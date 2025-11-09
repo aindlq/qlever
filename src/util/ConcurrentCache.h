@@ -98,7 +98,7 @@ class ResultInProgress {
   // Distribute the computation results to all the threads that at some point
   // have called or will call getResult(). Check that none of the other threads
   // waiting for the result have already finished or were aborted.
-  void finish(std::shared_ptr<Value> result) {
+  void finish(std::shared_ptr<const Value> result) {
     std::unique_lock lockGuard(_mutex);
     AD_CONTRACT_CHECK(_status == Status::IN_PROGRESS);
     _status = Status::FINISHED;
@@ -239,6 +239,16 @@ class ConcurrentCache {
   void tryInsertIfNotPresent(bool pinned, const Key& key,
                              std::shared_ptr<Value> value) {
     auto lockPtr = _cacheAndInProgressMap.wlock();
+    // If another thread is already computing the result, let them win, because
+    // our `value` might be incomplete (e.g. from an `ASK` query).
+    if (lockPtr->_inProgress.contains(key)) {
+      if (pinned) {
+        // The other thread might not have pinned the result, so we have to
+        // enforce this.
+        lockPtr->_inProgress.at(key).first = true;
+      }
+      return;
+    }
     auto& cache = lockPtr->_cache;
     if (pinned) {
       if (!cache.containsAndMakePinnedIfExists(key)) {
@@ -347,22 +357,41 @@ class ConcurrentCache {
   // make the whole class thread-safe by making all the data members thread-safe
   using SyncCache = ad_utility::Synchronized<CacheAndInProgressMap, std::mutex>;
 
-  // delete the operation with the key from the hash map of the operations that
-  // are in progress, and add it to the cache using the computationResult
-  // Will crash if the key cannot be found in the hash map
-  void moveFromInProgressToCache(Key key,
-                                 std::shared_ptr<Value> computationResult) {
+  // Delete the operation with the key from the hash map of the operations that
+  // are in progress, and add it to the cache using the computationResult.
+  // Returns the result that is stored in the cache after this operation. This
+  // might be a different value than `computationResult` because of a race
+  // condition. Will crash if the key cannot be found in the hash map.
+  std::shared_ptr<const Value> moveFromInProgressToCache(
+      const Key& key, std::shared_ptr<Value> computationResult) {
     // Obtain a lock for the whole operation, making it atomic.
     auto lockPtr = _cacheAndInProgressMap.wlock();
     AD_CONTRACT_CHECK(lockPtr->_inProgress.contains(key));
-    bool pinned = lockPtr->_inProgress[key].first;
+
+    // Check if the key is now present (which implies that a different thread
+    // has won a race).
+    if (lockPtr->_cache.contains(key)) {
+      // The other thread has won the race, so we return the value that it has
+      // computed.
+      auto& inProgressValue = lockPtr->_inProgress.at(key);
+      if (inProgressValue.first) {
+        // The original thread wanted to pin the result, so we have to make
+        // sure, that the result is pinned, even if the winning thread didn't
+        // want to.
+        lockPtr->_cache.containsAndMakePinnedIfExists(key);
+      }
+      lockPtr->_inProgress.erase(key);
+      return lockPtr->_cache[key];
+    }
+
+    bool pinned = lockPtr->_inProgress.at(key).first;
     if (pinned) {
-      lockPtr->_cache.insertPinned(std::move(key),
-                                   std::move(computationResult));
+      lockPtr->_cache.insertPinned(key, computationResult);
     } else {
-      lockPtr->_cache.insert(std::move(key), std::move(computationResult));
+      lockPtr->_cache.insert(key, computationResult);
     }
     lockPtr->_inProgress.erase(key);
+    return computationResult;
   }
 
  private:
@@ -418,17 +447,20 @@ class ConcurrentCache {
       try {
         // The actual computation
         shared_ptr<Value> result = make_shared<Value>(computeFunction());
+        shared_ptr<const Value> resultToReturn;
         if (suitableForCache(*result)) {
-          moveFromInProgressToCache(key, result);
+          auto winningResult = moveFromInProgressToCache(key, result);
           // Signal other threads who are waiting for the results.
-          resultInProgress->finish(result);
+          resultInProgress->finish(winningResult);
+          resultToReturn = std::move(winningResult);
         } else {
           AD_CONTRACT_CHECK(!pinned);
           _cacheAndInProgressMap.wlock()->_inProgress.erase(key);
-          resultInProgress->finish(nullptr);
+          resultInProgress->finish(std::shared_ptr<const Value>(nullptr));
+          resultToReturn = std::move(result);
         }
         // result was not cached
-        return {std::move(result), CacheStatus::computed};
+        return {std::move(resultToReturn), CacheStatus::computed};
       } catch (...) {
         // Other threads may try this computation again in the future
         _cacheAndInProgressMap.wlock()->_inProgress.erase(key);
@@ -442,10 +474,27 @@ class ConcurrentCache {
       // wait.
       auto resultPointer = resultInProgress->getResult();
       if (!resultPointer) {
-        // Fallback computation
+        // Fallback computation.
         auto mutablePointer = make_shared<Value>(computeFunction());
         if (suitableForCache(*mutablePointer)) {
-          tryInsertIfNotPresent(pinned, key, mutablePointer);
+          // We are in a fallback computation, which means that the original
+          // computation for this key was unsuitable for the cache. The
+          // original thread is responsible for removing the key from the
+          // `_inProgress` map. Due to a race condition, this might not have
+          // happened yet. We can't use `tryInsertIfNotPresent` because that
+          // one would see the `_inProgress` entry and not insert anything.
+          // Instead, we directly insert into the cache, but check if another
+          // thread has already won the race.
+          auto lock = _cacheAndInProgressMap.wlock();
+          if (pinned) {
+            if (!lock->_cache.containsAndMakePinnedIfExists(key)) {
+              lock->_cache.insertPinned(key, mutablePointer);
+            }
+          } else {
+            if (!lock->_cache.contains(key)) {
+              lock->_cache.insert(key, mutablePointer);
+            }
+          }
         } else {
           AD_CONTRACT_CHECK(!pinned);
         }
