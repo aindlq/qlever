@@ -112,7 +112,7 @@ class IndexImpl {
   std::optional<bool> useParallelParser_ = std::nullopt;
   TurtleParserIntegerOverflowBehavior turtleParserIntegerOverflowBehavior_ =
       TurtleParserIntegerOverflowBehavior::Error;
-  bool turtleParserSkipIllegalLiterals_ = false;
+  bool turtleParserSkipIllegalLiterals_ = true;
   bool keepTempFiles_ = false;
   ad_utility::MemorySize memoryLimitIndexBuilding_ =
       DEFAULT_MEMORY_LIMIT_INDEX_BUILDING;
