@@ -637,6 +637,11 @@ if (NOT _EMSCRIPTEN_NO_INDEXBUILDER_AND_SERVER)
     )
 endif()
 
+# Custom magic-SERVICE plugins. Added AFTER the binaries so the auto-discovered
+# service object libraries can link themselves in. Adding a new service is just a
+# new folder under `src/services/` -- no edits here.
+add_subdirectory(src/services)
+
 ###############################################################
 # CPack packaging
 ###############################################################

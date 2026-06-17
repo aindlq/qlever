@@ -35,6 +35,7 @@
 #include "index/TextScoring.h"
 #include "index/Vocabulary.h"
 #include "index/VocabularyMerger.h"
+#include "util/HashMap.h"
 #include "parser/RdfParser.h"
 #include "parser/TripleComponent.h"
 #include "util/BufferedVector.h"
@@ -127,6 +128,11 @@ class IndexImpl {
   DocsDB docsDB_;
   std::vector<WordIndex> blockBoundaries_;
   mutable ad_utility::File textIndexFile_;
+
+  // Generic, named auxiliary data attached by services (keyed by service name),
+  // populated at load time by registered index-extension load hooks. The value
+  // type is opaque to the core; services cast it back. See `IndexExtension.h`.
+  ad_utility::HashMap<std::string, std::shared_ptr<void>> extensions_;
 
   // If false, only PSO and POS permutations are loaded and expected.
   bool loadAllPermutations_ = true;
@@ -246,6 +252,16 @@ class IndexImpl {
   // Adds text index from on disk index that has previously been constructed.
   // Read necessary meta data into memory and opens file handles.
   void addTextFromOnDiskIndex();
+
+  // Store / retrieve a named service extension (see `IndexExtension.h`). Set by
+  // load hooks; retrieved by query operations, which know the concrete type.
+  void setExtension(std::string name, std::shared_ptr<void> data) {
+    extensions_.insert_or_assign(std::move(name), std::move(data));
+  }
+  std::shared_ptr<void> getExtension(const std::string& name) const {
+    auto it = extensions_.find(name);
+    return it == extensions_.end() ? nullptr : it->second;
+  }
 
   const auto& getVocab() const { return vocab_; };
   auto& getNonConstVocabForTesting() { return vocab_; }

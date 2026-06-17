@@ -11,8 +11,10 @@
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <typeindex>
 #include <range/v3/view/cartesian_product.hpp>
 #include <variant>
 
@@ -53,6 +55,7 @@
 #include "engine/TextLimit.h"
 #include "engine/TransitivePathBase.h"
 #include "engine/Union.h"
+#include "engine/MagicServicePlanning.h"
 #include "engine/Values.h"
 #include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/NaryExpression.h"
@@ -3140,6 +3143,8 @@ void QueryPlanner::GraphPatternPlanner::graphPatternOperationVisitor(Arg& arg) {
     visitSpatialSearch(arg);
   } else if constexpr (std::is_same_v<T, p::TextSearchQuery>) {
     visitTextSearch(arg);
+  } else if constexpr (std::is_same_v<T, p::MagicService>) {
+    planMagicService(*arg.query_);
   } else if constexpr (std::is_same_v<T, p::ExternalValuesQuery>) {
     visitExternalValues(arg);
   } else if constexpr (std::is_same_v<T, p::NamedCachedResult>) {
@@ -3297,6 +3302,47 @@ void QueryPlanner::GraphPatternPlanner::visitMaterializedViewQuery(
 }
 
 // _______________________________________________________________
+// Generic dispatch for a `MagicService` node: looks the concrete query type up
+// in the `MagicServicePlannerRegistry` and runs its handler through a stable
+// `MagicServicePlanningContext` façade. There is NO per-service code here;
+// services register their handler from their own translation unit (e.g.
+// `src/services/<name>/`). See `engine/MagicServicePlanning.h`.
+void QueryPlanner::GraphPatternPlanner::planMagicService(
+    parsedQuery::MagicServiceQuery& query) {
+  // Concrete façade backed by this planner; the only place that touches the
+  // planner internals (`makeSubtreePlan`, `optimize`, `visitGroupOptionalOrMinus`).
+  struct ContextImpl : MagicServicePlanningContext {
+    GraphPatternPlanner& self_;
+    explicit ContextImpl(GraphPatternPlanner& self) : self_{self} {}
+    QueryExecutionContext* qec() const override { return self_.qec_; }
+    void addLeafOperation(std::shared_ptr<Operation> operation) override {
+      std::vector<SubtreePlan> candidates;
+      candidates.push_back(makeSubtreePlan(std::move(operation)));
+      self_.visitGroupOptionalOrMinus(std::move(candidates));
+    }
+    void addOperationWithChildPattern(
+        parsedQuery::GraphPattern& childPattern,
+        std::function<std::shared_ptr<Operation>(
+            std::shared_ptr<QueryExecutionTree>)>
+            makeOperation) override {
+      auto childCandidates = self_.planner_.optimize(&childPattern);
+      std::vector<SubtreePlan> candidates;
+      for (auto& sub : childCandidates) {
+        candidates.push_back(
+            makeSubtreePlan(makeOperation(std::move(sub._qet))));
+      }
+      self_.visitGroupOptionalOrMinus(std::move(candidates));
+    }
+  } context{*this};
+
+  const MagicServicePlanner* handler =
+      MagicServicePlannerRegistry::get().lookup(std::type_index(typeid(query)));
+  AD_CONTRACT_CHECK(handler != nullptr,
+                    "No planner is registered for the magic service '",
+                    query.name(), "'.");
+  (*handler)(context, query);
+}
+
 void QueryPlanner::GraphPatternPlanner::visitSpatialSearch(
     parsedQuery::SpatialQuery& spatialQuery) {
   auto config = spatialQuery.toSpatialJoinConfiguration();

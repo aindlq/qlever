@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <filesystem>
 #include <future>
 #include <numeric>
 #include <optional>
@@ -18,6 +19,7 @@
 #include "backports/algorithm.h"
 #include "engine/AddCombinedRowToTable.h"
 #include "index/Index.h"
+#include "index/IndexExtension.h"
 #include "index/IndexFormatVersion.h"
 #include "index/VocabularyMerger.h"
 #include "parser/ParallelParseBuffer.h"
@@ -1000,6 +1002,12 @@ void IndexImpl::createFromOnDiskIndex(const std::string& onDiskBase,
 
   AD_LOG_DEBUG << "Number of words in internal and external vocabulary: "
                << vocab_.size() << std::endl;
+
+  // Let registered services load their auxiliary indices now that the vocabulary
+  // is available (see `IndexExtension.h`).
+  for (const auto& loadHook : IndexExtensionRegistry::get().loadHooks()) {
+    loadHook(*this, onDiskBase_);
+  }
 
   // Load the permutations and register the original metadata for the delta
   // triples.

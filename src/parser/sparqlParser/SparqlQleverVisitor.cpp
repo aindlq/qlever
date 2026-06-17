@@ -40,6 +40,7 @@
 #include "parser/GraphPatternOperation.h"
 #include "parser/MagicServiceIriConstants.h"
 #include "parser/MagicServiceQuery.h"
+#include "parser/MagicServiceRegistry.h"
 #include "parser/MaterializedViewQuery.h"
 #include "parser/NamedCachedResult.h"
 #include "parser/PathQuery.h"
@@ -1301,6 +1302,36 @@ GraphPatternOperation Visitor::visit(Parser::ServiceGraphPatternContext* ctx) {
                              MATERIALIZED_VIEW_IRI_WITHOUT_BRACKETS)) {
     return visitMagicServiceQuery<parsedQuery::MaterializedViewQuery>(
         ctx, serviceIri);
+  } else if (auto factory =
+                 parsedQuery::MagicServiceRegistry::get().lookup(serviceIri)) {
+    // A magic service registered via `MagicServiceRegistry` (the extensible
+    // path; no per-service code in this dispatch). Parse generically into a
+    // polymorphic `MagicService` node.
+    std::shared_ptr<parsedQuery::MagicServiceQuery> target =
+        factory.value()(serviceIri);
+    parsedQuery::GraphPattern graphPattern = visit(ctx->groupGraphPattern());
+    try {
+      for (const auto& op : graphPattern._graphPatterns) {
+        if (std::holds_alternative<parsedQuery::BasicGraphPattern>(op)) {
+          target->addBasicPattern(std::get<parsedQuery::BasicGraphPattern>(op));
+        } else if (std::holds_alternative<parsedQuery::GroupGraphPattern>(op)) {
+          target->addGraph(op);
+        } else {
+          throw std::runtime_error{absl::StrCat(
+              "Unsupported element in a magic service query of type `",
+              target->name(),
+              "`. Only triples and `{ group graph patterns }` are allowed ")};
+        }
+      }
+    } catch (const std::exception& e) {
+      reportError(ctx->groupGraphPattern(), e.what());
+    }
+    try {
+      target->validate();
+    } catch (const std::exception& ex) {
+      reportError(ctx, ex.what());
+    }
+    return parsedQuery::MagicService{std::move(target)};
   }
   // Parse the body of the SERVICE query. Add the visible variables from the
   // SERVICE clause to the visible variables so far, but also remember them

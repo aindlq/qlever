@@ -8,10 +8,13 @@
 
 #include "engine/ExportQueryExecutionTrees.h"
 #include "engine/MaterializedViews.h"
+#include "index/IndexExtension.h"
 #include "index/IndexImpl.h"
 #include "index/TextIndexBuilder.h"
 #include "libqlever/QleverTypes.h"
 #include "parser/SparqlParser.h"
+#include "util/Log.h"
+#include "util/json.h"
 
 namespace qlever {
 
@@ -119,6 +122,26 @@ void Qlever::buildIndex(IndexBuilderConfig config) {
       engine.writeMaterializedView(viewName, query);
     }
     AD_LOG_INFO << "All materialized views written successfully" << std::endl;
+  }
+
+  // Build service index-extensions if requested. Loading
+  // the just-built index gives the registered build hooks the vocabulary needed
+  // to resolve input IRIs to ids (permutations are not needed for that, so we
+  // skip loading them). Each service picks its own key from the config JSON.
+  if (!config.serviceIndexJson_.empty() &&
+      !IndexExtensionRegistry::get().buildHooks().empty()) {
+    AD_LOG_INFO << "Loading the new index to build service index-extensions ..."
+                << std::endl;
+    EngineConfig engineConfig{config};
+    engineConfig.doNotLoadPermutations_ = true;
+    Qlever engine{engineConfig};
+    nlohmann::json serviceConfig =
+        nlohmann::json::parse(config.serviceIndexJson_);
+    for (const auto& buildHook : IndexExtensionRegistry::get().buildHooks()) {
+      buildHook(*engine.index_, config.baseName_, serviceConfig);
+    }
+    AD_LOG_INFO << "All service index-extensions built successfully"
+                << std::endl;
   }
 }
 

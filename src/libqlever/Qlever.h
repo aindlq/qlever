@@ -147,6 +147,12 @@ struct IndexBuilderConfig : CommonConfig {
       std::vector<std::pair<std::string, std::string>>;
   WriteMaterializedViews writeMaterializedViews_;
 
+  // Raw JSON for service index-extensions to build after the main index is
+  // complete (a JSON object keyed by service name). Passed verbatim to every
+  // registered index-extension build hook (see `index/IndexExtension.h`); each
+  // service picks its own key. Empty = none.
+  std::string serviceIndexJson_;
+
   // Assert that the given configuration is valid.
   void validate() const;
 

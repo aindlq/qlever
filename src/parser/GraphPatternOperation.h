@@ -20,6 +20,7 @@
 #include "parser/MaterializedViewQuery.h"
 #include "parser/NamedCachedResult.h"
 #include "parser/PathQuery.h"
+#include "parser/MagicServiceQuery.h"
 #include "parser/SpatialQuery.h"
 #include "parser/TextSearchQuery.h"
 #include "parser/TripleComponent.h"
@@ -229,11 +230,20 @@ struct Bind {
 
 // TODO<joka921> Further refactor this, s.t. the whole `GraphPatternOperation`
 // class actually becomes `using GraphPatternOperation = std::variant<...>`
+// A generic magic-`SERVICE` node holding a polymorphic configuration. New magic
+// services register a parser factory (`MagicServiceRegistry`) and a planner
+// handler (`MagicServicePlannerRegistry`), and land here -- without being added
+// to this variant or to the parser/planner dispatch and exhaustiveness checks.
+// Drop-in services live under `src/services/`.
+struct MagicService {
+  std::shared_ptr<MagicServiceQuery> query_;
+};
+
 using GraphPatternOperationVariant =
     std::variant<Optional, Union, Subquery, TransPath, Bind, BasicGraphPattern,
                  Values, Service, PathQuery, SpatialQuery, TextSearchQuery,
                  Minus, GroupGraphPattern, Describe, Load, NamedCachedResult,
-                 MaterializedViewQuery, ExternalValuesQuery>;
+                 MaterializedViewQuery, ExternalValuesQuery, MagicService>;
 struct GraphPatternOperation
     : public GraphPatternOperationVariant,
       public VisitMixin<GraphPatternOperation, GraphPatternOperationVariant> {

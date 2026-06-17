@@ -174,6 +174,7 @@ qlever::IndexBuilderConfig::WriteMaterializedViews parseMaterializedViewsJson(
   return views;
 }
 
+
 // Main function.
 int main(int argc, char** argv) {
   // Copy the git hash and datetime of compilation (which require relinking)
@@ -192,6 +193,7 @@ int main(int argc, char** argv) {
   std::vector<string> defaultGraphs;
   std::vector<bool> parseParallel;
   std::string materializedViewsJson;
+  std::string serviceIndexJson;
 
   boost::program_options::options_description boostOptions(
       "Options for qlever-index");
@@ -291,6 +293,11 @@ int main(int argc, char** argv) {
       "create materialized views after index building. Takes a JSON object "
       "mapping view names to SELECT queries for writing the view, for example: "
       R"({"view1": "SELECT ...", "view2": "SELECT ..."})");
+  add("service-index", po::value(&serviceIndexJson),
+      "build custom service index-extensions after index building. Takes a JSON "
+      "object keyed by service name; each registered service interprets its own "
+      "value, e.g.: "
+      R"({"<service-name>": <service-specific JSON>})");
 
   // Process command line arguments.
   po::variables_map optionsMap;
@@ -323,6 +330,7 @@ int main(int argc, char** argv) {
                                                defaultGraphs, parseParallel);
     config.writeMaterializedViews_ =
         parseMaterializedViewsJson(materializedViewsJson);
+    config.serviceIndexJson_ = serviceIndexJson;
     config.validate();
     // For index building, use more threads for writing permutations than the
     // default (which is optimized for `rebuild-index`, where six permutations
