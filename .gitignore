@@ -1,6 +1,9 @@
 # Build directory
 build/
+build-conan/
 cmake-build*
+# Conan-generated user presets
+CMakeUserPresets.json
 
 # End-to-End data
 e2e_data/*

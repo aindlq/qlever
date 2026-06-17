@@ -206,6 +206,43 @@ FetchContent_Declare(
 # disable bzip2 and zlib support in spatialjoin, we don't need it
 add_compile_definitions(SPATIALJOIN_NO_BZIP2=True SPATIALJOIN_NO_ZLIB=True)
 
+#################################
+# usearch (header-only vector similarity search, for the built-in vector index)
+################################
+FetchContent_Declare(
+        usearch
+        GIT_REPOSITORY https://github.com/unum-cloud/usearch
+        GIT_TAG 9fd6b0115dcdd0016e037fb5335f36824dd02090  # v2.25.3
+        GIT_SUBMODULES ""  # fp16/simsimd submodules are optional and unused
+        SYSTEM
+        EXCLUDE_FROM_ALL
+)
+# Use the bundled scalar implementations only; no optional SIMD/fp16 submodules.
+add_compile_definitions(USEARCH_USE_FP16LIB=0 USEARCH_USE_SIMSIMD=0 USEARCH_USE_OPENMP=0)
+
+#################################
+# llama.cpp (OPTIONAL, off by default): in-process embedding generation.
+# Enable with -DQLEVER_WITH_LLAMACPP=ON. When off, no llama.cpp code is compiled
+# and the `llama:` embedding endpoint scheme reports a clear error.
+################################
+option(QLEVER_WITH_LLAMACPP "Build the optional in-process llama.cpp embedding backend" OFF)
+if (QLEVER_WITH_LLAMACPP)
+    FetchContent_Declare(
+            llama
+            GIT_REPOSITORY https://github.com/ggml-org/llama.cpp
+            GIT_TAG b4991  # pin a known release
+            SYSTEM
+            EXCLUDE_FROM_ALL
+    )
+    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(llama)
+    add_compile_definitions(QLEVER_WITH_LLAMACPP=1)
+    message(STATUS "QLever: building the in-process llama.cpp embedding backend")
+endif ()
+
 ################################
 # Threading
 ################################
@@ -475,6 +512,13 @@ include_directories(SYSTEM ${range-v3_SOURCE_DIR}/include)
 target_compile_options(antlr4_static PRIVATE -Wno-all -Wno-extra -Wno-error -Wno-deprecated-declarations)
 # Only required because a lot of classes that do not explicitly link against antlr4_static use the headers.
 include_directories(SYSTEM "${antlr_SOURCE_DIR}/runtime/Cpp/runtime/src")
+
+# usearch is header-only: populate the sources and add its include directory.
+FetchContent_GetProperties(usearch)
+if (NOT usearch_POPULATED)
+    FetchContent_Populate(usearch)
+endif ()
+include_directories(SYSTEM "${usearch_SOURCE_DIR}/include")
 
 message(STATUS ---)
 message(STATUS "CXX_FLAGS are : " ${CMAKE_CXX_FLAGS})

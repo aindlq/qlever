@@ -212,6 +212,8 @@ addLinkAndDiscoverTest(HasPredicateScanTest engine)
 
 addLinkAndDiscoverTest(MmapVectorTest)
 
+addLinkAndDiscoverTest(VectorIndexTest vectorStorage)
+
 # BufferedVectorTest also uses conflicting filenames.
 addLinkAndDiscoverTest(BufferedVectorTest)
 
