@@ -295,6 +295,12 @@ TEST(VectorSearchService, parseErrors) {
       planQuery(qec, query("_:c vec:index \"clip\" ; vec:left ?x ; "
                            "vec:result ?x . { ?x <is-a> <Statue> }")),
       HasSubstr("must be different"));
+  // `<left>` and `<bindScore>` must differ.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, query("_:c vec:index \"clip\" ; vec:left ?x ; "
+                           "vec:result ?nn ; vec:bindScore ?x . "
+                           "{ ?x <is-a> <Statue> }")),
+      HasSubstr("must be different"));
 }
 
 // _____________________________________________________________________________
@@ -432,6 +438,74 @@ TEST(VectorSearchService, outerBoundLeftJoinForm) {
   std::set<uint64_t> nns{table(0, col).getBits(), table(1, col).getBits()};
   EXPECT_TRUE(nns.contains(getId("<e2>").getBits()));
   EXPECT_TRUE(nns.contains(getId("<e1>").getBits()));
+}
+
+// _____________________________________________________________________________
+// The result variable may ALSO be constrained by the surrounding query (a join
+// on the vector-search output). Planning must not abort, and the result is the
+// k nearest that also satisfy the constraint. (Regression: an incomplete op
+// exposing its output columns must not turn an output-variable connection into
+// a normal join that aborts planning.)
+TEST(VectorSearchService, outerBoundLeftResultAlsoConstrained) {
+  auto* qec = qecWithVectorIndex();
+  auto [result, col] = runQuery(
+      qec,
+      std::string{PREFIX} +
+          "SELECT * WHERE { ?x <is-a> <Painting> . ?nn <is-a> <Statue> . "
+          "SERVICE vec: { _:c vec:index \"clip\" ; vec:left ?x ; "
+          "vec:result ?nn ; vec:k 5 . } }",
+      Variable{"?nn"});
+  auto getId = makeGetId(qec->getIndex());
+  const IdTable& table = result->idTable();
+  // <e2>'s neighbours are {e2,e1,e0,e3}; intersect with statues {e0,e1,e3}.
+  std::set<uint64_t> got;
+  for (size_t i = 0; i < table.numRows(); ++i)
+    got.insert(table(i, col).getBits());
+  EXPECT_FALSE(got.contains(getId("<e2>").getBits()));  // e2 is a painting
+  for (uint64_t id : got) {
+    EXPECT_TRUE(id == getId("<e0>").getBits() ||
+                id == getId("<e1>").getBits() || id == getId("<e3>").getBits());
+  }
+  EXPECT_TRUE(got.contains(getId("<e1>").getBits()));  // nearest statue
+}
+
+// _____________________________________________________________________________
+// A FILTER on the score of an outer-bound-left search must apply after the
+// join completes, not attach to the incomplete operation (which would leave it
+// unjoinable and fail at runtime).
+TEST(VectorSearchService, outerBoundLeftFilterOnScore) {
+  auto* qec = qecWithVectorIndex();
+  auto [result, col] = runQuery(
+      qec,
+      std::string{PREFIX} +
+          "SELECT * WHERE { ?x <is-a> <Painting> . "
+          "SERVICE vec: { _:c vec:index \"clip\" ; vec:left ?x ; "
+          "vec:result ?nn ; vec:bindScore ?s ; vec:k 5 . } FILTER(?s < 0.01) }",
+      Variable{"?nn"});
+  auto getId = makeGetId(qec->getIndex());
+  const IdTable& table = result->idTable();
+  // Only the self-match (distance ~0) survives the filter.
+  ASSERT_EQ(table.numRows(), 1u);
+  EXPECT_EQ(table(0, col), getId("<e2>"));
+}
+
+// _____________________________________________________________________________
+// Taking `<left>` from an OPTIONAL/MINUS pattern is not supported and must be
+// a clear error (not silent inner-join / expansion semantics).
+TEST(VectorSearchService, outerBoundLeftOptionalMinusRejected) {
+  auto* qec = qecWithVectorIndex();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT * WHERE { ?x <is-a> <Painting> . OPTIONAL { "
+                         "SERVICE vec: { _:c vec:index \"clip\" ; vec:left "
+                         "?x ; vec:result ?nn ; vec:k 2 . } } }"),
+      HasSubstr("OPTIONAL or MINUS"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT * WHERE { ?x <is-a> <Painting> . MINUS { "
+                         "SERVICE vec: { _:c vec:index \"clip\" ; vec:left "
+                         "?x ; vec:result ?nn ; vec:k 2 . } } }"),
+      HasSubstr("OPTIONAL or MINUS"));
 }
 
 // _____________________________________________________________________________

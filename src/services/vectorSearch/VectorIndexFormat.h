@@ -72,8 +72,9 @@ enum class VectorMetric : uint8_t { Cosine, L2Sq, InnerProduct };
 
 // The scalar type the vectors are stored as. `F32` is the default; the
 // smaller types trade a little recall for a half/quarter storage (and page
-// cache) footprint. `I8` expects roughly normalized inputs (values in
-// [-1, 1], as produced by cosine-ready embedding models).
+// cache) footprint. NOTE: `I8` rescales every vector to a common magnitude
+// (usearch's dot-product-oriented int8 cast), so it is only meaningful with
+// the `cosine` metric (the builder rejects `i8` + `l2sq`/`innerProduct`).
 enum class VectorScalar : uint8_t { F32, F16, I8 };
 
 // Bytes per stored scalar value.
@@ -154,8 +155,8 @@ struct VectorIndexConfig {
 };
 
 // One vector index to build during `qlever index`: its configuration plus the
-// input files (currently a `.npy` float matrix + a row-aligned IRI list; a
-// Parquet reader is planned). Each input IRI is resolved against the freshly
+// input files (a `.npy` float matrix + a row-aligned IRI list, a texts file to
+// embed, or a Parquet file). Each input IRI is resolved against the freshly
 // built knowledge-graph vocabulary; rows whose IRI is unknown are skipped.
 struct VectorIndexBuildSpec {
   VectorIndexConfig config_;

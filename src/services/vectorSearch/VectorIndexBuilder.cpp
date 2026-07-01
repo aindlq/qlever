@@ -19,6 +19,7 @@
 #include "util/File.h"
 #include "util/Log.h"
 #include "util/MmapVector.h"
+#include "util/jthread.h"
 
 namespace qlever::vector {
 
@@ -41,28 +42,37 @@ class FileCleanup {
   std::vector<std::string> paths_;
 };
 
-// Run `job(threadIdx, firstRow, lastRow)` for a partition of `[0, n)` over
-// `numThreads` threads and rethrow the first error, if any.
+// Run `job(threadIdx, firstRow, lastRow, shouldStop)` for a partition of
+// `[0, n)` over `numThreads` threads and rethrow the first error, if any.
+// `shouldStop` becomes true as soon as any thread fails, so a long job (a
+// multi-hour HNSW build) can abort promptly instead of running to completion.
 template <typename Job>
 void parallelOverRows(size_t n, size_t numThreads, const Job& job) {
   numThreads = std::max<size_t>(1, std::min(numThreads, n));
-  std::atomic_flag failed = ATOMIC_FLAG_INIT;
+  std::atomic<bool> stop{false};
   std::mutex errorMutex;
   std::string firstError;
+  auto recordError = [&](std::string message) {
+    stop.store(true, std::memory_order_relaxed);
+    std::lock_guard lock{errorMutex};
+    if (firstError.empty()) {
+      firstError =
+          message.empty() ? std::string{"unknown build error"} : message;
+    }
+  };
   auto guardedJob = [&](size_t t, size_t first, size_t last) {
     try {
-      job(t, first, last);
+      job(t, first, last, stop);
     } catch (const std::exception& e) {
-      if (!failed.test_and_set()) {
-        std::lock_guard lock{errorMutex};
-        firstError = e.what();
-      }
+      recordError(e.what());
+    } catch (...) {
+      recordError("non-standard exception");
     }
   };
   if (numThreads == 1) {
     guardedJob(0, 0, n);
   } else {
-    std::vector<std::thread> threads;
+    std::vector<ad_utility::JThread> threads;
     threads.reserve(numThreads);
     size_t chunk = (n + numThreads - 1) / numThreads;
     for (size_t t = 0; t < numThreads; ++t) {
@@ -138,6 +148,26 @@ void VectorIndexBuilder::add(Id entity, std::string_view iri,
 VectorIndexMetadata VectorIndexBuilder::build() {
   vecSpill_.close();
   iriSpill_.close();
+  // A failed flush at close (e.g. disk full) would leave a truncated spill;
+  // the gather below reads by absolute offset and (because `File::read` loops
+  // to EOF) would otherwise hang instead of erroring. Verify the spill sizes.
+  if (vecSpill_.fail() || iriSpill_.fail()) {
+    AD_THROW("Writing the temporary build files of vector index \"" +
+             config_.name_ + "\" failed (disk full?).");
+  }
+  {
+    std::error_code ec;
+    auto vecSize = std::filesystem::file_size(vecSpillPath_, ec);
+    if (ec || vecSize != ids_.size() * rowBytes_) {
+      AD_THROW("The temporary vector file of vector index \"" + config_.name_ +
+               "\" is incomplete (disk full?).");
+    }
+    auto iriSize = std::filesystem::file_size(iriSpillPath_, ec);
+    if (ec || iriSize != iriSpillOffset_) {
+      AD_THROW("The temporary IRI file of vector index \"" + config_.name_ +
+               "\" is incomplete (disk full?).");
+    }
+  }
   // The spill files are always removed -- also on success (`dismiss` is only
   // called for the `.tmp` outputs tracked by `outputsCleanup` below).
   FileCleanup spillCleanup;
@@ -203,16 +233,18 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     data.open(n * rowBytes_, tmp(dataPath));
     ad_utility::File spill{vecSpillPath_.c_str(), "r"};
     char* dataBegin = n > 0 ? &data[0] : nullptr;
-    parallelOverRows(n, numThreads, [&](size_t, size_t first, size_t last) {
-      for (size_t i = first; i < last; ++i) {
-        ssize_t read = spill.read(dataBegin + i * rowBytes_, rowBytes_,
-                                  static_cast<off_t>(rows[i] * rowBytes_));
-        if (read != static_cast<ssize_t>(rowBytes_)) {
-          throw std::runtime_error{
-              "Reading back the temporary vector file failed."};
-        }
-      }
-    });
+    parallelOverRows(
+        n, numThreads, [&](size_t, size_t first, size_t last, auto& stop) {
+          for (size_t i = first; i < last; ++i) {
+            if (stop.load(std::memory_order_relaxed)) return;
+            ssize_t read = spill.read(dataBegin + i * rowBytes_, rowBytes_,
+                                      static_cast<off_t>(rows[i] * rowBytes_));
+            if (read != static_cast<ssize_t>(rowBytes_)) {
+              throw std::runtime_error{
+                  "Reading back the temporary vector file failed."};
+            }
+          }
+        });
     // Destructor flushes and writes the trailer.
   }
 
@@ -246,9 +278,10 @@ VectorIndexMetadata VectorIndexBuilder::build() {
       }
       irisOut << buffer << '\n';
     }
-    if (!irisOut) {
+    irisOut.close();
+    if (irisOut.fail()) {
       AD_THROW("Writing the IRI sidecar of vector index \"" + config_.name_ +
-               "\" failed.");
+               "\" failed (disk full?).");
     }
   }
 
@@ -277,29 +310,35 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     AD_LOG_INFO << "Building the HNSW graph for vector index '" << config_.name_
                 << "' (" << n << " vectors, " << numThreads << " threads) ..."
                 << std::endl;
-    parallelOverRows(n, numThreads, [&](size_t t, size_t first, size_t last) {
-      uu::index_update_config_t updateConfig;
-      updateConfig.thread = t;
-      updateConfig.expansion = config_.hnswExpansionAdd_;
-      for (size_t row = first; row < last; ++row) {
-        auto added =
-            graph.add(row, graphMetric.rowPtr(row), graphMetric, updateConfig);
-        if (!added) {
-          throw std::runtime_error{
-              std::string{"Could not add a vector to the HNSW graph: "} +
-              added.error.what()};
-        }
-      }
-    });
+    parallelOverRows(
+        n, numThreads, [&](size_t t, size_t first, size_t last, auto& stop) {
+          uu::index_update_config_t updateConfig;
+          updateConfig.thread = t;
+          updateConfig.expansion = config_.hnswExpansionAdd_;
+          for (size_t row = first; row < last; ++row) {
+            if (stop.load(std::memory_order_relaxed)) return;
+            auto added = graph.add(row, graphMetric.rowPtr(row), graphMetric,
+                                   updateConfig);
+            if (!added) {
+              throw std::runtime_error{
+                  std::string{"Could not add a vector to the HNSW graph: "} +
+                  added.error.what()};
+            }
+          }
+        });
     std::ofstream hnswOut{tmp(hnswPath), std::ios::binary | std::ios::trunc};
+    bool streamOk = true;
     auto saved = graph.save_to_stream([&](const void* buffer, size_t length) {
       hnswOut.write(reinterpret_cast<const char*>(buffer),
                     static_cast<std::streamsize>(length));
-      return static_cast<bool>(hnswOut);
+      streamOk = static_cast<bool>(hnswOut);
+      return streamOk;
     });
-    if (!saved || !hnswOut) {
+    hnswOut.close();
+    if (!saved || !streamOk || hnswOut.fail()) {
       AD_THROW("Could not save the HNSW graph of vector index \"" +
-               config_.name_ + "\": " + saved.error.what());
+               config_.name_ + "\" (disk full?): " +
+               (saved ? "stream write failed" : saved.error.what()));
     }
   }
 
@@ -318,6 +357,11 @@ VectorIndexMetadata VectorIndexBuilder::build() {
       AD_THROW("Could not write the vector metadata file " + tmp(metaPath));
     }
     metaOut << nlohmann::json(meta).dump(2);
+    metaOut.close();
+    if (metaOut.fail()) {
+      AD_THROW("Could not write the vector metadata file " + tmp(metaPath) +
+               " (disk full?).");
+    }
   }
 
   // 8. Rename everything into place (metadata last, see above). A stale

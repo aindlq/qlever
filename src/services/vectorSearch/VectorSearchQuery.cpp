@@ -173,6 +173,10 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   throwIf(scoreVar_.has_value() && scoreVar_ == resultVar_,
           "The `<bindScore>` and `<result>` variables of a vector search must "
           "be different.");
+  throwIf(
+      scoreVar_.has_value() && leftVar_.has_value() && scoreVar_ == leftVar_,
+      "The `<bindScore>` and `<left>` variables of a vector search must be "
+      "different.");
   // Otherwise (a query *point* via queryVector/query/queryText/image): a nested
   // pattern is OPTIONAL and, if present, restricts the search to the entities
   // it binds to `<result>` (exact search over that candidate set -- the "small

@@ -7,15 +7,18 @@
 
 #include "index/IndexExtension.h"
 
+// _____________________________________________________________________________
 IndexExtensionRegistry& IndexExtensionRegistry::get() {
   static IndexExtensionRegistry instance;
   return instance;
 }
 
+// _____________________________________________________________________________
 void IndexExtensionRegistry::addBuildHook(BuildHook hook) {
   buildHooks_.push_back(std::move(hook));
 }
 
+// _____________________________________________________________________________
 void IndexExtensionRegistry::addLoadHook(LoadHook hook) {
   loadHooks_.push_back(std::move(hook));
 }

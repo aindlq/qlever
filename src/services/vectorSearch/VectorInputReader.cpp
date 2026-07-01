@@ -120,16 +120,31 @@ NpyVectorInputReader::NpyVectorInputReader(const std::string& npyPath,
                 (static_cast<uint32_t>(b[2]) << 16) |
                 (static_cast<uint32_t>(b[3]) << 24);
   }
+  // A .npy header is a short ASCII dict; cap it so a corrupt length field
+  // cannot request a multi-GB allocation before the (bounded) read.
+  if (headerLen > (1u << 20)) {
+    AD_THROW("The .npy header of " + npyPath + " is implausibly large (" +
+             std::to_string(headerLen) + " bytes).");
+  }
   std::string header(headerLen, '\0');
   npy_.read(header.data(), headerLen);
   if (npy_.gcount() != static_cast<std::streamsize>(headerLen)) {
     AD_THROW("Unexpected end of file in the .npy header of " + npyPath);
   }
 
-  // We only support little-endian float32, C-order. (The raw little-endian
-  // float read below matches QLever's general little-endian assumption.)
-  if (header.find("'<f4'") == std::string::npos &&
-      header.find("\"<f4\"") == std::string::npos) {
+  // We only support little-endian float32, C-order. Match the `descr` VALUE
+  // exactly (a substring check would accept a structured dtype that merely
+  // contains a `<f4` field and then silently misread the row stride).
+  auto descrIsF4 = [&header](std::string_view quote) {
+    size_t pos = header.find("'descr'");
+    if (pos == std::string::npos) return false;
+    pos = header.find(':', pos);
+    if (pos == std::string::npos) return false;
+    pos = header.find_first_not_of(" ", pos + 1);
+    return pos != std::string::npos &&
+           header.compare(pos, quote.size(), quote) == 0;
+  };
+  if (!descrIsF4("'<f4'") && !descrIsF4("\"<f4\"")) {
     AD_THROW(".npy input must be little-endian float32 ('<f4'). Header: " +
              header.substr(0, 200));
   }
@@ -352,6 +367,21 @@ bool ParquetVectorInputReader::next(std::string& iri,
              " of the Parquet input has an embedding of length " +
              std::to_string(length) + ", but earlier rows had " +
              std::to_string(impl.dimensions_) + ".");
+  }
+  // Guard the leaf reads against a corrupt offsets buffer (Arrow does not
+  // bounds-check `Value()` in release builds).
+  if (offset < 0 || offset + length > values->length()) {
+    AD_THROW("Row " + std::to_string(rowNumber) +
+             " of the Parquet input has an out-of-range embedding offset.");
+  }
+  // A null inside the embedding list would read an unspecified value.
+  if (values->null_count() != 0) {
+    for (int64_t j = 0; j < length; ++j) {
+      if (values->IsNull(offset + j)) {
+        AD_THROW("Row " + std::to_string(rowNumber) +
+                 " of the Parquet input has a null value in its embedding.");
+      }
+    }
   }
   vector.resize(impl.dimensions_);
   if (values->type_id() == arrow::Type::FLOAT) {

@@ -32,9 +32,9 @@ class VectorInputReader {
 // Reads a 2-D little-endian float32 NumPy `.npy` matrix (shape `(N, D)`,
 // C-order) together with a sidecar text file of `N` IRIs, one per line, where
 // line `i` labels row `i` of the matrix. This is the dependency-free default
-// ingest format (a Parquet reader using Apache Arrow is the planned production
-// alternative; see the implementation log). `np.save("vectors.npy", arr)` plus
-// writing the IRIs to a text file is all it takes to produce.
+// ingest format (`ParquetVectorInputReader` below is the alternative for large
+// production inputs). `np.save("vectors.npy", arr)` plus writing the IRIs to a
+// text file is all it takes to produce.
 class NpyVectorInputReader : public VectorInputReader {
  public:
   NpyVectorInputReader(const std::string& npyPath, const std::string& irisPath);

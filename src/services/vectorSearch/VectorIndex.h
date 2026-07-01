@@ -93,10 +93,13 @@ class VectorIndex {
       const CheckInterruptCallback& checkInterrupt = {}) const;
 
   // Approximate top-`k` via the HNSW graph over the whole index. Requires
-  // `hasHnsw()`. Results are ascending by distance.
+  // `hasHnsw()`. Results are ascending by distance. `k` is clamped to the
+  // number of live vectors. `checkInterrupt`, if set, is polled while waiting
+  // for a search slot so the search can be cancelled under load.
   std::vector<ScoredEntity> searchHnsw(
       ql::span<const float> query, size_t k,
-      std::optional<float> maxDistance = std::nullopt) const;
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {}) const;
 
   // The same two searches with a STORED entity's vector as the query point
   // (used by the join form and `vec:query <iri>`). The stored bytes are used
@@ -108,8 +111,8 @@ class VectorIndex {
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
   std::vector<ScoredEntity> searchHnswByEntity(
-      Id entity, size_t k,
-      std::optional<float> maxDistance = std::nullopt) const;
+      Id entity, size_t k, std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {}) const;
 
  private:
   struct Impl;

@@ -7,6 +7,7 @@
 
 #include "services/vectorSearch/VectorIndex.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
@@ -53,9 +54,24 @@ class SearchSlotPool {
     size_t id_;
   };
 
-  Slot acquire() {
+  // Acquire a slot, waiting if none is free. `checkInterrupt`, if set, is
+  // invoked while waiting so that a cancelled/timed-out query does not park a
+  // worker thread here indefinitely (it throws to unwind).
+  Slot acquire(const CheckInterruptCallback& checkInterrupt) {
     std::unique_lock lock{mutex_};
-    cv_.wait(lock, [this] { return !free_.empty(); });
+    while (free_.empty()) {
+      if (checkInterrupt) {
+        cv_.wait_for(lock, std::chrono::milliseconds{50},
+                     [this] { return !free_.empty(); });
+        if (free_.empty()) {
+          lock.unlock();
+          checkInterrupt();  // throws on cancellation
+          lock.lock();
+        }
+      } else {
+        cv_.wait(lock, [this] { return !free_.empty(); });
+      }
+    }
     size_t id = free_.front();
     free_.pop();
     return Slot{*this, id};
@@ -198,8 +214,22 @@ void VectorIndex::open(const std::string& basename, const std::string& name) {
       impl.rowmap_.size() != impl.numLive()) {
     complainInterrupted("the entity mapping on disk");
   }
+  if (impl.meta_.config_.dimensions_ == 0) {
+    complainInterrupted("the dimension");
+  }
   if (impl.data_.size() != impl.meta_.numVectors_ * impl.rowBytes()) {
     complainInterrupted("the data size on disk");
+  }
+  // Validate the VALUES in the mapping (not just the counts): `.rowmap` must be
+  // sorted by id and every `row_` must be in range, so that the unchecked
+  // memory-mapped reads on the query paths can never go out of bounds on a
+  // corrupt or truncated index file. One O(numLive) scan at load.
+  for (size_t i = 0; i < impl.rowmap_.size(); ++i) {
+    const IdRowPair& pair = impl.rowmap_[i];
+    if (pair.row_ >= impl.meta_.numVectors_ || pair.idBits_ == TOMBSTONE_KEY ||
+        (i > 0 && impl.rowmap_[i - 1].idBits_ >= pair.idBits_)) {
+      complainInterrupted("the entity mapping on disk");
+    }
   }
 
   // 3. The shared metric (over the storage scalar) and the f32 casts.
@@ -317,7 +347,10 @@ std::vector<ScoredEntity> searchExactBytes(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt) {
-  if (k == 0 || impl.numLive() == 0) {
+  // Clamp `k` (user-supplied, unbounded) to the number of live vectors: it
+  // bounds the `TopK` heap and would otherwise be a remote OOM lever.
+  k = std::min(k, impl.numLive());
+  if (k == 0) {
     return {};
   }
   TopK top{k};
@@ -398,61 +431,72 @@ std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
 // ____________________________________________________________________________
 // The scalar-agnostic core of the HNSW search (see `searchExactBytes`).
 template <typename ImplT>
-std::vector<ScoredEntity> searchHnswBytes(const ImplT& impl,
-                                          const char* queryBytesIn, size_t k,
-                                          std::optional<float> maxDistance) {
+std::vector<ScoredEntity> searchHnswBytes(
+    const ImplT& impl, const char* queryBytesIn, size_t k,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt) {
   AD_CONTRACT_CHECK(impl.graph_.has_value(),
                     "searchHnsw called but this index has no HNSW structure.");
-  if (k == 0 || impl.numLive() == 0) {
+  // Clamp to the number of live vectors: `k` is user-supplied and unbounded,
+  // and drives the allocations below -- an unclamped `k` is a remote OOM lever.
+  k = std::min(k, impl.numLive());
+  if (k == 0) {
     return {};
   }
-  auto slot = impl.searchSlots_->acquire();
+  // Fetch `k + numTombstones` results: at most `numTombstones` of the nearest
+  // can be tombstoned, so this provably captures the k nearest LIVE results in
+  // a SINGLE search -- no unbounded retry loop, and the allocation is bounded
+  // by the index size. (A heavily tombstoned index inflates `wanted`; that is
+  // the documented "rebuild after many removals" case.)
+  size_t wanted =
+      std::min<size_t>(impl.meta_.numVectors_, k + impl.meta_.numTombstones_);
+  if (checkInterrupt) {
+    checkInterrupt();
+  }
+  auto slot = impl.searchSlots_->acquire(checkInterrupt);
   FlatStoreMetric metric = impl.graphMetric();
   const auto* queryBytes = reinterpret_cast<const uu::byte_t*>(queryBytesIn);
 
-  // Tombstoned rows are filtered AFTER the graph search; if too few live
-  // results remain, retry with a doubled result count (bounded by the graph
-  // size). Without tombstones a single pass always suffices.
-  size_t wanted = k;
+  uu::index_search_config_t config;
+  config.thread = slot.id();
+  config.expansion =
+      std::max<size_t>(impl.meta_.config_.hnswExpansionSearch_, wanted);
+  auto result = impl.graph_->search(queryBytes, wanted, metric, config);
+  if (!result) {
+    AD_THROW("HNSW search on vector index \"" + impl.meta_.config_.name_ +
+             "\" failed: " + result.error.what());
+  }
+  std::vector<uint64_t> rows(wanted);
+  std::vector<uu::distance_punned_t> dists(wanted);
+  size_t count = result.dump_to(rows.data(), dists.data());
   std::vector<ScoredEntity> out;
-  while (true) {
-    uu::index_search_config_t config;
-    config.thread = slot.id();
-    config.expansion =
-        std::max<size_t>(impl.meta_.config_.hnswExpansionSearch_, wanted);
-    auto result = impl.graph_->search(queryBytes, wanted, metric, config);
-    if (!result) {
-      AD_THROW("HNSW search on vector index \"" + impl.meta_.config_.name_ +
-               "\" failed: " + result.error.what());
+  out.reserve(k);
+  for (size_t i = 0; i < count && out.size() < k; ++i) {
+    float dist = static_cast<float>(dists[i]);
+    // `maxDistance` legitimately yields fewer than k results (there simply are
+    // not k neighbours within the distance) -- that is the correct answer, not
+    // a reason to fetch more.
+    if (maxDistance.has_value() && dist > maxDistance.value()) {
+      continue;
     }
-    std::vector<uint64_t> rows(wanted);
-    std::vector<uu::distance_punned_t> dists(wanted);
-    size_t count = result.dump_to(rows.data(), dists.data());
-    out.clear();
-    for (size_t i = 0; i < count && out.size() < k; ++i) {
-      float dist = static_cast<float>(dists[i]);
-      if (maxDistance.has_value() && dist > maxDistance.value()) {
-        continue;
-      }
-      uint64_t id = impl.keys_[rows[i]];
-      if (id == TOMBSTONE_KEY) {
-        continue;
-      }
-      out.push_back(ScoredEntity{Id::fromBits(id), dist});
+    // Defense in depth: a graph member key is a row index; guard the unchecked
+    // `keys_` access against a corrupt `.hnsw`.
+    if (rows[i] >= impl.meta_.numVectors_) {
+      continue;
     }
-    bool exhausted = wanted >= impl.meta_.numVectors_;
-    if (out.size() >= k || impl.meta_.numTombstones_ == 0 || exhausted) {
-      break;
+    uint64_t id = impl.keys_[rows[i]];
+    if (id == TOMBSTONE_KEY) {
+      continue;
     }
-    wanted = std::min<size_t>(impl.meta_.numVectors_, wanted * 2);
+    out.push_back(ScoredEntity{Id::fromBits(id), dist});
   }
   return out;
 }
 
 // ____________________________________________________________________________
 std::vector<ScoredEntity> VectorIndex::searchHnsw(
-    ql::span<const float> query, size_t k,
-    std::optional<float> maxDistance) const {
+    ql::span<const float> query, size_t k, std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt) const {
   const auto& impl = *impl_;
   if (query.size() != impl.dim()) {
     AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
@@ -461,18 +505,20 @@ std::vector<ScoredEntity> VectorIndex::searchHnsw(
   }
   std::vector<char> buffer;
   const char* queryBytes = impl.encodeQuery(query, buffer);
-  return searchHnswBytes(impl, queryBytes, k, maxDistance);
+  return searchHnswBytes(impl, queryBytes, k, maxDistance, checkInterrupt);
 }
 
 // ____________________________________________________________________________
 std::vector<ScoredEntity> VectorIndex::searchHnswByEntity(
-    Id entity, size_t k, std::optional<float> maxDistance) const {
+    Id entity, size_t k, std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt) const {
   const auto& impl = *impl_;
   auto row = impl.rowOf(entity);
   if (!row.has_value()) {
     return {};
   }
-  return searchHnswBytes(impl, impl.rowPtr(row.value()), k, maxDistance);
+  return searchHnswBytes(impl, impl.rowPtr(row.value()), k, maxDistance,
+                         checkInterrupt);
 }
 
 }  // namespace qlever::vector

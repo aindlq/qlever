@@ -75,7 +75,7 @@ deterministic build. Reference point (48-core AVX-512 Xeon, clustered data):
 builder RSS, i.e. ~83k vectors/s -- roughly 20 minutes per 100M vectors.
 
 On-disk layout per index `N` of database `B` (see `VectorIndexFormat.h` for
-details): `B.vec.N.meta` (JSON), `B.vec.N.data` (row-major floats; immutable),
+details): `B.vec.N.meta` (JSON), `B.vec.N.data` (row-major matrix in the configured scalar type; immutable),
 `B.vec.N.iris` (row-aligned IRIs; immutable), `B.vec.N.keys` (row -> entity
 id), `B.vec.N.rowmap` (entity id -> row), `B.vec.N.hnsw` (optional usearch
 graph, keyed by ROW index; the vectors are NOT duplicated into it -- distances
@@ -132,7 +132,10 @@ Exactly one **query point** must be given:
   `llama:/model.gguf` when built with `-DQLEVER_WITH_LLAMACPP=ON`);
 - `vec:imageUrl <...>` / `vec:imageBase64 "..."` — an image, embedded at query
   time (server-local file paths are deliberately not supported: that would let
-  remote clients read arbitrary server files);
+  remote clients read arbitrary server files). NOTE: a `vec:imageUrl` and the
+  `vec:queryText` are forwarded to the operator-configured embedding endpoint,
+  which then fetches/embeds them — if that endpoint sits on a trusted network,
+  treat `imageUrl` as a request-forgery vector and restrict it accordingly;
 - `vec:left ?x` — the **join form**: for each `?x`, emit the k nearest
   entities. `?x` is bound either by a nested `{ ... }` pattern inside the
   SERVICE, or — like the spatial join — by the **surrounding query**:

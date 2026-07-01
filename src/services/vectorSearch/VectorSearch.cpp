@@ -295,15 +295,17 @@ Result VectorSearch::computeResult([[maybe_unused]] bool requestLaziness) {
     // decode/re-encode through f32).
     bool useHnsw = vidx->hasHnsw() && config_.algorithm_ != Algo::Exact;
     if (queryEntity.has_value()) {
-      results = useHnsw
-                    ? vidx->searchHnswByEntity(queryEntity.value(), config_.k_,
-                                               config_.maxDistance_)
-                    : vidx->searchExactByEntity(
-                          queryEntity.value(), config_.k_, std::nullopt,
-                          config_.maxDistance_, checkInterrupt);
+      results =
+          useHnsw
+              ? vidx->searchHnswByEntity(queryEntity.value(), config_.k_,
+                                         config_.maxDistance_, checkInterrupt)
+              : vidx->searchExactByEntity(queryEntity.value(), config_.k_,
+                                          std::nullopt, config_.maxDistance_,
+                                          checkInterrupt);
     } else {
       results = useHnsw
-                    ? vidx->searchHnsw(query, config_.k_, config_.maxDistance_)
+                    ? vidx->searchHnsw(query, config_.k_, config_.maxDistance_,
+                                       checkInterrupt)
                     : vidx->searchExact(query, config_.k_, std::nullopt,
                                         config_.maxDistance_, checkInterrupt);
     }

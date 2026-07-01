@@ -82,8 +82,14 @@ VectorSearchJoin::VectorSearchJoin(
 // ____________________________________________________________________________
 std::shared_ptr<Operation> VectorSearchJoin::addJoinChild(
     std::shared_ptr<QueryExecutionTree> child) const {
-  return std::make_shared<VectorSearchJoin>(getExecutionContext(), config_,
-                                            std::move(child));
+  auto completed = std::make_shared<VectorSearchJoin>(
+      getExecutionContext(), config_, std::move(child));
+  // Carry over any warnings accrued on the incomplete operation (mirrors
+  // `SpatialJoin::addChild`).
+  for (const auto& warning : *getWarnings().rlock()) {
+    completed->addWarning(warning);
+  }
+  return completed;
 }
 
 // ____________________________________________________________________________
@@ -219,15 +225,14 @@ Result VectorSearchJoin::computeResult([[maybe_unused]] bool requestLaziness) {
     checkCancellation();
     Id leftId = childTable(row, leftCol_);
     auto [memo, isNew] = hitsByEntity.try_emplace(leftId.getBits());
-    if (isNew) {
-      auto queryVec = vidx->getVector(leftId);
-      if (queryVec.has_value()) {
-        memo->second = useHnsw ? vidx->searchHnsw(queryVec.value(), config_.k_,
-                                                  config_.maxDistance_)
-                               : vidx->searchExact(
-                                     queryVec.value(), config_.k_, std::nullopt,
-                                     config_.maxDistance_, checkInterrupt);
-      }
+    if (isNew && vidx->hasVector(leftId)) {
+      // Search by the STORED vector (no decode/re-encode through f32).
+      memo->second =
+          useHnsw
+              ? vidx->searchHnswByEntity(leftId, config_.k_,
+                                         config_.maxDistance_, checkInterrupt)
+              : vidx->searchExactByEntity(leftId, config_.k_, std::nullopt,
+                                          config_.maxDistance_, checkInterrupt);
     }
     // A query entity without a vector contributes no result rows (UNDEF and
     // unknown entities behave the same way).

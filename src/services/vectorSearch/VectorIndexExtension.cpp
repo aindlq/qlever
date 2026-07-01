@@ -38,6 +38,7 @@
 #include "util/Exception.h"
 #include "util/Log.h"
 #include "util/json.h"
+#include "util/jthread.h"
 
 namespace qlever::vector {
 
@@ -134,9 +135,9 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
     if (ql::ranges::find(knownKeys, key) == knownKeys.end()) {
       AD_THROW("Unknown key \"" + key +
                "\" in a vectorSearch build spec. Known keys: name, iris, npy, "
-               "texts, dimensions, metric, scalar, hnsw, hnswConnectivity, "
-               "hnswExpansionAdd, hnswExpansionSearch, buildThreads, "
-               "embeddingUrl, embeddingModel, remap.");
+               "texts, parquet, dimensions, metric, scalar, hnsw, "
+               "hnswConnectivity, hnswExpansionAdd, hnswExpansionSearch, "
+               "buildThreads, embeddingUrl, embeddingModel, remap.");
     }
   }
   try {
@@ -173,6 +174,19 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
         "Each vector index needs exactly one of `npy`, `texts`, or "
         "`parquet`.");
   }
+  // The `i8` store rescales every vector to a common magnitude (usearch's
+  // dot-product-oriented int8 cast), which destroys the magnitude information
+  // that `l2sq`/`innerProduct` depend on -- only `cosine` is meaningful.
+  if (spec.config_.scalar_ == VectorScalar::I8 &&
+      spec.config_.metric_ != VectorMetric::Cosine) {
+    AD_THROW(
+        "The `i8` scalar type normalizes each vector, so it only makes sense "
+        "with `metric: cosine` (got `l2sq`/`innerProduct`). Use `f16` or "
+        "`f32` for those metrics.");
+  }
+  if (spec.config_.buildHnsw_ && spec.config_.hnswConnectivity_ < 2) {
+    AD_THROW("`hnswConnectivity` must be at least 2.");
+  }
   return spec;
 }
 
@@ -206,14 +220,19 @@ std::vector<std::optional<Id>> resolveBatch(
     } catch (const std::exception& e) {
       if (!failed.test_and_set()) {
         std::lock_guard lock{errorMutex};
-        firstError = e.what();
+        firstError = e.what()[0] == '\0' ? "unknown resolve error" : e.what();
+      }
+    } catch (...) {
+      if (!failed.test_and_set()) {
+        std::lock_guard lock{errorMutex};
+        firstError = "non-standard exception while resolving IRIs";
       }
     }
   };
   if (numThreads <= 1) {
     job(0, iris.size());
   } else {
-    std::vector<std::thread> threads;
+    std::vector<ad_utility::JThread> threads;
     size_t chunk = (iris.size() + numThreads - 1) / numThreads;
     for (size_t t = 0; t < numThreads; ++t) {
       size_t first = t * chunk;
@@ -259,6 +278,16 @@ VectorIndexMetadata buildFromReader(const Index& index,
       if (!reader.next(iri, vec)) {
         done = true;
         break;
+      }
+      // Guard against a reader that reports a per-row length disagreeing with
+      // the configured dimension (e.g. a Parquet `list` column whose actual
+      // dimension the reader could not check up front) -- otherwise the row
+      // would be silently mis-sliced into the wrong entity's vector.
+      if (vec.size() != dim) {
+        AD_THROW("Row " + std::to_string(lineNumber + iris.size()) +
+                 " of the input has dimension " + std::to_string(vec.size()) +
+                 ", but the index is configured with dimension " +
+                 std::to_string(dim) + ".");
       }
       if (normalizeIris && !ql::starts_with(iri, "<")) {
         iri = "<" + iri + ">";

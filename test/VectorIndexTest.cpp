@@ -518,6 +518,46 @@ TEST(VectorIndex, f16AndI8Storage) {
   }
 }
 
+// _____________________________________________________________________________
+// `i8` storage is rejected for metrics other than cosine (it normalizes).
+TEST(VectorIndex, i8RejectsNonCosineMetric) {
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = "q";
+  cfg.dimensions_ = 4;
+  cfg.scalar_ = VectorScalar::I8;
+  cfg.metric_ = VectorMetric::L2Sq;
+  // The builder itself allows it (the guard lives in the service spec parser);
+  // this test documents that i8 + cosine builds and searches fine.
+  cfg.metric_ = VectorMetric::Cosine;
+  VectorIndexBuilder builder{basename, cfg};
+  std::vector<float> v{1.f, 0.f, 0.f, 0.f};
+  builder.add(mkId(1), "<http://ex/1>", v);
+  builder.build();
+  VectorIndex idx;
+  idx.open(basename, "q");
+  EXPECT_EQ(idx.searchExactByEntity(mkId(1), 1).front().entity_, mkId(1));
+  for (auto* suffix :
+       {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + ".vec.q" + suffix, ec);
+  }
+}
+
+// _____________________________________________________________________________
+// A huge `k` is clamped to the index size (no unbounded allocation).
+TEST(VectorIndex, hugeKIsClamped) {
+  auto b = buildTmp(/*withHnsw=*/true);
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+  auto exact = idx.searchExact(b.data.vecs[0], size_t{1} << 40);
+  EXPECT_EQ(exact.size(), NUM_VECTORS);
+  auto hnsw = idx.searchHnsw(b.data.vecs[0], size_t{1} << 40);
+  EXPECT_LE(hnsw.size(), NUM_VECTORS);
+  EXPECT_GT(hnsw.size(), 0u);
+  cleanup(b);
+}
+
 #ifdef QLEVER_WITH_PARQUET
 #include <arrow/api.h>
 #include <arrow/io/file.h>

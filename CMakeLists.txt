@@ -216,6 +216,11 @@ if (_EMSCRIPTEN_NO_INDEXBUILDER_AND_SERVER)
     # Emscripten build does not define; skip the whole feature there.
     set(QLEVER_WITH_VECTOR_SEARCH OFF)
 endif ()
+if (REDUCED_FEATURE_SET_FOR_CPP17)
+    # The query-time embedding client needs the C++20-only `http` target, which
+    # this configuration does not build; skip the whole feature.
+    set(QLEVER_WITH_VECTOR_SEARCH OFF)
+endif ()
 if (QLEVER_WITH_VECTOR_SEARCH)
     # usearch (header-only vector similarity search). Its include directory and
     # configuration macros are added target-scoped in
