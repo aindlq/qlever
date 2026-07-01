@@ -7,16 +7,19 @@
 
 #include "engine/MagicServicePlanning.h"
 
+// _____________________________________________________________________________
 MagicServicePlannerRegistry& MagicServicePlannerRegistry::get() {
   static MagicServicePlannerRegistry instance;
   return instance;
 }
 
+// _____________________________________________________________________________
 void MagicServicePlannerRegistry::add(std::type_index type,
                                       MagicServicePlanner planner) {
   planners_.insert_or_assign(type, std::move(planner));
 }
 
+// _____________________________________________________________________________
 const MagicServicePlanner* MagicServicePlannerRegistry::lookup(
     std::type_index type) const {
   auto it = planners_.find(type);

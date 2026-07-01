@@ -1413,6 +1413,17 @@ void QueryPlanner::applyFiltersIfPossible(
   // in one go. Changing `row` inside the loop would invalidate the iterators.
   std::vector<SubtreePlan> addedPlans;
   for (auto& plan : row) {
+    // Never attach a filter to an incomplete magic-service (or spatial) join:
+    // it would hide the operation under a `Filter` root where the join
+    // enumeration can no longer complete it. The filter is guaranteed to be
+    // applied once the operation is completed (its output variables are then
+    // covered by a completed plan).
+    if (auto incomplete =
+            std::dynamic_pointer_cast<const IncompleteJoinOperation>(
+                plan._qet->getRootOperation());
+        incomplete && !incomplete->isJoinConstructed()) {
+      continue;
+    }
     for (const auto& [i, filterAndSubst] :
          ::ranges::views::enumerate(filters)) {
       checkCancellation();
@@ -2278,14 +2289,23 @@ std::vector<SubtreePlan> QueryPlanner::createJoinCandidates(
     return candidates;
   }
 
-  // The same two steps for registry-based magic services whose operations
-  // take one join side from the surrounding query (see
-  // `IncompleteJoinOperation` in `engine/MagicServicePlanning.h`).
-  if (checkMagicServiceJoin(a, b) == std::pair<bool, bool>{true, true}) {
-    return candidates;
-  }
-  if (auto opt = createMagicServiceJoin(a, b, jcs)) {
-    candidates.push_back(std::move(opt.value()));
+  // The same handling for registry-based magic services whose operations take
+  // one join side from the surrounding query (see `IncompleteJoinOperation` in
+  // `engine/MagicServicePlanning.h`). Because such an operation exposes its
+  // OUTPUT variables (so that consumers of them stay in the same connected
+  // component), a subtree may share one of those output variables with it --
+  // that pairing must NOT become a normal join (the operation would never be
+  // completed). So whenever either side is an incomplete magic-service
+  // operation, this is the ONLY place its join is handled: we either complete
+  // it (connection == the join variable) or block the pair (empty candidates)
+  // so the planner completes it in another order.
+  if (auto [aInc, bInc] = checkMagicServiceJoin(a, b); aInc || bInc) {
+    if (aInc && bInc) {
+      return candidates;
+    }
+    if (auto opt = createMagicServiceJoin(a, b, jcs)) {
+      candidates.push_back(std::move(opt.value()));
+    }
     return candidates;
   }
 
@@ -2441,22 +2461,41 @@ auto QueryPlanner::createMagicServiceJoin(
   auto incomplete = std::dynamic_pointer_cast<const IncompleteJoinOperation>(
       servicePlan._qet->getRootOperation());
 
-  if (jcs.size() > 1) {
-    AD_THROW(
-        "If one side of a join is a magic service that takes its join "
-        "variable from the surrounding query, then this variable must be the "
-        "only connection between the two sides. Bind the other shared "
-        "variables outside of the service clause.");
+  // Taking the join side from an OPTIONAL/MINUS pattern would silently change
+  // the join semantics (left-join / set-minus become inner joins); it is not
+  // supported. Use the nested-pattern form of the service inside such patterns.
+  if (servicePlan.type != SubtreePlan::BASIC ||
+      otherPlan.type != SubtreePlan::BASIC) {
+    AD_THROW(absl::StrCat(
+        "The join variable ", incomplete->joinVariable().name(),
+        " of a magic service cannot be taken from an OPTIONAL or MINUS "
+        "pattern. Move the variable binding out of the OPTIONAL/MINUS, or use "
+        "the nested-pattern form of the service."));
+  }
+  // A LIMIT/OFFSET on the incomplete operation (e.g. it is the root of a
+  // subquery) would be dropped when the operation is rebuilt on completion.
+  if (!servicePlan._qet->getRootOperation()
+           ->getLimitOffset()
+           .isUnconstrained()) {
+    AD_THROW(absl::StrCat(
+        "A magic service whose join variable ",
+        incomplete->joinVariable().name(),
+        " comes from the surrounding query cannot be the outermost operation "
+        "of a subquery with LIMIT/OFFSET."));
+  }
+
+  // The connection must be exactly the join variable. If the shared variable
+  // is one of the operation's OUTPUT variables (which it also exposes), block
+  // this pairing (return nullopt -> the caller adds no candidate) so the
+  // planner completes the operation via its join variable in another order.
+  if (jcs.size() != 1) {
+    return std::nullopt;
   }
   ColumnIndex ind = aIs ? jcs[0][1] : jcs[0][0];
   const Variable& var =
       otherPlan._qet->getVariableAndInfoByColumnIndex(ind).first;
   if (var != incomplete->joinVariable()) {
-    AD_THROW(absl::StrCat(
-        "The magic service expects to be joined with the surrounding query "
-        "via its variable ",
-        incomplete->joinVariable().name(), ", but the only connection is ",
-        var.name(), "."));
+    return std::nullopt;
   }
 
   SubtreePlan plan =
