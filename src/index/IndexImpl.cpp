@@ -1003,8 +1003,8 @@ void IndexImpl::createFromOnDiskIndex(const std::string& onDiskBase,
   AD_LOG_DEBUG << "Number of words in internal and external vocabulary: "
                << vocab_.size() << std::endl;
 
-  // Let registered services load their auxiliary indices now that the vocabulary
-  // is available (see `IndexExtension.h`).
+  // Let registered services load their auxiliary indices now that the
+  // vocabulary is available (see `IndexExtension.h`).
   for (const auto& loadHook : IndexExtensionRegistry::get().loadHooks()) {
     loadHook(*this, onDiskBase_);
   }

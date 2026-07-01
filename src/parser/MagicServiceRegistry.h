@@ -1,6 +1,9 @@
-// Copyright 2026, University of Freiburg,
-// Chair of Algorithms and Data Structures.
-// Author: Artem <artem@rem.sh>
+// Copyright 2026 The QLever Authors, in particular:
+//
+// 2026 Artem <artem@rem.sh>
+
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #ifndef QLEVER_SRC_PARSER_MAGICSERVICEREGISTRY_H
 #define QLEVER_SRC_PARSER_MAGICSERVICEREGISTRY_H
@@ -19,8 +22,9 @@ namespace parsedQuery {
 // A registry of magic `SERVICE` types, so a new service can be added without
 // editing the parser's dispatch, the `GraphPatternOperation` variant, or the
 // exhaustiveness checks: a service registers (a) an IRI matcher and (b) a
-// factory that creates its `MagicServiceQuery`. The parser looks the IRI up here
-// and parses into a generic `MagicService` node (see `GraphPatternOperation.h`).
+// factory that creates its `MagicServiceQuery`. The parser looks the IRI up
+// here and parses into a generic `MagicService` node (see
+// `GraphPatternOperation.h`).
 //
 // Services self-register via a static initializer (see e.g.
 // a service`s own .cpp). The registry is a function-local static, so
@@ -36,8 +40,8 @@ class MagicServiceRegistry {
 
   static MagicServiceRegistry& get();
 
-  // Register a service. `matcher` decides whether a given service IRI belongs to
-  // it; `factory` creates its (empty) query object.
+  // Register a service. `matcher` decides whether a given service IRI belongs
+  // to it; `factory` creates its (empty) query object.
   void add(Matcher matcher, Factory factory);
 
   // Convenience: register a service matched by an exact IRI string.

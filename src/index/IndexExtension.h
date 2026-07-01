@@ -1,6 +1,9 @@
-// Copyright 2026, University of Freiburg,
-// Chair of Algorithms and Data Structures.
-// Author: Artem <artem@rem.sh>
+// Copyright 2026 The QLever Authors, in particular:
+//
+// 2026 Artem <artem@rem.sh>
+
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #ifndef QLEVER_SRC_INDEX_INDEXEXTENSION_H
 #define QLEVER_SRC_INDEX_INDEXEXTENSION_H
@@ -14,10 +17,11 @@
 class Index;
 class IndexImpl;
 
-// Registry that lets a service attach an auxiliary on-disk index to QLever's main
-// index, without the core index/build code knowing about the service. A service
-// registers (from its own translation unit; see `src/services/`):
-//   * a BUILD hook  -- run by `qlever index` AFTER the main index is built, with
+// Registry that lets a service attach an auxiliary on-disk index to QLever's
+// main index, without the core index/build code knowing about the service. A
+// service registers (from its own translation unit; see `src/services/`):
+//   * a BUILD hook  -- run by `qlever index` AFTER the main index is built,
+//   with
 //     the freshly built index loaded, so URI->Id resolution is available. It
 //     reads its slice of the build configuration JSON and writes its files.
 //   * a LOAD hook   -- run at server/engine start, after the vocabulary is
