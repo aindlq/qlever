@@ -162,10 +162,10 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
           "The `<queryVector>` parameter must contain at least one number.");
 
   if (leftVar_.has_value()) {
-    // Binary "for each ?x" form: the nested pattern binds the query entities.
-    throwIf(!childGraphPattern_.has_value(),
-            "The `<left>` form of vector search requires a nested `{ ... }` "
-            "graph pattern that binds the query variable.");
+    // Binary "for each ?x" form: the query entities come either from a nested
+    // pattern that binds `<left>`, or -- without a nested pattern -- from the
+    // SURROUNDING query (the planner then joins the vector search with the
+    // subtree that binds the variable).
     throwIf(leftVar_ == resultVar_,
             "The `<left>` and `<result>` variables of a vector search must be "
             "different.");

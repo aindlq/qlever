@@ -295,11 +295,6 @@ TEST(VectorSearchService, parseErrors) {
       planQuery(qec, query("_:c vec:index \"clip\" ; vec:left ?x ; "
                            "vec:result ?x . { ?x <is-a> <Statue> }")),
       HasSubstr("must be different"));
-  // The `<left>` form needs a nested pattern.
-  AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec, query("_:c vec:index \"clip\" ; vec:left ?x ; "
-                           "vec:result ?nn .")),
-      HasSubstr("nested"));
 }
 
 // _____________________________________________________________________________
@@ -415,6 +410,42 @@ TEST(VectorSearchService, joinFormEstimatesAndMemoization) {
   EXPECT_EQ(join.getSizeEstimate(), 6u);
   auto result = join.getResult();
   EXPECT_EQ(result->idTable().numRows(), 6u);
+}
+
+// _____________________________________________________________________________
+// The `<left>` variable can be bound by the SURROUNDING query instead of a
+// nested pattern: the operation is planned as an incomplete leaf and completed
+// by the join enumeration (the generic `IncompleteJoinOperation` mechanism).
+TEST(VectorSearchService, outerBoundLeftJoinForm) {
+  auto* qec = qecWithVectorIndex();
+  auto [result, col] =
+      runQuery(qec,
+               std::string{PREFIX} +
+                   "SELECT * WHERE { ?x <is-a> <Painting> . "
+                   "SERVICE vec: { _:c vec:index \"clip\" ; vec:left ?x ; "
+                   "vec:result ?nn ; vec:bindScore ?d ; vec:k 2 . } }",
+               Variable{"?nn"});
+  auto getId = makeGetId(qec->getIndex());
+  const IdTable& table = result->idTable();
+  // <e2> is the only painting with a vector (self + <e1>); <e4> has none.
+  ASSERT_EQ(table.numRows(), 2u);
+  std::set<uint64_t> nns{table(0, col).getBits(), table(1, col).getBits()};
+  EXPECT_TRUE(nns.contains(getId("<e2>").getBits()));
+  EXPECT_TRUE(nns.contains(getId("<e1>").getBits()));
+}
+
+// _____________________________________________________________________________
+// Without any binding of `<left>` the operation stays incomplete and fails at
+// execution time with an actionable message (not a crash or silent result).
+TEST(VectorSearchService, unjoinedOuterLeftThrows) {
+  auto* qec = qecWithVectorIndex();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      runQuery(qec,
+               std::string{PREFIX} +
+                   "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
+                   "vec:left ?x ; vec:result ?nn ; vec:k 2 . } }",
+               Variable{"?nn"}),
+      HasSubstr("is not bound anywhere"));
 }
 
 // _____________________________________________________________________________

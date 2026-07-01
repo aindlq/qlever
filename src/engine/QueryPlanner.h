@@ -444,6 +444,16 @@ class QueryPlanner {
                                                       const SubtreePlan& b,
                                                       const JoinColumns& jcs);
 
+  // The generic pendants to `checkSpatialJoin`/`createSpatialJoin` for
+  // registry-based magic services whose operations implement
+  // `IncompleteJoinOperation` (see `engine/MagicServicePlanning.h`): an
+  // operation that still misses its join child must not take part in normal
+  // joins; instead the other input is added to it as that child.
+  static std::pair<bool, bool> checkMagicServiceJoin(const SubtreePlan& a,
+                                                     const SubtreePlan& b);
+  static std::optional<SubtreePlan> createMagicServiceJoin(
+      const SubtreePlan& a, const SubtreePlan& b, const JoinColumns& jcs);
+
   // Helper that generates `IndexScan` query plans on materialized views if they
   // can be used to avoid joins between some of the `triples`. The resulting
   // plans for part of the `triples` are given in a vector of query planning

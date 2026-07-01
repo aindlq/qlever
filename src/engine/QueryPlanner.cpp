@@ -2278,6 +2278,17 @@ std::vector<SubtreePlan> QueryPlanner::createJoinCandidates(
     return candidates;
   }
 
+  // The same two steps for registry-based magic services whose operations
+  // take one join side from the surrounding query (see
+  // `IncompleteJoinOperation` in `engine/MagicServicePlanning.h`).
+  if (checkMagicServiceJoin(a, b) == std::pair<bool, bool>{true, true}) {
+    return candidates;
+  }
+  if (auto opt = createMagicServiceJoin(a, b, jcs)) {
+    candidates.push_back(std::move(opt.value()));
+    return candidates;
+  }
+
   if (a.type == SubtreePlan::MINUS) {
     AD_THROW(
         "MINUS can only appear after"
@@ -2399,6 +2410,57 @@ auto QueryPlanner::createSpatialJoin(const SubtreePlan& a, const SubtreePlan& b,
   auto newSpatialJoin = spatialJoin->addChild(otherSubtreePlan._qet, var);
 
   SubtreePlan plan = makeSubtreePlan<SpatialJoin>(std::move(newSpatialJoin));
+  mergeSubtreePlanIds(plan, a, b);
+  return plan;
+}
+
+// _____________________________________________________________________________
+std::pair<bool, bool> QueryPlanner::checkMagicServiceJoin(
+    const SubtreePlan& a, const SubtreePlan& b) {
+  auto isIncomplete = [](const SubtreePlan& plan) {
+    auto casted = std::dynamic_pointer_cast<const IncompleteJoinOperation>(
+        plan._qet->getRootOperation());
+    return casted != nullptr && !casted->isJoinConstructed();
+  };
+  return {isIncomplete(a), isIncomplete(b)};
+}
+
+// _____________________________________________________________________________
+auto QueryPlanner::createMagicServiceJoin(
+    const SubtreePlan& a, const SubtreePlan& b,
+    const JoinColumns& jcs) -> std::optional<SubtreePlan> {
+  auto [aIs, bIs] = checkMagicServiceJoin(a, b);
+
+  // Exactly one of the inputs must be an incomplete magic-service join.
+  if (aIs == bIs) {
+    return std::nullopt;
+  }
+
+  const SubtreePlan& servicePlan = aIs ? a : b;
+  const SubtreePlan& otherPlan = aIs ? b : a;
+  auto incomplete = std::dynamic_pointer_cast<const IncompleteJoinOperation>(
+      servicePlan._qet->getRootOperation());
+
+  if (jcs.size() > 1) {
+    AD_THROW(
+        "If one side of a join is a magic service that takes its join "
+        "variable from the surrounding query, then this variable must be the "
+        "only connection between the two sides. Bind the other shared "
+        "variables outside of the service clause.");
+  }
+  ColumnIndex ind = aIs ? jcs[0][1] : jcs[0][0];
+  const Variable& var =
+      otherPlan._qet->getVariableAndInfoByColumnIndex(ind).first;
+  if (var != incomplete->joinVariable()) {
+    AD_THROW(absl::StrCat(
+        "The magic service expects to be joined with the surrounding query "
+        "via its variable ",
+        incomplete->joinVariable().name(), ", but the only connection is ",
+        var.name(), "."));
+  }
+
+  SubtreePlan plan =
+      makeSubtreePlan<Operation>(incomplete->addJoinChild(otherPlan._qet));
   mergeSubtreePlanIds(plan, a, b);
   return plan;
 }

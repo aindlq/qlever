@@ -17,6 +17,7 @@
 class Operation;
 class QueryExecutionContext;
 class QueryExecutionTree;
+class Variable;
 namespace parsedQuery {
 struct MagicServiceQuery;
 class GraphPattern;
@@ -54,6 +55,31 @@ class MagicServicePlanningContext {
 // using the provided context.
 using MagicServicePlanner = std::function<void(
     MagicServicePlanningContext&, parsedQuery::MagicServiceQuery&)>;
+
+// Interface for operations of registry-based magic services that take one side
+// of a binary join from the SURROUNDING query (mirroring how `SpatialJoin` is
+// planned): the handler adds the operation as an "incomplete" leaf whose
+// variable-to-column map exposes the join variable as a possibly-undefined
+// column; when the join enumeration meets a subtree that binds this variable,
+// it completes the operation via `addJoinChild` instead of creating a normal
+// join. An operation that is still incomplete at execution time must throw a
+// clear user-facing error (the query then contains no other occurrence of the
+// join variable).
+class IncompleteJoinOperation {
+ public:
+  virtual ~IncompleteJoinOperation() = default;
+
+  // False while the join child is still missing.
+  virtual bool isJoinConstructed() const = 0;
+
+  // The variable that the surrounding query has to bind.
+  virtual const Variable& joinVariable() const = 0;
+
+  // A NEW, completed operation with `child` -- a subtree that binds
+  // `joinVariable()` -- as the missing side.
+  virtual std::shared_ptr<Operation> addJoinChild(
+      std::shared_ptr<QueryExecutionTree> child) const = 0;
+};
 
 // Registry of planner handlers, keyed by the concrete `MagicServiceQuery`
 // subtype. Services self-register (typically from a static initializer in their

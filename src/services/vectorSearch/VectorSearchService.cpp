@@ -49,7 +49,8 @@ void registerVectorSearchService() {
         auto config = vectorQuery.toVectorSearchConfiguration();
         QueryExecutionContext* qec = ctx.qec();
 
-        if (config.leftVariable_.has_value()) {
+        if (config.leftVariable_.has_value() &&
+            vectorQuery.childGraphPattern_.has_value()) {
           // "for each ?x in the nested pattern, find the k nearest."
           ctx.addOperationWithChildPattern(
               vectorQuery.childGraphPattern_.value(),
@@ -58,6 +59,11 @@ void registerVectorSearchService() {
                 return std::make_shared<VectorSearchJoin>(qec, config,
                                                           std::move(child));
               });
+        } else if (config.leftVariable_.has_value()) {
+          // "for each ?x bound by the SURROUNDING query": an incomplete join
+          // leaf; the planner's join enumeration adds the subtree that binds
+          // `<left>` (see `IncompleteJoinOperation`).
+          ctx.addLeafOperation(std::make_shared<VectorSearchJoin>(qec, config));
         } else if (vectorQuery.childGraphPattern_.has_value()) {
           // Query point restricted to the candidate entities the nested pattern
           // binds (exact search over that set).

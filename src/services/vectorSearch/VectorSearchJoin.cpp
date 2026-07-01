@@ -25,6 +25,22 @@ VectorSearchJoin::VectorSearchJoin(
     : Operation{qec}, config_{std::move(config)}, child_{std::move(child)} {
   AD_CONTRACT_CHECK(config_.leftVariable_.has_value(),
                     "VectorSearchJoin requires a query (`<left>`) variable.");
+  if (!child_) {
+    // INCOMPLETE form: the subtree binding `<left>` comes from the
+    // surrounding query. Expose the variables as possibly-undefined columns
+    // so that the join enumeration can find the connection (see
+    // `IncompleteJoinOperation`); `addJoinChild` builds the completed
+    // operation.
+    variableColumns_[config_.leftVariable_.value()] =
+        makePossiblyUndefinedColumn(ColumnIndex{0});
+    variableColumns_[config_.resultVariable_] =
+        makePossiblyUndefinedColumn(ColumnIndex{1});
+    if (config_.scoreVariable_.has_value()) {
+      variableColumns_[config_.scoreVariable_.value()] =
+          makePossiblyUndefinedColumn(ColumnIndex{2});
+    }
+    return;
+  }
   const auto& childCols = child_->getVariableColumns();
   auto it = childCols.find(config_.leftVariable_.value());
   if (it == childCols.end()) {
@@ -64,6 +80,13 @@ VectorSearchJoin::VectorSearchJoin(
 }
 
 // ____________________________________________________________________________
+std::shared_ptr<Operation> VectorSearchJoin::addJoinChild(
+    std::shared_ptr<QueryExecutionTree> child) const {
+  return std::make_shared<VectorSearchJoin>(getExecutionContext(), config_,
+                                            std::move(child));
+}
+
+// ____________________________________________________________________________
 std::string VectorSearchJoin::getDescriptor() const {
   return absl::StrCat("VectorSearchJoin on index '", config_.indexName_,
                       "', k=", config_.k_);
@@ -71,12 +94,19 @@ std::string VectorSearchJoin::getDescriptor() const {
 
 // ____________________________________________________________________________
 size_t VectorSearchJoin::getResultWidth() const {
-  return child_->getResultWidth() +
-         (config_.scoreVariable_.has_value() ? 2 : 1);
+  size_t ownColumns = config_.scoreVariable_.has_value() ? 2 : 1;
+  if (!child_) {
+    // Incomplete: `<left>`, `<result>`[, `<bindScore>`].
+    return 1 + ownColumns;
+  }
+  return child_->getResultWidth() + ownColumns;
 }
 
 // ____________________________________________________________________________
 float VectorSearchJoin::getMultiplicity(size_t col) {
+  if (!child_) {
+    return 1.0f;
+  }
   // Passthrough columns inherit the child's multiplicity (scaled by the k-fold
   // expansion); the synthetic result/score columns are treated as ~unique.
   size_t childWidth = child_->getResultWidth();
@@ -88,7 +118,7 @@ float VectorSearchJoin::getMultiplicity(size_t col) {
 
 // ____________________________________________________________________________
 uint64_t VectorSearchJoin::getSizeEstimateBeforeLimit() {
-  return child_->getSizeEstimate() * config_.k_;
+  return child_ ? child_->getSizeEstimate() * config_.k_ : config_.k_;
 }
 
 // ____________________________________________________________________________
@@ -107,6 +137,9 @@ size_t VectorSearchJoin::getCostEstimate() {
             ? static_cast<size_t>(std::log2(static_cast<double>(n) + 1) + 1) *
                   config_.k_
             : n;
+  }
+  if (!child_) {
+    return probeCost;
   }
   return child_->getCostEstimate() + child_->getSizeEstimate() * probeCost;
 }
@@ -127,18 +160,32 @@ std::string VectorSearchJoin::getCacheKeyImpl() const {
         &key, " maxDist=",
         absl::Hex(absl::bit_cast<uint32_t>(config_.maxDistance_.value())));
   }
-  absl::StrAppend(&key, " {", child_->getCacheKey(), "}");
+  if (child_) {
+    absl::StrAppend(&key, " {", child_->getCacheKey(), "}");
+  } else {
+    // Incomplete operations are never executed or cached; the marker only
+    // keeps the key well-defined during planning.
+    absl::StrAppend(&key, " INCOMPLETE");
+  }
   return key;
 }
 
 // ____________________________________________________________________________
 std::unique_ptr<Operation> VectorSearchJoin::cloneImpl() const {
   return std::make_unique<VectorSearchJoin>(getExecutionContext(), config_,
-                                            child_->clone());
+                                            child_ ? child_->clone() : nullptr);
 }
 
 // ____________________________________________________________________________
 Result VectorSearchJoin::computeResult([[maybe_unused]] bool requestLaziness) {
+  if (!child_) {
+    throw std::runtime_error{absl::StrCat(
+        "The vector-search `<left>` variable ",
+        config_.leftVariable_.value().name(),
+        " is not bound anywhere: bind it in the surrounding query (it is "
+        "then joined with the vector search) or in a nested `{ ... }` "
+        "pattern inside the SERVICE clause.")};
+  }
   const Index& index = getExecutionContext()->getIndex();
   std::shared_ptr<const qlever::vector::VectorIndex> vidx =
       qlever::vector::getVectorIndex(index, config_.indexName_);
