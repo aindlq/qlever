@@ -207,18 +207,26 @@ FetchContent_Declare(
 add_compile_definitions(SPATIALJOIN_NO_BZIP2=True SPATIALJOIN_NO_ZLIB=True)
 
 #################################
-# usearch (header-only vector similarity search, for the built-in vector index)
+# Optional built-in vector-similarity search (a usearch-based magic SERVICE)
 ################################
-FetchContent_Declare(
-        usearch
-        GIT_REPOSITORY https://github.com/unum-cloud/usearch
-        GIT_TAG 9fd6b0115dcdd0016e037fb5335f36824dd02090  # v2.25.3
-        GIT_SUBMODULES ""  # fp16/simsimd submodules are optional and unused
-        SYSTEM
-        EXCLUDE_FROM_ALL
-)
-# Use the bundled scalar implementations only; no optional SIMD/fp16 submodules.
-add_compile_definitions(USEARCH_USE_FP16LIB=0 USEARCH_USE_SIMSIMD=0 USEARCH_USE_OPENMP=0)
+option(QLEVER_WITH_VECTOR_SEARCH
+        "Build the built-in vector-similarity-search service (fetches usearch)" ON)
+if (_EMSCRIPTEN_NO_INDEXBUILDER_AND_SERVER)
+    # The service is only linked into qlever-server/qlever-index, which the
+    # Emscripten build does not define; skip the whole feature there.
+    set(QLEVER_WITH_VECTOR_SEARCH OFF)
+endif ()
+if (QLEVER_WITH_VECTOR_SEARCH)
+    # usearch (header-only vector similarity search). Its include directory and
+    # configuration macros are added target-scoped in
+    # `src/services/vectorSearch/CMakeLists.txt`.
+    FetchContent_Declare(
+            usearch
+            GIT_REPOSITORY https://github.com/unum-cloud/usearch
+            GIT_TAG 9fd6b0115dcdd0016e037fb5335f36824dd02090  # v2.25.3
+            GIT_SUBMODULES ""  # fp16/simsimd submodules are optional and unused
+    )
+endif ()
 
 #################################
 # llama.cpp (OPTIONAL, off by default): in-process embedding generation.
@@ -230,7 +238,7 @@ if (QLEVER_WITH_LLAMACPP)
     FetchContent_Declare(
             llama
             GIT_REPOSITORY https://github.com/ggml-org/llama.cpp
-            GIT_TAG b4991  # pin a known release
+            GIT_TAG 0bb2919335d00ff0bc79d5015da95c422de51f03  # b4991
             SYSTEM
             EXCLUDE_FROM_ALL
     )
@@ -513,12 +521,14 @@ target_compile_options(antlr4_static PRIVATE -Wno-all -Wno-extra -Wno-error -Wno
 # Only required because a lot of classes that do not explicitly link against antlr4_static use the headers.
 include_directories(SYSTEM "${antlr_SOURCE_DIR}/runtime/Cpp/runtime/src")
 
-# usearch is header-only: populate the sources and add its include directory.
-FetchContent_GetProperties(usearch)
-if (NOT usearch_POPULATED)
-    FetchContent_Populate(usearch)
+if (QLEVER_WITH_VECTOR_SEARCH)
+    # usearch is header-only: populate the sources. The include directory is
+    # added target-scoped in `src/services/vectorSearch/CMakeLists.txt`.
+    FetchContent_GetProperties(usearch)
+    if (NOT usearch_POPULATED)
+        FetchContent_Populate(usearch)
+    endif ()
 endif ()
-include_directories(SYSTEM "${usearch_SOURCE_DIR}/include")
 
 message(STATUS ---)
 message(STATUS "CXX_FLAGS are : " ${CMAKE_CXX_FLAGS})

@@ -1,7 +1,7 @@
-# Custom magic-SERVICE plugins. Each subdirectory with a `CMakeLists.txt` is a
-# self-contained service (parser + planner registration + operations) that wires
-# itself in via the runtime registries -- with NO edits to the core
-# parser/planner/variant or to this file. To add a service, drop a folder here.
+# Custom magic-SERVICE plugins. Each subdirectory is a self-contained service
+# (parser + planner registration + operations) that wires itself in via the
+# runtime registries -- with NO edits to the core parser/planner/variant. To add
+# a service, add its folder plus one `add_subdirectory` line here.
 #
 # Services are built as OBJECT libraries and linked directly into the QLever
 # binaries below, so their self-registration static initializers are always
@@ -9,17 +9,17 @@
 # archive members). This `add_subdirectory(src/services)` must appear AFTER the
 # binaries are defined in the top-level CMakeLists.
 
-file(GLOB serviceDirs CONFIGURE_DEPENDS LIST_DIRECTORIES true
-     "${CMAKE_CURRENT_SOURCE_DIR}/*")
-foreach (dir ${serviceDirs})
-    if (IS_DIRECTORY "${dir}" AND EXISTS "${dir}/CMakeLists.txt")
-        add_subdirectory("${dir}")
-    endif ()
-endforeach ()
+if (QLEVER_WITH_VECTOR_SEARCH)
+    add_subdirectory(vectorSearch)
+endif ()
 
-# Link every registered service object library into the QLever binaries.
+# Link every registered service object library into the QLever binaries --
+# including the `LibQLeverExample` embedder: any binary that parses queries
+# needs the registrations, otherwise a magic-SERVICE IRI silently degrades to a
+# federated HTTP SERVICE request. (External libqlever embedders likewise have
+# to link the service object libraries themselves.)
 get_property(serviceObjLibs GLOBAL PROPERTY QLEVER_SERVICE_OBJLIBS)
-foreach (target qlever-server qlever-index)
+foreach (target qlever-server qlever-index LibQLeverExample)
     if (TARGET ${target})
         foreach (objLib ${serviceObjLibs})
             # Plain signature to match the binaries' existing plain-signature

@@ -1,9 +1,13 @@
-// Copyright 2026, University of Freiburg,
-// Chair of Algorithms and Data Structures.
-// Author: Artem <artem@rem.sh>
+// Copyright 2026 The QLever Authors, in particular:
+//
+// 2026 Artem <artem@rem.sh>
+
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 // Self-registration of the vector-search magic SERVICE. This is the ONLY place
-// that wires the service into QLever, and it touches no core engine/parser code:
+// that wires the service into QLever, and it touches no core engine/parser
+// code:
 //   * the parser factory is registered with `MagicServiceRegistry` (parser);
 //   * the planner handler is registered with `MagicServicePlannerRegistry`
 //     (engine) and uses only the stable `MagicServicePlanningContext` façade.
@@ -71,8 +75,8 @@ void registerVectorSearchService() {
       });
 }
 
-// Run the registration at static-initialization time. The folder is linked as an
-// OBJECT library, so this initializer is always included (not stripped).
+// Run the registration at static-initialization time. The folder is linked as
+// an OBJECT library, so this initializer is always included (not stripped).
 [[maybe_unused]] const bool vectorSearchRegistered = [] {
   registerVectorSearchService();
   return true;

@@ -11,6 +11,15 @@ add_library(vectorStorage
         VectorIndexBuilder.cpp
         VectorInputReader.cpp)
 qlever_target_link_libraries(vectorStorage util global)
+# usearch is header-only; scope its include directory and configuration to the
+# targets that actually use it (PUBLIC keeps the macros ODR-consistent in every
+# TU that might include usearch headers through us). The bundled scalar
+# implementations are used -- no SIMD/fp16 submodules; enabling SimSIMD for
+# faster exact search is a known follow-up.
+target_include_directories(vectorStorage SYSTEM PUBLIC
+        "${usearch_SOURCE_DIR}/include")
+target_compile_definitions(vectorStorage PUBLIC
+        USEARCH_USE_FP16LIB=0 USEARCH_USE_SIMSIMD=0 USEARCH_USE_OPENMP=0)
 
 add_library(service_vectorSearch OBJECT
         VectorSearch.cpp

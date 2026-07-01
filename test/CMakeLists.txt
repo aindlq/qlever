@@ -212,7 +212,13 @@ addLinkAndDiscoverTest(HasPredicateScanTest engine)
 
 addLinkAndDiscoverTest(MmapVectorTest)
 
-addLinkAndDiscoverTest(VectorIndexTest vectorStorage)
+if (QLEVER_WITH_VECTOR_SEARCH)
+    addLinkAndDiscoverTest(VectorIndexTest vectorStorage)
+
+    # End-to-end tests of the vector-search magic SERVICE (parsing, planning,
+    # operations); needs the service's self-registration, hence the OBJECT lib.
+    addLinkAndDiscoverTest(VectorSearchServiceTest engine service_vectorSearch)
+endif ()
 
 # BufferedVectorTest also uses conflicting filenames.
 addLinkAndDiscoverTest(BufferedVectorTest)

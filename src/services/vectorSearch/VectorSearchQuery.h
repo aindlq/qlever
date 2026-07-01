@@ -1,6 +1,9 @@
-// Copyright 2026, University of Freiburg,
-// Chair of Algorithms and Data Structures.
-// Author: Artem <artem@rem.sh>
+// Copyright 2026 The QLever Authors, in particular:
+//
+// 2026 Artem <artem@rem.sh>
+
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #ifndef QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORSEARCHQUERY_H
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORSEARCHQUERY_H
@@ -34,12 +37,13 @@ struct VectorSearchQuery : MagicServiceQuery {
   std::optional<std::string> queryEntityIri_;
   std::optional<std::string> queryText_;  // free text -> embedded at query time
   std::optional<qlever::vector::VectorSearchConfiguration::ImageQuery>
-      queryImage_;  // image -> embedded at query time
+      queryImage_;                   // image -> embedded at query time
   std::optional<Variable> leftVar_;  // binary form: query entity from the
                                      // nested pattern ("for each ?x")
   std::optional<Variable> resultVar_;
   std::optional<Variable> scoreVar_;
   std::optional<size_t> k_;
+  std::optional<float> maxDistance_;
   qlever::vector::VectorSearchConfiguration::Algorithm algo_ =
       qlever::vector::VectorSearchConfiguration::Algorithm::Automatic;
 

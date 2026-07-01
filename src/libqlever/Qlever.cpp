@@ -129,6 +129,13 @@ void Qlever::buildIndex(IndexBuilderConfig config) {
   // to resolve input IRIs to ids (permutations are not needed for that, so we
   // skip loading them). Each service picks its own key from the config JSON.
   if (!config.serviceIndexJson_.empty() &&
+      IndexExtensionRegistry::get().buildHooks().empty()) {
+    AD_LOG_WARN << "`--service-index` was given, but no service "
+                   "index-extensions are registered in this binary; the "
+                   "option is ignored."
+                << std::endl;
+  }
+  if (!config.serviceIndexJson_.empty() &&
       !IndexExtensionRegistry::get().buildHooks().empty()) {
     AD_LOG_INFO << "Loading the new index to build service index-extensions ..."
                 << std::endl;
@@ -238,6 +245,23 @@ void IndexBuilderConfig::validate() const {
         ". Both or none of docsfile and wordsfile have to be given to build "
         "text index. If none are given the option to add words from literals "
         "has to be true. For details see --help."));
+  }
+  // Validate the `--service-index` JSON up front -- the build hooks that
+  // consume it only run AFTER the (potentially hours-long) main index build,
+  // which is far too late to learn about a syntax error.
+  if (!serviceIndexJson_.empty()) {
+    nlohmann::json parsed;
+    try {
+      parsed = nlohmann::json::parse(serviceIndexJson_);
+    } catch (const std::exception& e) {
+      throw std::invalid_argument(absl::StrCat(
+          "The argument of --service-index is not valid JSON: ", e.what()));
+    }
+    if (!parsed.is_object()) {
+      throw std::invalid_argument(
+          "The argument of --service-index must be a JSON object that maps "
+          "each service name to its configuration.");
+    }
   }
 }
 

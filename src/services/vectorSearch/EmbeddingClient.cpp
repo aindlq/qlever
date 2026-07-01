@@ -1,30 +1,31 @@
-// Copyright 2026, University of Freiburg,
-// Chair of Algorithms and Data Structures.
-// Author: Artem <artem@rem.sh>
+// Copyright 2026 The QLever Authors, in particular:
+//
+// 2026 Artem <artem@rem.sh>
+
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #include "services/vectorSearch/EmbeddingClient.h"
 
+#include <absl/strings/str_cat.h>
+
+#include <chrono>
 #include <cmath>
 #include <mutex>
 #include <optional>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
-
-#include <absl/strings/str_cat.h>
 
 #ifdef QLEVER_WITH_LLAMACPP
 #include <llama.h>
 #endif
-#include <boost/asio/connect.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/local/stream_protocol.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/http.hpp>
 
+#include "backports/StartsWithAndEndsWith.h"
 #include "util/Exception.h"
+#include "util/HashMap.h"
 #include "util/http/HttpClient.h"
 #include "util/http/HttpUtils.h"
+#include "util/http/beast.h"
 #include "util/json.h"
 
 namespace qlever::vector {
@@ -34,38 +35,54 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 namespace asio = boost::asio;
 
-constexpr std::string_view kTarget = "/v1/embeddings";
+constexpr std::string_view EMBEDDINGS_PATH = "/v1/embeddings";
 
-// POST `body` to a server listening on a Unix domain socket (synchronous Beast).
-// `socketPath` is the filesystem path of the socket. Used for `unix:` endpoints
-// (e.g. a local vLLM/llama.cpp server) -- lower overhead than TCP and off the
-// network. Returns the response body; throws on a non-200 status.
+// Upper bound on each blocking phase (connect/write/read) of a unix-socket
+// embedding request. The TCP path is interruptible through the cancellation
+// handle instead; for the synchronous unix-socket exchange this deadline is
+// what keeps a stalled local embedding server from blocking a query worker
+// thread forever.
+constexpr std::chrono::seconds UNIX_SOCKET_TIMEOUT{60};
+
+// POST `body` to a server listening on a Unix domain socket. `socketPath` is
+// the filesystem path of the socket. Used for `unix:` endpoints (e.g. a local
+// vLLM/llama.cpp server) -- lower overhead than TCP and off the network.
+// Returns the response body; throws on connection errors, timeout, or a
+// non-200 status.
 std::string postViaUnixSocket(const std::string& socketPath,
                               const std::string& body) {
   asio::io_context ioc;
-  asio::local::stream_protocol::socket socket{ioc};
-  socket.connect(asio::local::stream_protocol::endpoint{socketPath});
-
-  http::request<http::string_body> req{http::verb::post,
-                                       std::string{kTarget}, 11};
-  req.set(http::field::host, "localhost");
-  req.set(http::field::content_type, "application/json");
-  req.set(http::field::accept, "application/json");
-  req.body() = body;
-  req.prepare_payload();
-  http::write(socket, req);
-
-  beast::flat_buffer buffer;
+  beast::basic_stream<asio::local::stream_protocol> stream{ioc};
   http::response<http::string_body> res;
-  http::read(socket, buffer, res);
-  beast::error_code ec;
-  socket.shutdown(asio::local::stream_protocol::socket::shutdown_both, ec);
+  try {
+    stream.expires_after(UNIX_SOCKET_TIMEOUT);
+    stream.socket().connect(asio::local::stream_protocol::endpoint{socketPath});
+
+    http::request<http::string_body> req{http::verb::post,
+                                         std::string{EMBEDDINGS_PATH}, 11};
+    req.set(http::field::host, "localhost");
+    req.set(http::field::content_type, "application/json");
+    req.set(http::field::accept, "application/json");
+    req.body() = body;
+    req.prepare_payload();
+    stream.expires_after(UNIX_SOCKET_TIMEOUT);
+    http::write(stream, req);
+
+    beast::flat_buffer buffer;
+    stream.expires_after(UNIX_SOCKET_TIMEOUT);
+    http::read(stream, buffer, res);
+    beast::error_code ec;
+    stream.socket().shutdown(
+        asio::local::stream_protocol::socket::shutdown_both, ec);
+  } catch (const boost::system::system_error& e) {
+    AD_THROW(absl::StrCat("Could not reach the embedding endpoint at unix:",
+                          socketPath, ": ", e.what()));
+  }
 
   if (res.result() != http::status::ok) {
-    AD_THROW(absl::StrCat("The embedding endpoint at unix:", socketPath,
-                          " returned HTTP status ",
-                          static_cast<int>(res.result_int()), ": ",
-                          res.body().substr(0, 200)));
+    AD_THROW(absl::StrCat(
+        "The embedding endpoint at unix:", socketPath, " returned HTTP status ",
+        static_cast<int>(res.result_int()), ": ", res.body().substr(0, 200)));
   }
   return std::move(res).body();
 }
@@ -77,11 +94,11 @@ std::string postViaTcp(const std::string& baseUrl, const std::string& body,
   while (!urlStr.empty() && urlStr.back() == '/') {
     urlStr.pop_back();
   }
-  urlStr += kTarget;
+  urlStr += EMBEDDINGS_PATH;
   ad_utility::httpUtils::Url url{urlStr};
-  HttpOrHttpsResponse response = sendHttpOrHttpsRequest(
-      url, std::move(handle), http::verb::post, body, "application/json",
-      "application/json");
+  HttpOrHttpsResponse response =
+      sendHttpOrHttpsRequest(url, std::move(handle), http::verb::post, body,
+                             "application/json", "application/json");
   if (response.status_ != http::status::ok) {
     AD_THROW(absl::StrCat("The embedding endpoint at ", urlStr,
                           " returned HTTP status ",
@@ -96,9 +113,9 @@ std::string postViaTcp(const std::string& baseUrl, const std::string& body,
 }
 
 #ifdef QLEVER_WITH_LLAMACPP
-// In-process embedding via llama.cpp from a local GGUF model (no server). Models
-// are loaded once per path and cached. Written against the llama.cpp embedding
-// API; enabled only with -DQLEVER_WITH_LLAMACPP=ON.
+// In-process embedding via llama.cpp from a local GGUF model (no server).
+// Models are loaded once per path and cached. Written against the llama.cpp
+// embedding API; enabled only with -DQLEVER_WITH_LLAMACPP=ON.
 std::vector<float> embedViaLlamaCpp(const std::string& modelPath,
                                     const std::string& text) {
   static std::once_flag backendOnce;
@@ -109,20 +126,24 @@ std::vector<float> embedViaLlamaCpp(const std::string& modelPath,
     llama_context* ctx;
   };
   static std::mutex mutex;
-  static std::unordered_map<std::string, Loaded> cache;
+  static ad_utility::HashMap<std::string, Loaded> cache;
   std::lock_guard<std::mutex> lock{mutex};
 
   auto it = cache.find(modelPath);
   if (it == cache.end()) {
     llama_model_params mp = llama_model_default_params();
     llama_model* model = llama_model_load_from_file(modelPath.c_str(), mp);
-    AD_CONTRACT_CHECK(model != nullptr, "Could not load GGUF model ", modelPath);
+    if (model == nullptr) {
+      AD_THROW(absl::StrCat("Could not load the GGUF model ", modelPath));
+    }
     llama_context_params cp = llama_context_default_params();
     cp.embeddings = true;
     cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
     llama_context* ctx = llama_init_from_model(model, cp);
-    AD_CONTRACT_CHECK(ctx != nullptr, "Could not create llama context for ",
-                      modelPath);
+    if (ctx == nullptr) {
+      AD_THROW(
+          absl::StrCat("Could not create a llama context for ", modelPath));
+    }
     it = cache.emplace(modelPath, Loaded{model, ctx}).first;
   }
   llama_model* model = it->second.model;
@@ -133,19 +154,25 @@ std::vector<float> embedViaLlamaCpp(const std::string& modelPath,
   int n = llama_tokenize(vocab, text.c_str(), static_cast<int>(text.size()),
                          tokens.data(), static_cast<int>(tokens.size()),
                          /*add_special=*/true, /*parse_special=*/false);
-  AD_CONTRACT_CHECK(n > 0, "Tokenization failed for the embedding input.");
+  if (n <= 0) {
+    AD_THROW("Tokenization failed for the embedding input.");
+  }
   tokens.resize(n);
 
   llama_kv_self_clear(ctx);
   llama_batch batch = llama_batch_get_one(tokens.data(), n);
-  AD_CONTRACT_CHECK(llama_decode(ctx, batch) >= 0, "llama_decode failed.");
+  if (llama_decode(ctx, batch) < 0) {
+    AD_THROW("llama_decode failed for the embedding input.");
+  }
 
   int dim = llama_model_n_embd(model);
   const float* emb = llama_get_embeddings_seq(ctx, 0);
   if (emb == nullptr) {
     emb = llama_get_embeddings(ctx);
   }
-  AD_CONTRACT_CHECK(emb != nullptr, "llama.cpp returned no embeddings.");
+  if (emb == nullptr) {
+    AD_THROW("llama.cpp returned no embeddings.");
+  }
   std::vector<float> out(emb, emb + dim);
   // L2-normalize (cosine-ready).
   double norm = 0.0;
@@ -162,31 +189,31 @@ std::vector<float> embedViaLlamaCpp(const std::string& modelPath,
 // regular http(s) URL.
 std::optional<std::string> unixSocketPath(const std::string& baseUrl) {
   constexpr std::string_view prefix = "unix:";
-  if (baseUrl.compare(0, prefix.size(), prefix) != 0) {
+  if (!ql::starts_with(baseUrl, prefix)) {
     return std::nullopt;
   }
   std::string rest = baseUrl.substr(prefix.size());
   // Drop an optional "//" empty-authority (so "unix:///p" and "unix:/p" both
   // yield "/p").
-  if (rest.compare(0, 2, "//") == 0) {
+  if (ql::starts_with(rest, "//")) {
     rest = rest.substr(2);
   }
   return rest;
 }
-}  // namespace
 
-// Embed a single `input` value (text or image payload) via the OpenAI-compatible
-// endpoint and return `data[0].embedding`.
+// Embed a single `input` value (text or image payload) via the
+// OpenAI-compatible endpoint and return `data[0].embedding`.
 std::vector<float> embedOneOpenAI(const std::string& baseUrl,
                                   const std::string& model,
                                   const std::string& input,
                                   ad_utility::SharedCancellationHandle handle) {
-  AD_CONTRACT_CHECK(!baseUrl.empty(),
-                    "This vector index has no embedding endpoint configured.");
+  if (baseUrl.empty()) {
+    AD_THROW("This vector index has no embedding endpoint configured.");
+  }
 
   // `llama:/path/to/model.gguf` -> in-process llama.cpp (no HTTP).
   constexpr std::string_view llamaPrefix = "llama:";
-  if (baseUrl.compare(0, llamaPrefix.size(), llamaPrefix) == 0) {
+  if (ql::starts_with(baseUrl, llamaPrefix)) {
     std::string modelPath = baseUrl.substr(llamaPrefix.size());
 #ifdef QLEVER_WITH_LLAMACPP
     (void)model;  // the GGUF file fully determines the model
@@ -194,7 +221,8 @@ std::vector<float> embedOneOpenAI(const std::string& baseUrl,
 #else
     AD_THROW(
         "This QLever build has no llama.cpp embedding backend. Rebuild with "
-        "-DQLEVER_WITH_LLAMACPP=ON, or use an http(s)/unix embedding endpoint.");
+        "-DQLEVER_WITH_LLAMACPP=ON, or use an http(s)/unix embedding "
+        "endpoint.");
 #endif
   }
 
@@ -204,7 +232,9 @@ std::vector<float> embedOneOpenAI(const std::string& baseUrl,
 
   std::string body;
   if (auto socketPath = unixSocketPath(baseUrl); socketPath.has_value()) {
+    handle->throwIfCancelled();
     body = postViaUnixSocket(socketPath.value(), requestBody);
+    handle->throwIfCancelled();
   } else {
     body = postViaTcp(baseUrl, requestBody, std::move(handle));
   }
@@ -213,15 +243,17 @@ std::vector<float> embedOneOpenAI(const std::string& baseUrl,
   try {
     parsed = nlohmann::json::parse(body);
   } catch (const std::exception& e) {
-    AD_THROW(absl::StrCat("Could not parse embedding response as JSON: ",
-                          e.what()));
+    AD_THROW(
+        absl::StrCat("Could not parse embedding response as JSON: ", e.what()));
   }
-  AD_CONTRACT_CHECK(parsed.contains("data") && parsed["data"].is_array() &&
-                        !parsed["data"].empty(),
-                    "Embedding response has no non-empty `data` array.");
+  if (!parsed.contains("data") || !parsed["data"].is_array() ||
+      parsed["data"].empty()) {
+    AD_THROW("The embedding response has no non-empty `data` array.");
+  }
   const auto& embedding = parsed["data"][0].at("embedding");
-  AD_CONTRACT_CHECK(embedding.is_array(),
-                    "Embedding response `data[0].embedding` is not an array.");
+  if (!embedding.is_array()) {
+    AD_THROW("The embedding response's `data[0].embedding` is not an array.");
+  }
   std::vector<float> out;
   out.reserve(embedding.size());
   for (const auto& value : embedding) {
@@ -229,14 +261,16 @@ std::vector<float> embedOneOpenAI(const std::string& baseUrl,
   }
   return out;
 }
+}  // namespace
 
-std::vector<float> embedTextOpenAI(const std::string& baseUrl,
-                                   const std::string& model,
-                                   const std::string& text,
-                                   ad_utility::SharedCancellationHandle handle) {
+// ____________________________________________________________________________
+std::vector<float> embedTextOpenAI(
+    const std::string& baseUrl, const std::string& model,
+    const std::string& text, ad_utility::SharedCancellationHandle handle) {
   return embedOneOpenAI(baseUrl, model, text, std::move(handle));
 }
 
+// ____________________________________________________________________________
 std::vector<float> embedImageOpenAI(
     const std::string& baseUrl, const std::string& model,
     const std::string& imagePayload,

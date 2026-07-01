@@ -1,9 +1,12 @@
-// Copyright 2026, University of Freiburg,
-// Chair of Algorithms and Data Structures.
-// Author: Artem <artem@rem.sh>
+// Copyright 2026 The QLever Authors, in particular:
+//
+// 2026 Artem <artem@rem.sh>
 
-#ifndef QLEVER_SRC_ENGINE_VECTORSEARCHJOIN_H
-#define QLEVER_SRC_ENGINE_VECTORSEARCHJOIN_H
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
+
+#ifndef QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORSEARCHJOIN_H
+#define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORSEARCHJOIN_H
 
 #include <memory>
 
@@ -52,4 +55,4 @@ class VectorSearchJoin : public Operation {
   std::unique_ptr<Operation> cloneImpl() const override;
 };
 
-#endif  // QLEVER_SRC_ENGINE_VECTORSEARCHJOIN_H
+#endif  // QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORSEARCHJOIN_H

@@ -1,10 +1,14 @@
-// Copyright 2026, University of Freiburg,
-// Chair of Algorithms and Data Structures.
-// Author: Artem <artem@rem.sh>
+// Copyright 2026 The QLever Authors, in particular:
+//
+// 2026 Artem <artem@rem.sh>
+
+// You may not use this file except in compliance with the Apache 2.0 License,
+// which can be found in the `LICENSE` file at the root of the QLever project.
 
 #ifndef QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEXEXTENSION_H
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEXEXTENSION_H
 
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -35,8 +39,11 @@ class VectorIndexCollection {
   ad_utility::HashMap<std::string, VectorIndex> indices_;
 };
 
-// Convenience for operations: the loaded `VectorIndex` named `name`, or nullptr.
-const VectorIndex* getVectorIndex(const Index& index, const std::string& name);
+// Convenience for operations: the loaded `VectorIndex` named `name`, or an
+// empty pointer. The returned `shared_ptr` aliases the whole collection, so the
+// index stays valid even if the extension is ever replaced while in use.
+std::shared_ptr<const VectorIndex> getVectorIndex(const Index& index,
+                                                  const std::string& name);
 
 }  // namespace qlever::vector
 
