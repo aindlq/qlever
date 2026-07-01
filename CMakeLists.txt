@@ -224,8 +224,25 @@ if (QLEVER_WITH_VECTOR_SEARCH)
             usearch
             GIT_REPOSITORY https://github.com/unum-cloud/usearch
             GIT_TAG 9fd6b0115dcdd0016e037fb5335f36824dd02090  # v2.25.3
-            GIT_SUBMODULES ""  # fp16/simsimd submodules are optional and unused
+            GIT_SUBMODULES ""  # submodules are fetched separately (see NumKong)
     )
+    # OPTIONAL, off by default: NumKong SIMD distance kernels with runtime CPU
+    # dispatch. The pinned commit is exactly the submodule pointer of the
+    # usearch version above, so the two are guaranteed compatible. Measured on
+    # this integration (usearch 2.25.3 + NumKong 7.6.0, 500k x 128 f32,
+    # 48 threads), the NumKong path was 2.5x SLOWER on HNSW build and 5.7x
+    # slower on queries than usearch's portable scalar kernels, so it stays
+    # opt-in until the upstream integration improves.
+    option(QLEVER_VECTOR_SEARCH_SIMD
+            "Use SIMD distance kernels (NumKong) for the vector search" OFF)
+    if (QLEVER_VECTOR_SEARCH_SIMD)
+        FetchContent_Declare(
+                numkong
+                GIT_REPOSITORY https://github.com/ashvardanian/NumKong
+                GIT_TAG 48cbd21db85c013f0faebdbbe07b0feed1dd9e7c  # usearch v2.25.3 submodule
+                GIT_SUBMODULES ""
+        )
+    endif ()
 endif ()
 
 #################################
@@ -522,11 +539,18 @@ target_compile_options(antlr4_static PRIVATE -Wno-all -Wno-extra -Wno-error -Wno
 include_directories(SYSTEM "${antlr_SOURCE_DIR}/runtime/Cpp/runtime/src")
 
 if (QLEVER_WITH_VECTOR_SEARCH)
-    # usearch is header-only: populate the sources. The include directory is
-    # added target-scoped in `src/services/vectorSearch/CMakeLists.txt`.
+    # usearch (and optionally NumKong) are header-only: populate the sources.
+    # The include directories are added target-scoped in
+    # `src/services/vectorSearch/CMakeLists.txt`.
     FetchContent_GetProperties(usearch)
     if (NOT usearch_POPULATED)
         FetchContent_Populate(usearch)
+    endif ()
+    if (QLEVER_VECTOR_SEARCH_SIMD)
+        FetchContent_GetProperties(numkong)
+        if (NOT numkong_POPULATED)
+            FetchContent_Populate(numkong)
+        endif ()
     endif ()
 endif ()
 

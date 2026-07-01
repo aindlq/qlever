@@ -37,6 +37,16 @@ std::vector<float> embedImageOpenAI(
     const std::string& imagePayload,
     ad_utility::SharedCancellationHandle handle);
 
+// Embed many texts with ONE request (`"input": [t0, t1, ...]`) -- the
+// OpenAI-compatible batch shape. Returns one embedding per input, in input
+// order. Used by the index build, where a request per row would make the build
+// latency-bound on the endpoint. (The in-process `llama:` backend embeds the
+// batch sequentially.)
+std::vector<std::vector<float>> embedBatchOpenAI(
+    const std::string& baseUrl, const std::string& model,
+    const std::vector<std::string>& texts,
+    ad_utility::SharedCancellationHandle handle);
+
 }  // namespace qlever::vector
 
 #endif  // QLEVER_SRC_SERVICES_VECTORSEARCH_EMBEDDINGCLIENT_H

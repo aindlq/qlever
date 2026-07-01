@@ -17,24 +17,53 @@
 // On-disk format description and shared types for the built-in vector indices.
 //
 // A single named vector index `N` of a database with base name `B` is stored in
-// the following files (mirroring how the text index uses `B.text.*`):
+// the following files:
 //
-//   B.vec.N.meta   JSON metadata (this file's `VectorIndexMetadata`)
-//   B.vec.N.keys   `MmapVector<uint64_t>`: ascending entity ids (VocabIndex)
-//   B.vec.N.data   flat row-major float matrix, stride = `dimensions` floats
-//   B.vec.N.hnsw   usearch HNSW index file (only if `hasHnsw_`)
+//   B.vec.N.meta    JSON metadata (this file's `VectorIndexMetadata`)
+//   B.vec.N.data    flat row-major float matrix, stride = `dimensions` floats.
+//                   IMMUTABLE after the build: row indices are the permanent
+//                   identity of the vectors.
+//   B.vec.N.iris    one IRI per line, aligned with the rows. IMMUTABLE. Kept so
+//                   that the entity mapping can be recomputed cheaply after the
+//                   knowledge graph is re-indexed (see "remapping" below).
+//   B.vec.N.keys    `MmapVector<uint64_t>`: row -> current `ValueId` bits, or
+//                   `TOMBSTONE_KEY` for rows whose IRI is not part of the
+//                   current knowledge graph. Rewritten by a remap.
+//   B.vec.N.rowmap  `MmapVector<IdRowPair>` sorted by id: current `ValueId`
+//                   bits -> row, live rows only (the id -> row direction).
+//                   Rewritten by a remap.
+//   B.vec.N.hnsw    usearch HNSW graph (only if `hasHnsw_`), keyed by ROW
+//                   index; the vectors themselves are NOT duplicated into this
+//                   file -- distance computations read them from `.data`.
+//                   IMMUTABLE after the build.
 //
-// Row `i` of `.data` is the vector of the entity whose id is `keys[i]`. Because
-// `.keys` is sorted, the entity -> row mapping is a binary search and row ->
-// entity is O(1). Only entities that actually have a vector occupy a row, so a
-// sparse index over a large database stays small.
+// Remapping: the entity ids stored in `.keys`/`.rowmap` are vocabulary
+// positions, which shift whenever the RDF data is re-indexed. Because `.data`,
+// `.iris`, and the row-keyed `.hnsw` never depend on those ids, a re-index of
+// the RDF data only requires re-resolving `.iris` against the new vocabulary
+// and rewriting the two small mapping files -- the (potentially huge) vector
+// matrix and HNSW graph are reused as-is. Entities that disappeared from the
+// knowledge graph become tombstones (skipped by all searches).
 namespace qlever::vector {
 
-// Bumped whenever the on-disk layout of the `.keys`/`.data`/`.meta` files
-// changes. Independent of QLever's global `indexFormatVersion`, so adding or
-// changing vector indices never forces a rebuild of the main index.
-// Version history: 1 = initial; 2 = added the `vocabSize` fingerprint.
-inline constexpr uint32_t VECTOR_INDEX_VERSION = 2;
+// Bumped whenever the on-disk layout changes. Independent of QLever's global
+// `indexFormatVersion`, so adding or changing vector indices never forces a
+// rebuild of the main index. Version history: 1 = initial; 2 = added the
+// `vocabSize` fingerprint; 3 = row-keyed graph-only `.hnsw`, `.iris` +
+// `.rowmap` sidecars, tombstones (cheap remapping after a KG re-index).
+inline constexpr uint32_t VECTOR_INDEX_VERSION = 3;
+
+// The `.keys` value of a row whose entity is not part of the current knowledge
+// graph. Real keys are `ValueId` bits, whose datatype (high) bits never have
+// all bits set, so this value cannot collide.
+inline constexpr uint64_t TOMBSTONE_KEY = ~uint64_t{0};
+
+// One entry of the `.rowmap` file: the id -> row direction of the entity
+// mapping, sorted by `idBits_`.
+struct IdRowPair {
+  uint64_t idBits_;
+  uint64_t row_;
+};
 
 // The similarity metric of an index. Maps 1:1 to a `usearch` metric kind.
 enum class VectorMetric : uint8_t { Cosine, L2Sq, InnerProduct };
@@ -94,6 +123,9 @@ struct VectorIndexConfig {
   uint32_t hnswConnectivity_ = 16;     // a.k.a. M
   uint32_t hnswExpansionAdd_ = 128;    // a.k.a. efConstruction
   uint32_t hnswExpansionSearch_ = 64;  // a.k.a. efSearch
+  // Number of threads for the HNSW construction; 0 = all hardware threads.
+  // Build-time only (not persisted).
+  uint32_t buildThreads_ = 0;
 
   // Optional embedding endpoint, bound to this index so that query-time
   // embedding always uses the SAME model that produced the index.
@@ -115,20 +147,25 @@ struct VectorIndexBuildSpec {
   std::string npyPath_;    // precomputed vectors in a .npy matrix, or
   std::string textsPath_;  // a row-aligned file of texts to embed at index time
                            // (requires `config_.embeddingUrl_`).
+  // If true, do not build anything: re-resolve the existing index's `.iris`
+  // against the (re-indexed) knowledge graph and rewrite `.keys`/`.rowmap`.
+  bool remap_ = false;
 };
 
 // What is persisted in `B.vec.N.meta` and re-read at server start.
 struct VectorIndexMetadata {
   VectorIndexConfig config_;
+  // Number of rows in `.data` (including tombstoned rows).
   uint64_t numVectors_ = 0;
+  // Number of rows whose entity is absent from the current knowledge graph.
+  uint64_t numTombstones_ = 0;
   bool hasHnsw_ = false;
   uint32_t version_ = VECTOR_INDEX_VERSION;
-  // Fingerprint of the knowledge-graph build the entity ids in `.keys` refer
-  // to: the size of the vocabulary at vector-index build time. The stored ids
-  // are vocabulary positions, so they silently point at DIFFERENT entities
-  // after the main index is rebuilt with changed data; the load hook compares
-  // this fingerprint against the loaded vocabulary and skips (with a warning)
-  // any vector index that does not match.
+  // Fingerprint of the knowledge-graph build the entity ids in
+  // `.keys`/`.rowmap` refer to: the size of the vocabulary at (re)mapping
+  // time. The load hook compares this fingerprint against the loaded
+  // vocabulary and skips (with a warning suggesting a remap) any vector index
+  // that does not match.
   uint64_t vocabSize_ = 0;
 };
 
@@ -141,9 +178,17 @@ inline std::string vectorKeysFile(const std::string& base,
                                   const std::string& name) {
   return base + ".vec." + name + ".keys";
 }
+inline std::string vectorRowmapFile(const std::string& base,
+                                    const std::string& name) {
+  return base + ".vec." + name + ".rowmap";
+}
 inline std::string vectorDataFile(const std::string& base,
                                   const std::string& name) {
   return base + ".vec." + name + ".data";
+}
+inline std::string vectorIrisFile(const std::string& base,
+                                  const std::string& name) {
+  return base + ".vec." + name + ".iris";
 }
 inline std::string vectorHnswFile(const std::string& base,
                                   const std::string& name) {
@@ -158,6 +203,7 @@ inline void to_json(nlohmann::json& j, const VectorIndexMetadata& m) {
                      {"metric", toString(m.config_.metric_)},
                      {"scalar", toString(m.config_.scalar_)},
                      {"numVectors", m.numVectors_},
+                     {"numTombstones", m.numTombstones_},
                      {"hasHnsw", m.hasHnsw_},
                      {"hnswConnectivity", m.config_.hnswConnectivity_},
                      {"hnswExpansionAdd", m.config_.hnswExpansionAdd_},
@@ -174,6 +220,7 @@ inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
   m.config_.metric_ = vectorMetricFromString(j.at("metric").get<std::string>());
   m.config_.scalar_ = vectorScalarFromString(j.at("scalar").get<std::string>());
   j.at("numVectors").get_to(m.numVectors_);
+  m.numTombstones_ = j.value("numTombstones", uint64_t{0});
   j.at("hasHnsw").get_to(m.hasHnsw_);
   j.at("hnswConnectivity").get_to(m.config_.hnswConnectivity_);
   j.at("hnswExpansionAdd").get_to(m.config_.hnswExpansionAdd_);

@@ -8,9 +8,11 @@
 #ifndef QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEXEXTENSION_H
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEXEXTENSION_H
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "services/vectorSearch/VectorIndex.h"
 #include "util/HashMap.h"
@@ -44,6 +46,19 @@ class VectorIndexCollection {
 // index stays valid even if the extension is ever replaced while in use.
 std::shared_ptr<const VectorIndex> getVectorIndex(const Index& index,
                                                   const std::string& name);
+
+// Recompute the entity mapping of the existing on-disk vector index `name`
+// against the CURRENTLY LOADED knowledge graph: re-resolves the row-aligned
+// `.iris` sidecar (in parallel; `numThreads` 0 = all cores) and rewrites
+// `.keys`/`.rowmap`/`.meta`. The vector data and the HNSW graph are reused
+// as-is, which makes this orders of magnitude cheaper than a rebuild after the
+// RDF data was re-indexed. Entities that are no longer part of the knowledge
+// graph become tombstones. Returns (live entities, tombstones). Also invoked
+// via `--service-index '{"vectorSearch":[{"name":"...","remap":true}]}'`.
+std::pair<uint64_t, uint64_t> remapVectorIndex(const Index& index,
+                                               const std::string& basename,
+                                               const std::string& name,
+                                               uint32_t numThreads = 0);
 
 }  // namespace qlever::vector
 

@@ -51,22 +51,59 @@ Per-index keys (unknown keys are rejected):
 | `hnswConnectivity` | usearch M | 16 |
 | `hnswExpansionAdd` | efConstruction | 128 |
 | `hnswExpansionSearch` | efSearch (applied at query time) | 64 |
+| `buildThreads` | threads for the HNSW construction and IRI resolution | all cores |
 | `embeddingUrl` | OpenAI-compatible embeddings endpoint bound to this index | — |
 | `embeddingModel` | model name sent to the endpoint | — |
+| `remap` | see "Re-indexing the RDF data" below | `false` |
 
 IRIs not present in the knowledge graph are skipped (with a count in the log);
 duplicate IRIs are deduplicated (first vector wins, with a warning). The build
 is atomic: files are written to temporaries and renamed into place (metadata
 last), so an interrupted build never leaves a loadable-but-inconsistent index.
 
-On-disk layout per index `N` of database `B` (see `VectorIndexFormat.h`):
-`B.vec.N.meta` (JSON), `B.vec.N.keys` (sorted entity ids), `B.vec.N.data`
-(row-major floats), `B.vec.N.hnsw` (optional usearch file). The metadata
-records the **vocabulary size at build time**; a vector index whose fingerprint
-does not match the loaded knowledge graph (i.e. the KG was rebuilt) is skipped
-at server start with a warning instead of silently binding vectors to wrong
-entities. Broken index files are likewise skipped with a warning; queries
-against a skipped index fail with "no loaded vector index named ...".
+The build is designed for very large inputs: vectors are STREAMED through
+temporary files (the builder holds ~24 bytes of bookkeeping per row in RAM,
+never the vectors -- 100M rows is ~2.4 GB), IRIs are resolved against the
+vocabulary in parallel batches, texts are embedded in batched requests, and
+the HNSW graph is constructed concurrently on `buildThreads` threads with the
+vectors read from the memory-mapped store (usearch holds only the graph in
+RAM, roughly `N * connectivity * 10` bytes). A concurrently built graph is not
+bit-for-bit deterministic (recall is unaffected); set `buildThreads: 1` for a
+deterministic build. Reference point: 500k x 128-dim f32 vectors build in
+~7.5 s on 48 cores with recall@10 = 0.98 on clustered data.
+
+On-disk layout per index `N` of database `B` (see `VectorIndexFormat.h` for
+details): `B.vec.N.meta` (JSON), `B.vec.N.data` (row-major floats; immutable),
+`B.vec.N.iris` (row-aligned IRIs; immutable), `B.vec.N.keys` (row -> entity
+id), `B.vec.N.rowmap` (entity id -> row), `B.vec.N.hnsw` (optional usearch
+graph, keyed by ROW index; the vectors are NOT duplicated into it -- distances
+are computed against the memory-mapped `.data` store, so each vector exists
+exactly once on disk and in the page cache).
+
+## Re-indexing the RDF data: remapping instead of rebuilding
+
+Entity ids are vocabulary positions, which shift whenever the RDF data is
+re-indexed. The metadata records the **vocabulary size at mapping time**; a
+vector index whose fingerprint does not match the loaded knowledge graph is
+skipped at server start with a warning (instead of silently binding vectors to
+wrong entities). Broken index files are likewise skipped; queries against a
+skipped index fail with "no loaded vector index named ...".
+
+Because the vector matrix, the IRI sidecar, and the row-keyed HNSW graph never
+depend on entity ids, a re-index of the RDF data does NOT require rebuilding
+the vector index. Instead, run a **remap**:
+
+```bash
+qlever-index -i base -f updated-kg.ttl \
+  --service-index '{"vectorSearch": [{"name": "clip", "remap": true}]}'
+```
+
+This re-resolves the persisted IRIs against the new vocabulary (in parallel)
+and rewrites only the two small mapping files -- minutes and a few GB of I/O
+even at the 100M-vector scale, versus hours for a full rebuild. Entities that
+disappeared from the knowledge graph become tombstones: they stay in the files
+but are skipped by every search. Rebuild (rather than remap) when the set of
+entities with vectors has changed substantially.
 
 ## Querying
 
@@ -113,16 +150,20 @@ empty result. Results computed through an external embedding endpoint
 
 ## Design notes
 
-- **Storage/serving**: the flat store is opened as a read-only mmap
-  (`MmapVectorView`), the HNSW file via usearch `view()` — startup cost is
-  O(metadata), the index may exceed RAM, and concurrent readers are safe. The
-  configured `hnswExpansionSearch` is re-applied after `view()` (usearch does
-  not persist it), and the search-context pool is enlarged beyond
-  `hardware_concurrency()` so that a server running with more query threads
-  than cores does not fail searches.
-- **Keys are raw `ValueId` bits** (an explicitly `uint64_t`-keyed
-  `index_dense_gt`), so vector results join directly with any graph data and
-  exact and HNSW search share one `metric_punned_t` (comparable distances).
+- **Storage/serving**: everything is opened as read-only mmaps; the HNSW
+  graph via usearch `view()` — startup cost is O(metadata), the index may
+  exceed RAM, and concurrent readers are safe. Searches use a pooled set of
+  usearch contexts; a burst beyond the pool briefly queues instead of failing.
+- **The HNSW graph is usearch's low-level `index_gt`, keyed by row index**,
+  with a custom metric that reads vectors from the flat store — this is what
+  keeps vectors out of the graph file and makes remapping possible. Search
+  results are translated rows -> current entity ids via `.keys`. Exact and
+  HNSW search share one `metric_punned_t` (comparable distances). The exact
+  search switches between per-candidate lookups and a sequential
+  scan-with-filter depending on candidate density.
+- SIMD kernels (NumKong) can be enabled with `-DQLEVER_VECTOR_SEARCH_SIMD=ON`;
+  they are OFF by default because the current usearch integration measured
+  slower than the portable scalar kernels (see the note in `CMakeLists.txt`).
 - **Operations**: `VectorSearch` (point query, optional candidate restriction)
   and `VectorSearchJoin` (per-row form, memoizes repeated query entities)
   follow the `SpatialJoin` conventions — allocator-backed `IdTable`s,
@@ -137,15 +178,14 @@ empty result. Results computed through an external embedding endpoint
 
 ## Known limitations / follow-ups
 
-- The **builder holds all vectors in RAM** (roughly twice the raw vector data)
-  and builds the HNSW single-threaded — fine up to a few million vectors;
-  external-memory sorting, a parallel usearch build, merge-based vocabulary
-  resolution, and batched embedding requests are the planned path to 100M+.
+- For a fast HNSW build, the flat store should fit in the page cache (graph
+  construction reads vectors in random order); with data much larger than RAM,
+  expect the build to become NVMe-bound. The graph itself always stays small.
 - The join form requires `vec:left` to be bound **inside** the SERVICE's
   nested pattern (unlike the spatial join's `<left>`); joining with the
   surrounding query and restricting its search space need the planner's
   incomplete-join machinery (follow-up).
-- usearch is built with `USEARCH_USE_SIMSIMD=0` (portable scalar kernels);
-  enabling SimSIMD would speed up exact search considerably.
+- Tombstones accumulate over repeated remaps; rebuild when a large fraction of
+  the indexed entities has disappeared (searches over-fetch past tombstones).
 - `f16`/`i8` storage, Parquet ingest, and migrating the six pre-existing magic
   services onto the registry are follow-ups.

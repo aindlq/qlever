@@ -36,13 +36,17 @@ struct ScoredEntity {
 // An empty function disables the checks.
 using CheckInterruptCallback = std::function<void()>;
 
-// Read-only, memory-mapped accessor for a single on-disk vector index. It owns
-// the mmaped flat float store (`.keys`/`.data`) and, if present, the
-// memory-mapped usearch HNSW index (`.hnsw`). All search methods are const and
-// thread-safe for concurrent reads (usearch search is thread-safe).
+// Read-only, memory-mapped accessor for a single on-disk vector index (see
+// `VectorIndexFormat.h` for the file layout). It owns the mmaped flat float
+// store, the entity mappings, and, if present, the memory-mapped usearch HNSW
+// graph. All search methods are const and thread-safe for concurrent reads;
+// concurrent HNSW searches beyond the reserved context pool briefly queue
+// instead of failing.
 //
 // The exact and approximate searches use the *same* metric implementation
 // (usearch's `metric_punned_t`), so their distances are directly comparable.
+// Tombstoned rows (entities that disappeared from the knowledge graph after a
+// remap) are skipped by all searches.
 class VectorIndex {
  public:
   VectorIndex();
@@ -52,14 +56,17 @@ class VectorIndex {
   VectorIndex(const VectorIndex&) = delete;
   VectorIndex& operator=(const VectorIndex&) = delete;
 
-  // Open `<basename>.vec.<name>.*` read-only (vectors and HNSW are mmaped).
-  // Throws if the metadata/keys/data files are missing or inconsistent.
+  // Open `<basename>.vec.<name>.*` read-only (everything is mmaped).
+  // Throws if the files are missing or inconsistent.
   void open(const std::string& basename, const std::string& name);
 
   // Metadata accessors.
   const VectorIndexMetadata& metadata() const;
   size_t dimensions() const;
+  // Number of rows in the flat store (including tombstoned rows).
   size_t numVectors() const;
+  // Number of rows whose entity exists in the current knowledge graph.
+  size_t numLiveVectors() const;
   VectorMetric metric() const;
   bool hasHnsw() const;
 
@@ -69,7 +76,7 @@ class VectorIndex {
   std::optional<ql::span<const float>> getVector(Id entity) const;
 
   // Exact brute-force top-`k` nearest neighbours of `query`.
-  //  - If `candidates` is `nullopt`, searches over ALL entities in the index.
+  //  - If `candidates` is `nullopt`, searches over ALL (live) entities.
   //  - Otherwise searches only the given candidate entities (the optimisation
   //    used when a join's search side is already small). Candidates without a
   //    vector in this index are skipped; an EMPTY candidate list yields an
@@ -82,7 +89,7 @@ class VectorIndex {
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
 
-  // Approximate top-`k` via the HNSW index over the whole index. Requires
+  // Approximate top-`k` via the HNSW graph over the whole index. Requires
   // `hasHnsw()`. Results are ascending by distance.
   std::vector<ScoredEntity> searchHnsw(
       ql::span<const float> query, size_t k,

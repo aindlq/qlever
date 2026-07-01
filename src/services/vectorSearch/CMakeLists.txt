@@ -13,13 +13,34 @@ add_library(vectorStorage
 qlever_target_link_libraries(vectorStorage util global)
 # usearch is header-only; scope its include directory and configuration to the
 # targets that actually use it (PUBLIC keeps the macros ODR-consistent in every
-# TU that might include usearch headers through us). The bundled scalar
-# implementations are used -- no SIMD/fp16 submodules; enabling SimSIMD for
-# faster exact search is a known follow-up.
+# TU that might include usearch headers through us).
 target_include_directories(vectorStorage SYSTEM PUBLIC
         "${usearch_SOURCE_DIR}/include")
 target_compile_definitions(vectorStorage PUBLIC
-        USEARCH_USE_FP16LIB=0 USEARCH_USE_SIMSIMD=0 USEARCH_USE_OPENMP=0)
+        USEARCH_USE_FP16LIB=0 USEARCH_USE_OPENMP=0)
+if (QLEVER_VECTOR_SEARCH_SIMD)
+    # SIMD distance kernels with runtime CPU dispatch (also used by the exact
+    # brute-force scan, which shares usearch's `metric_punned_t`). usearch
+    # consumes NumKong in its dynamic-dispatch mode, which needs NumKong's C
+    # dispatch tables compiled once; we build them as a small static library
+    # (upstream only offers a shared one).
+    file(GLOB NUMKONG_DISPATCH_SOURCES
+         "${numkong_SOURCE_DIR}/c/numkong.c"
+         "${numkong_SOURCE_DIR}/c/dispatch_*.c")
+    add_library(numkongDispatch STATIC ${NUMKONG_DISPATCH_SOURCES})
+    target_include_directories(numkongDispatch SYSTEM PUBLIC
+            "${numkong_SOURCE_DIR}/include")
+    target_compile_definitions(numkongDispatch PUBLIC NK_DYNAMIC_DISPATCH=1)
+    if (NOT MSVC)
+        # Third-party C sources; not subject to our warning level.
+        target_compile_options(numkongDispatch PRIVATE -w)
+    endif ()
+    # Plain signature to match `qlever_target_link_libraries` above.
+    qlever_target_link_libraries(vectorStorage numkongDispatch)
+    target_compile_definitions(vectorStorage PUBLIC USEARCH_USE_NUMKONG=1)
+else ()
+    target_compile_definitions(vectorStorage PUBLIC USEARCH_USE_NUMKONG=0)
+endif ()
 
 add_library(service_vectorSearch OBJECT
         VectorSearch.cpp

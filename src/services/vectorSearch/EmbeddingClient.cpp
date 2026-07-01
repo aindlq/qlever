@@ -201,14 +201,18 @@ std::optional<std::string> unixSocketPath(const std::string& baseUrl) {
   return rest;
 }
 
-// Embed a single `input` value (text or image payload) via the
-// OpenAI-compatible endpoint and return `data[0].embedding`.
-std::vector<float> embedOneOpenAI(const std::string& baseUrl,
-                                  const std::string& model,
-                                  const std::string& input,
-                                  ad_utility::SharedCancellationHandle handle) {
+// Embed `inputs` (texts or image payloads) via the OpenAI-compatible endpoint
+// with a single request; returns one embedding per input, in input order. The
+// response's per-item `index` field is honoured where present.
+std::vector<std::vector<float>> embedManyOpenAI(
+    const std::string& baseUrl, const std::string& model,
+    const std::vector<std::string>& inputs,
+    ad_utility::SharedCancellationHandle handle) {
   if (baseUrl.empty()) {
     AD_THROW("This vector index has no embedding endpoint configured.");
+  }
+  if (inputs.empty()) {
+    return {};
   }
 
   // `llama:/path/to/model.gguf` -> in-process llama.cpp (no HTTP).
@@ -217,7 +221,13 @@ std::vector<float> embedOneOpenAI(const std::string& baseUrl,
     std::string modelPath = baseUrl.substr(llamaPrefix.size());
 #ifdef QLEVER_WITH_LLAMACPP
     (void)model;  // the GGUF file fully determines the model
-    return embedViaLlamaCpp(modelPath, input);
+    std::vector<std::vector<float>> out;
+    out.reserve(inputs.size());
+    for (const auto& input : inputs) {
+      handle->throwIfCancelled();
+      out.push_back(embedViaLlamaCpp(modelPath, input));
+    }
+    return out;
 #else
     AD_THROW(
         "This QLever build has no llama.cpp embedding backend. Rebuild with "
@@ -226,8 +236,7 @@ std::vector<float> embedOneOpenAI(const std::string& baseUrl,
 #endif
   }
 
-  nlohmann::json request{{"model", model},
-                         {"input", nlohmann::json::array({input})}};
+  nlohmann::json request{{"model", model}, {"input", inputs}};
   std::string requestBody = request.dump();
 
   std::string body;
@@ -247,17 +256,30 @@ std::vector<float> embedOneOpenAI(const std::string& baseUrl,
         absl::StrCat("Could not parse embedding response as JSON: ", e.what()));
   }
   if (!parsed.contains("data") || !parsed["data"].is_array() ||
-      parsed["data"].empty()) {
-    AD_THROW("The embedding response has no non-empty `data` array.");
+      parsed["data"].size() != inputs.size()) {
+    AD_THROW(absl::StrCat(
+        "The embedding response's `data` array must contain one entry per "
+        "input (",
+        inputs.size(), " expected)."));
   }
-  const auto& embedding = parsed["data"][0].at("embedding");
-  if (!embedding.is_array()) {
-    AD_THROW("The embedding response's `data[0].embedding` is not an array.");
-  }
-  std::vector<float> out;
-  out.reserve(embedding.size());
-  for (const auto& value : embedding) {
-    out.push_back(value.get<float>());
+  std::vector<std::vector<float>> out(inputs.size());
+  size_t position = 0;
+  for (const auto& item : parsed["data"]) {
+    size_t index = item.value("index", position);
+    if (index >= out.size() || !out[index].empty()) {
+      AD_THROW(
+          "The embedding response has invalid or duplicate `index` "
+          "fields.");
+    }
+    const auto& embedding = item.at("embedding");
+    if (!embedding.is_array() || embedding.empty()) {
+      AD_THROW("An `embedding` in the response is not a non-empty array.");
+    }
+    out[index].reserve(embedding.size());
+    for (const auto& value : embedding) {
+      out[index].push_back(value.get<float>());
+    }
+    ++position;
   }
   return out;
 }
@@ -267,7 +289,8 @@ std::vector<float> embedOneOpenAI(const std::string& baseUrl,
 std::vector<float> embedTextOpenAI(
     const std::string& baseUrl, const std::string& model,
     const std::string& text, ad_utility::SharedCancellationHandle handle) {
-  return embedOneOpenAI(baseUrl, model, text, std::move(handle));
+  return std::move(
+      embedManyOpenAI(baseUrl, model, {text}, std::move(handle)).front());
 }
 
 // ____________________________________________________________________________
@@ -275,7 +298,17 @@ std::vector<float> embedImageOpenAI(
     const std::string& baseUrl, const std::string& model,
     const std::string& imagePayload,
     ad_utility::SharedCancellationHandle handle) {
-  return embedOneOpenAI(baseUrl, model, imagePayload, std::move(handle));
+  return std::move(
+      embedManyOpenAI(baseUrl, model, {imagePayload}, std::move(handle))
+          .front());
+}
+
+// ____________________________________________________________________________
+std::vector<std::vector<float>> embedBatchOpenAI(
+    const std::string& baseUrl, const std::string& model,
+    const std::vector<std::string>& texts,
+    ad_utility::SharedCancellationHandle handle) {
+  return embedManyOpenAI(baseUrl, model, texts, std::move(handle));
 }
 
 }  // namespace qlever::vector

@@ -7,10 +7,12 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <random>
 #include <set>
 #include <vector>
@@ -46,6 +48,9 @@ struct TestData {
   std::vector<uint64_t> rawIds;  // small ints used to form Ids and IRIs
   std::vector<std::vector<float>> vecs;
   Id id(size_t i) const { return mkId(rawIds[i]); }
+  std::string iri(size_t i) const {
+    return "<http://ex/" + std::to_string(rawIds[i]) + ">";
+  }
 };
 
 TestData makeData() {
@@ -85,7 +90,7 @@ BuiltIndex buildTmp(bool withHnsw) {
   cfg.hnswExpansionSearch_ = 200;  // high recall for the test
   VectorIndexBuilder builder{b.basename, cfg};
   for (size_t i = 0; i < NUM_VECTORS; ++i) {
-    builder.add(b.data.id(i), b.data.vecs[i]);
+    builder.add(b.data.id(i), b.data.iri(i), b.data.vecs[i]);
   }
   auto meta = builder.build();
   EXPECT_EQ(meta.numVectors_, NUM_VECTORS);
@@ -94,7 +99,8 @@ BuiltIndex buildTmp(bool withHnsw) {
 }
 
 void cleanup(const BuiltIndex& b) {
-  for (auto* suffix : {".meta", ".keys", ".data", ".hnsw"}) {
+  for (auto* suffix :
+       {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
     std::error_code ec;
     std::filesystem::remove(b.basename + ".vec." + b.name + suffix, ec);
   }
@@ -255,9 +261,9 @@ TEST(VectorIndex, duplicateEntitiesAreDeduplicated) {
   std::vector<float> first{1.f, 0.f, 0.f, 0.f};
   std::vector<float> second{0.f, 1.f, 0.f, 0.f};
   std::vector<float> other{0.f, 0.f, 1.f, 0.f};
-  builder.add(mkId(1), first);
-  builder.add(mkId(1), second);  // duplicate -> dropped, first wins
-  builder.add(mkId(2), other);
+  builder.add(mkId(1), "<http://ex/1>", first);
+  builder.add(mkId(1), "<http://ex/1>", second);  // duplicate -> dropped
+  builder.add(mkId(2), "<http://ex/2>", other);
   auto meta = builder.build();
   EXPECT_EQ(meta.numVectors_, 2u);
   VectorIndex idx;
@@ -266,7 +272,8 @@ TEST(VectorIndex, duplicateEntitiesAreDeduplicated) {
   ASSERT_TRUE(v.has_value());
   EXPECT_FLOAT_EQ((*v)[0], 1.f);
   EXPECT_FLOAT_EQ((*v)[1], 0.f);
-  for (auto* suffix : {".meta", ".keys", ".data", ".hnsw"}) {
+  for (auto* suffix :
+       {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
     std::error_code ec;
     std::filesystem::remove(basename + ".vec.dup" + suffix, ec);
   }
@@ -283,13 +290,14 @@ TEST(VectorIndex, rebuildOverExistingIndexIsAtomic) {
   cfg.dimensions_ = DIM;
   cfg.buildHnsw_ = false;
   VectorIndexBuilder builder{b.basename, cfg};
-  builder.add(b.data.id(0), b.data.vecs[0]);
+  builder.add(b.data.id(0), b.data.iri(0), b.data.vecs[0]);
   builder.build();
   VectorIndex idx;
   idx.open(b.basename, b.name);
   EXPECT_EQ(idx.numVectors(), 1u);
   // No `.tmp` files are left behind.
-  for (auto* suffix : {".meta.tmp", ".keys.tmp", ".data.tmp", ".hnsw.tmp"}) {
+  for (auto* suffix : {".meta.tmp", ".keys.tmp", ".rowmap.tmp", ".data.tmp",
+                       ".iris.tmp", ".hnsw.tmp"}) {
     EXPECT_FALSE(
         std::filesystem::exists(b.basename + ".vec." + b.name + suffix));
   }
@@ -447,4 +455,89 @@ TEST(VectorIndex, hnswMatchesExactReasonably) {
   }
   EXPECT_GE(static_cast<double>(hits) / total, 0.9);
   cleanup(b);
+}
+
+// _____________________________________________________________________________
+// Manual scale/performance smoke check (excluded from regular runs; it builds
+// a multi-million-vector index). Run with:
+//   --gtest_also_run_disabled_tests --gtest_filter='*scaleBenchmark*'
+TEST(VectorIndex, DISABLED_scaleBenchmark) {
+  // Overridable for experiments: QLEVER_BENCH_N / QLEVER_BENCH_THREADS.
+  const char* nEnv = std::getenv("QLEVER_BENCH_N");
+  const size_t n = nEnv ? std::stoull(nEnv) : 2'000'000;
+  const char* threadsEnv = std::getenv("QLEVER_BENCH_THREADS");
+  const uint32_t threads =
+      threadsEnv ? static_cast<uint32_t>(std::stoul(threadsEnv)) : 0;
+  const char* efEnv = std::getenv("QLEVER_BENCH_EF");
+  const uint32_t ef = efEnv ? static_cast<uint32_t>(std::stoul(efEnv)) : 64;
+  // 0 = iid gaussian -- the known pathological case for ANN (distance
+  // concentration; recall then scales with `ef`, not with graph quality).
+  // The default is clustered data, which is what real embeddings look like.
+  const char* clustersEnv = std::getenv("QLEVER_BENCH_CLUSTERS");
+  const size_t clusters = clustersEnv ? std::stoull(clustersEnv) : 1000;
+  constexpr size_t dim = 128;
+  std::string basename = uniqueTmpBasename();
+  std::mt19937 rng{42};
+  std::normal_distribution<float> g{0.f, 1.f};
+  VectorIndexConfig cfg;
+  cfg.name_ = "bench";
+  cfg.dimensions_ = dim;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.buildHnsw_ = true;
+  cfg.buildThreads_ = threads;
+  cfg.hnswExpansionSearch_ = ef;
+  std::vector<std::vector<float>> centroids;
+  for (size_t c = 0; c < clusters; ++c) {
+    std::vector<float> centroid(dim);
+    for (auto& x : centroid) x = g(rng);
+    centroids.push_back(std::move(centroid));
+  }
+  auto t0 = std::chrono::steady_clock::now();
+  VectorIndexBuilder builder{basename, cfg};
+  std::vector<float> v(dim);
+  for (size_t i = 0; i < n; ++i) {
+    for (auto& x : v) x = g(rng);
+    if (clusters > 0) {
+      const auto& centroid = centroids[i % clusters];
+      for (size_t j = 0; j < dim; ++j) v[j] = centroid[j] + 0.15f * v[j];
+    }
+    builder.add(mkId(10 + i * 3), "<http://ex/" + std::to_string(i) + ">", v);
+  }
+  auto t1 = std::chrono::steady_clock::now();
+  auto meta = builder.build();
+  auto t2 = std::chrono::steady_clock::now();
+  ASSERT_EQ(meta.numVectors_, n);
+  VectorIndex idx;
+  idx.open(basename, "bench");
+  // Recall@10 of HNSW vs. exact on a sample of stored vectors.
+  size_t hits = 0, total = 0;
+  auto t3 = std::chrono::steady_clock::now();
+  for (size_t q = 0; q < n; q += n / 50) {
+    auto query = idx.getVector(mkId(10 + q * 3));
+    ASSERT_TRUE(query.has_value());
+    auto exact = idx.searchExact(query.value(), 10);
+    auto hnsw = idx.searchHnsw(query.value(), 10);
+    std::set<uint64_t> truth;
+    for (const auto& e : exact) truth.insert(e.entity_.getBits());
+    for (const auto& h : hnsw)
+      if (truth.contains(h.entity_.getBits())) ++hits;
+    total += exact.size();
+  }
+  auto t4 = std::chrono::steady_clock::now();
+  auto ms = [](auto a, auto b) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+  };
+  double recall = static_cast<double>(hits) / static_cast<double>(total);
+  std::cout << "[bench] n=" << n << " dim=" << dim << " threads=" << threads
+            << " ef=" << ef << " clusters=" << clusters << "\n"
+            << "[bench] stream-in: " << ms(t0, t1) << " ms\n"
+            << "[bench] build (sort+gather+HNSW): " << ms(t1, t2) << " ms\n"
+            << "[bench] 51 exact + 51 hnsw queries: " << ms(t3, t4) << " ms\n"
+            << "[bench] recall@10: " << recall << std::endl;
+  EXPECT_GE(recall, 0.9);
+  for (auto* suffix :
+       {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + ".vec.bench" + suffix, ec);
+  }
 }

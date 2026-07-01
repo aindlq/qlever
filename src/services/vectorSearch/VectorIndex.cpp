@@ -7,86 +7,113 @@
 
 #include "services/vectorSearch/VectorIndex.h"
 
+#include <condition_variable>
 #include <fstream>
+#include <mutex>
 #include <queue>
 #include <thread>
-#include <usearch/index_dense.hpp>
 
 #include "backports/algorithm.h"
+#include "services/vectorSearch/UsearchGraph.h"
 #include "util/Exception.h"
+#include "util/HashSet.h"
 #include "util/MmapVector.h"
 #include "util/json.h"
 
 namespace qlever::vector {
 
 namespace {
-namespace uu = unum::usearch;
-
-// We key the usearch index by the raw 64-bit `ValueId` bits, so the key type
-// must be `uint64_t` (the default `index_dense_t` uses a signed key, which
-// would misbehave for `ValueId`s whose datatype bits set the high bit).
-using DenseIndex = uu::index_dense_gt<std::uint64_t>;
-
 // How often the exact-search loops call the interrupt callback. Frequent enough
 // for sub-second cancellation latency, rare enough to not show up in profiles.
 constexpr size_t CHECK_INTERRUPT_PERIOD = 65536;
 
-// Map our enums to the corresponding usearch enum values.
-uu::metric_kind_t toUsearchMetric(VectorMetric m) {
-  switch (m) {
-    case VectorMetric::Cosine:
-      return uu::metric_kind_t::cos_k;
-    case VectorMetric::L2Sq:
-      return uu::metric_kind_t::l2sq_k;
-    case VectorMetric::InnerProduct:
-      return uu::metric_kind_t::ip_k;
+// A pool of usearch search-context ids. Each concurrent HNSW search needs a
+// distinct context; a request beyond the pool size briefly WAITS for a free
+// context instead of failing the query (the pool is sized generously above the
+// hardware concurrency, so waiting is rare).
+class SearchSlotPool {
+ public:
+  explicit SearchSlotPool(size_t numSlots) {
+    for (size_t i = 0; i < numSlots; ++i) {
+      free_.push(i);
+    }
   }
-  return uu::metric_kind_t::cos_k;
-}
 
-uu::scalar_kind_t toUsearchScalar(VectorScalar s) {
-  switch (s) {
-    case VectorScalar::F32:
-      return uu::scalar_kind_t::f32_k;
-    case VectorScalar::F16:
-      return uu::scalar_kind_t::f16_k;
-    case VectorScalar::I8:
-      return uu::scalar_kind_t::i8_k;
+  class Slot {
+   public:
+    Slot(SearchSlotPool& pool, size_t id) : pool_{&pool}, id_{id} {}
+    Slot(const Slot&) = delete;
+    Slot& operator=(const Slot&) = delete;
+    ~Slot() { pool_->release(id_); }
+    size_t id() const { return id_; }
+
+   private:
+    SearchSlotPool* pool_;
+    size_t id_;
+  };
+
+  Slot acquire() {
+    std::unique_lock lock{mutex_};
+    cv_.wait(lock, [this] { return !free_.empty(); });
+    size_t id = free_.front();
+    free_.pop();
+    return Slot{*this, id};
   }
-  return uu::scalar_kind_t::f32_k;
-}
+
+ private:
+  void release(size_t id) {
+    {
+      std::lock_guard lock{mutex_};
+      free_.push(id);
+    }
+    cv_.notify_one();
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::queue<size_t> free_;
+};
 }  // namespace
 
-// All heavy members (mmaped vectors + usearch) live here so that neither
-// usearch nor `MmapVector` leak into the public header.
+// All heavy members (mmaped files + usearch) live here so that neither usearch
+// nor `MmapVector` leak into the public header.
 struct VectorIndex::Impl {
   VectorIndexMetadata meta_;
-  ad_utility::MmapVectorView<uint64_t> keys_;  // ascending entity ids
+  ad_utility::MmapVectorView<uint64_t> keys_;  // row -> id (or TOMBSTONE_KEY)
+  ad_utility::MmapVectorView<IdRowPair> rowmap_;  // id -> row, sorted by id
   ad_utility::MmapVectorView<float> data_;     // row-major, stride = dimensions
   std::optional<uu::metric_punned_t> metric_;  // shared by exact + HNSW
-  std::optional<DenseIndex> hnsw_;             // present iff meta_.hasHnsw_
+  std::optional<GraphIndex> graph_;            // present iff meta_.hasHnsw_
+  std::unique_ptr<SearchSlotPool> searchSlots_;
 
   size_t dim() const { return meta_.config_.dimensions_; }
+  size_t numLive() const { return meta_.numVectors_ - meta_.numTombstones_; }
 
   // Pointer to the start of row `i` in the flat float store.
   const float* rowPtr(size_t i) const { return data_.data() + i * dim(); }
 
-  // Row index of `entity`, or nullopt if it has no vector here.
+  // Row index of `entity`, or nullopt if it has no (live) vector here.
   std::optional<size_t> rowOf(Id entity) const {
     uint64_t id = entity.getBits();
-    auto it = ql::ranges::lower_bound(keys_, id);
-    if (it == keys_.end() || *it != id) {
+    auto it = ql::ranges::lower_bound(
+        rowmap_, id, std::less<>{},
+        [](const IdRowPair& pair) { return pair.idBits_; });
+    if (it == rowmap_.end() || it->idBits_ != id) {
       return std::nullopt;
     }
-    return static_cast<size_t>(it - keys_.begin());
+    return static_cast<size_t>(it->row_);
   }
 
   // Distance between the query and row `i`, using the (punned) index metric so
   // that exact and HNSW distances are identical.
   float distanceToRow(const float* query, size_t i) const {
     return static_cast<float>(
-        metric_.value()(reinterpret_cast<const char*>(query),
-                        reinterpret_cast<const char*>(rowPtr(i))));
+        metric_.value()(reinterpret_cast<const uu::byte_t*>(query),
+                        reinterpret_cast<const uu::byte_t*>(rowPtr(i))));
+  }
+
+  FlatStoreMetric graphMetric() const {
+    return FlatStoreMetric{data_.data(), dim(), metric_.value()};
   }
 };
 
@@ -122,29 +149,37 @@ void VectorIndex::open(const std::string& basename, const std::string& name) {
              ". Please rebuild the vector index.");
   }
 
-  // 2. Flat store (memory-mapped, random access pattern for scattered lookups).
-  auto openMmap = [&](auto& view, const std::string& path) {
+  // 2. Flat store + entity mappings (memory-mapped).
+  auto openMmap = [&](auto& view, const std::string& path,
+                      ad_utility::AccessPattern pattern) {
     try {
-      view.open(path, ad_utility::AccessPattern::Random);
+      view.open(path, pattern);
     } catch (const std::exception& e) {
       AD_THROW("Could not open the file " + path + " of vector index \"" +
                name + "\": " + e.what());
     }
   };
-  openMmap(impl.keys_, vectorKeysFile(basename, name));
-  openMmap(impl.data_, vectorDataFile(basename, name));
+  openMmap(impl.keys_, vectorKeysFile(basename, name),
+           ad_utility::AccessPattern::Random);
+  openMmap(impl.rowmap_, vectorRowmapFile(basename, name),
+           ad_utility::AccessPattern::Random);
+  openMmap(impl.data_, vectorDataFile(basename, name),
+           ad_utility::AccessPattern::Random);
+  auto complainInterrupted = [&](const std::string& what) {
+    AD_THROW("Vector index \"" + name + "\": " + what +
+             " does not match the metadata. The index files are likely from "
+             "an interrupted build; please rebuild the vector index.");
+  };
   if (impl.keys_.size() != impl.meta_.numVectors_) {
-    AD_THROW("Vector index \"" + name +
-             "\": the number of keys on disk does not match the metadata. The "
-             "index files are likely from an interrupted build; please rebuild "
-             "the vector index.");
+    complainInterrupted("the number of keys on disk");
+  }
+  if (impl.meta_.numTombstones_ > impl.meta_.numVectors_ ||
+      impl.rowmap_.size() != impl.numLive()) {
+    complainInterrupted("the entity mapping on disk");
   }
   if (impl.data_.size() !=
       impl.meta_.numVectors_ * impl.meta_.config_.dimensions_) {
-    AD_THROW("Vector index \"" + name +
-             "\": the data size on disk does not match keys * dimensions. The "
-             "index files are likely from an interrupted build; please rebuild "
-             "the vector index.");
+    complainInterrupted("the data size on disk");
   }
 
   // 3. The shared metric.
@@ -152,30 +187,35 @@ void VectorIndex::open(const std::string& basename, const std::string& name) {
                        toUsearchMetric(impl.meta_.config_.metric_),
                        toUsearchScalar(impl.meta_.config_.scalar_));
 
-  // 4. The optional HNSW index, memory-mapped read-only via usearch `view`.
+  // 4. The optional HNSW graph, memory-mapped read-only via usearch `view`.
+  //    The graph is keyed by row; vectors come from the flat store above.
   if (impl.meta_.hasHnsw_) {
-    auto result =
-        DenseIndex::make(vectorHnswFile(basename, name).c_str(), /*view=*/true);
+    const std::string hnswPath = vectorHnswFile(basename, name);
+    impl.graph_.emplace(
+        uu::index_config_t{impl.meta_.config_.hnswConnectivity_,
+                           impl.meta_.config_.hnswConnectivity_ * 2});
+    auto result = impl.graph_->view(uu::memory_mapped_file_t{hnswPath.c_str()});
     if (!result) {
       AD_THROW("Could not memory-map the HNSW file for vector index \"" + name +
                "\": " + result.error.what());
     }
-    impl.hnsw_.emplace(std::move(result.index));
-    // `view()` restores only what is in the usearch file header, which does
-    // NOT include the search-expansion parameter -- apply the configured value
-    // (otherwise every search silently runs at usearch's default ef).
-    impl.hnsw_->change_expansion_search(
-        impl.meta_.config_.hnswExpansionSearch_);
-    // `view()` sizes the search-context pool to `hardware_concurrency()`, and
-    // usearch FAILS (rather than queues) a search when the pool is exhausted.
-    // QLever's query-thread count (`-j`) is user-configurable and may exceed
-    // the core count, so reserve a generously larger pool up front.
+    if (impl.graph_->size() != impl.meta_.numVectors_) {
+      complainInterrupted("the HNSW graph on disk");
+    }
+    // Reserve one search context per pooled slot. QLever's query-thread count
+    // (`-j`) may exceed the hardware concurrency; searches beyond the pool
+    // size wait briefly for a free slot instead of failing.
+    size_t numSlots = std::max<size_t>(
+        2 * std::max(1u, std::thread::hardware_concurrency()), 16);
     uu::index_limits_t limits;
-    limits.members = impl.hnsw_->size();
+    limits.members = impl.graph_->size();
     limits.threads_add = 0;
-    limits.threads_search =
-        std::max<std::size_t>(std::thread::hardware_concurrency(), 1) * 4;
-    impl.hnsw_->try_reserve(limits);
+    limits.threads_search = numSlots;
+    if (!impl.graph_->try_reserve(limits)) {
+      AD_THROW("Could not allocate the search contexts for vector index \"" +
+               name + "\".");
+    }
+    impl.searchSlots_ = std::make_unique<SearchSlotPool>(numSlots);
   }
 }
 
@@ -185,6 +225,7 @@ const VectorIndexMetadata& VectorIndex::metadata() const {
 }
 size_t VectorIndex::dimensions() const { return impl_->dim(); }
 size_t VectorIndex::numVectors() const { return impl_->meta_.numVectors_; }
+size_t VectorIndex::numLiveVectors() const { return impl_->numLive(); }
 VectorMetric VectorIndex::metric() const {
   return impl_->meta_.config_.metric_;
 }
@@ -243,7 +284,7 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
              ", but vector index \"" + impl.meta_.config_.name_ +
              "\" has dimension " + std::to_string(impl.dim()) + ".");
   }
-  if (k == 0 || impl.meta_.numVectors_ == 0) {
+  if (k == 0 || impl.numLive() == 0) {
     return {};
   }
   TopK top{k};
@@ -258,13 +299,28 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
       top.offer(dist, id);
     }
   };
-  if (!candidates.has_value()) {
-    for (size_t i = 0; i < impl.meta_.numVectors_; ++i) {
-      consider(i, impl.keys_[i]);
+  auto scanAll = [&](auto&& keepId) {
+    for (size_t row = 0; row < impl.meta_.numVectors_; ++row) {
+      uint64_t id = impl.keys_[row];
+      if (id != TOMBSTONE_KEY && keepId(id)) {
+        consider(row, id);
+      }
     }
-  } else {
-    // NOTE: an empty candidate list deliberately yields an empty result -- the
+  };
+  if (!candidates.has_value()) {
+    scanAll([](uint64_t) { return true; });
+  } else if (candidates->size() * 8 >= impl.numLive()) {
+    // A large candidate set: a sequential scan with a membership filter beats
+    // one random binary search + one random row access per candidate.
+    // NOTE: an empty candidate set deliberately yields an empty result -- the
     // caller has already restricted the search space to nothing.
+    ad_utility::HashSet<uint64_t> wanted;
+    wanted.reserve(candidates->size());
+    for (Id c : candidates.value()) {
+      wanted.insert(c.getBits());
+    }
+    scanAll([&wanted](uint64_t id) { return wanted.contains(id); });
+  } else {
     for (Id c : candidates.value()) {
       if (auto row = impl.rowOf(c); row.has_value()) {
         consider(row.value(), c.getBits());
@@ -279,35 +335,55 @@ std::vector<ScoredEntity> VectorIndex::searchHnsw(
     ql::span<const float> query, size_t k,
     std::optional<float> maxDistance) const {
   const auto& impl = *impl_;
-  AD_CONTRACT_CHECK(impl.hnsw_.has_value(),
+  AD_CONTRACT_CHECK(impl.graph_.has_value(),
                     "searchHnsw called but this index has no HNSW structure.");
   if (query.size() != impl.dim()) {
     AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
              ", but vector index \"" + impl.meta_.config_.name_ +
              "\" has dimension " + std::to_string(impl.dim()) + ".");
   }
-  if (k == 0) {
+  if (k == 0 || impl.numLive() == 0) {
     return {};
   }
-  auto result = impl.hnsw_.value().search(query.data(), k);
-  if (!result) {
-    AD_THROW("HNSW search on vector index \"" + impl.meta_.config_.name_ +
-             "\" failed: " + result.error.what());
-  }
-  using KeyT = DenseIndex::vector_key_t;
-  using DistT = DenseIndex::distance_t;
-  std::vector<KeyT> keys(k);
-  std::vector<DistT> dists(k);
-  size_t count = result.dump_to(keys.data(), dists.data());
+  auto slot = impl.searchSlots_->acquire();
+  FlatStoreMetric metric = impl.graphMetric();
+  const auto* queryBytes = reinterpret_cast<const uu::byte_t*>(query.data());
+
+  // Tombstoned rows are filtered AFTER the graph search; if too few live
+  // results remain, retry with a doubled result count (bounded by the graph
+  // size). Without tombstones a single pass always suffices.
+  size_t wanted = k;
   std::vector<ScoredEntity> out;
-  out.reserve(count);
-  for (size_t i = 0; i < count; ++i) {
-    float dist = static_cast<float>(dists[i]);
-    if (maxDistance.has_value() && dist > maxDistance.value()) {
-      continue;
+  while (true) {
+    uu::index_search_config_t config;
+    config.thread = slot.id();
+    config.expansion =
+        std::max<size_t>(impl.meta_.config_.hnswExpansionSearch_, wanted);
+    auto result = impl.graph_->search(queryBytes, wanted, metric, config);
+    if (!result) {
+      AD_THROW("HNSW search on vector index \"" + impl.meta_.config_.name_ +
+               "\" failed: " + result.error.what());
     }
-    out.push_back(
-        ScoredEntity{Id::fromBits(static_cast<uint64_t>(keys[i])), dist});
+    std::vector<uint64_t> rows(wanted);
+    std::vector<uu::distance_punned_t> dists(wanted);
+    size_t count = result.dump_to(rows.data(), dists.data());
+    out.clear();
+    for (size_t i = 0; i < count && out.size() < k; ++i) {
+      float dist = static_cast<float>(dists[i]);
+      if (maxDistance.has_value() && dist > maxDistance.value()) {
+        continue;
+      }
+      uint64_t id = impl.keys_[rows[i]];
+      if (id == TOMBSTONE_KEY) {
+        continue;
+      }
+      out.push_back(ScoredEntity{Id::fromBits(id), dist});
+    }
+    bool exhausted = wanted >= impl.meta_.numVectors_;
+    if (out.size() >= k || impl.meta_.numTombstones_ == 0 || exhausted) {
+      break;
+    }
+    wanted = std::min<size_t>(impl.meta_.numVectors_, wanted * 2);
   }
   return out;
 }

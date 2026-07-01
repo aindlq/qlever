@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <filesystem>
+#include <set>
 
 #include "./engine/ValuesForTesting.h"
 #include "./util/GTestHelpers.h"
@@ -78,13 +79,14 @@ QueryExecutionContext* qecWithVectorIndex() {
   cfg.buildHnsw_ = false;
   qlever::vector::VectorIndexBuilder builder{basename, cfg};
   for (const auto& [iri, vec] : testVectors()) {
-    builder.add(getId(iri), vec);
+    builder.add(getId(iri), iri, vec);
   }
   builder.build();
   qlever::vector::VectorIndex idx;
   idx.open(basename, "clip");
   // The mmap keeps the data alive; the directory entries can go right away.
-  for (auto* suffix : {".meta", ".keys", ".data"}) {
+  for (auto* suffix :
+       {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
     std::error_code ec;
     std::filesystem::remove(basename + ".vec.clip" + suffix, ec);
   }
@@ -413,4 +415,85 @@ TEST(VectorSearchService, joinFormEstimatesAndMemoization) {
   EXPECT_EQ(join.getSizeEstimate(), 6u);
   auto result = join.getResult();
   EXPECT_EQ(result->idTable().numRows(), 6u);
+}
+
+// _____________________________________________________________________________
+// After the RDF data is re-indexed, the vector index is REMAPPED instead of
+// rebuilt: `.iris` is re-resolved against the new vocabulary and only the two
+// small mapping files are rewritten; the vectors and the HNSW graph (which is
+// keyed by row indices, not entity ids) are reused as-is. Entities that
+// disappeared become tombstones and vanish from all search results.
+TEST(VectorSearchService, remapAfterKgReindex) {
+  // "Old" and "new" knowledge graphs: the new one adds <a-new-entity> (which
+  // shifts every vocabulary position) and drops <e3> entirely.
+  auto* qecOld = getQec(
+      "<e0> <is-a> <Statue> . <e1> <is-a> <Statue> . <e2> <is-a> <Painting> . "
+      "<e3> <is-a> <Statue> .");
+  auto* qecNew = getQec(
+      "<a-new-entity> <is-a> <Statue> . <e0> <is-a> <Statue> . "
+      "<e1> <is-a> <Statue> . <e2> <is-a> <Painting> .");
+
+  std::string basename = (std::filesystem::temp_directory_path() /
+                          ("qlever-vecremaptest-" + std::to_string(::getpid())))
+                             .string();
+  auto getIdOld = makeGetId(qecOld->getIndex());
+  qlever::vector::VectorIndexConfig cfg;
+  cfg.name_ = "clip";
+  cfg.dimensions_ = 4;
+  cfg.metric_ = qlever::vector::VectorMetric::Cosine;
+  cfg.buildHnsw_ = true;
+  cfg.hnswExpansionSearch_ = 64;
+  {
+    qlever::vector::VectorIndexBuilder builder{basename, cfg};
+    builder.setVocabSize(qecOld->getIndex().getImpl().getVocab().size());
+    for (const auto& [iri, vec] : testVectors()) {
+      builder.add(getIdOld(iri), iri, vec);
+    }
+    builder.build();
+  }
+
+  // Remap against the NEW knowledge graph.
+  auto [live, tombstones] =
+      qlever::vector::remapVectorIndex(qecNew->getIndex(), basename, "clip");
+  EXPECT_EQ(live, 3u);
+  EXPECT_EQ(tombstones, 1u);  // <e3> is gone
+
+  qlever::vector::VectorIndex idx;
+  idx.open(basename, "clip");
+  EXPECT_EQ(idx.numVectors(), 4u);
+  EXPECT_EQ(idx.numLiveVectors(), 3u);
+  EXPECT_EQ(idx.metadata().vocabSize_,
+            qecNew->getIndex().getImpl().getVocab().size());
+
+  // Lookups now work with the NEW ids, and the vectors are unchanged.
+  auto getIdNew = makeGetId(qecNew->getIndex());
+  auto v = idx.getVector(getIdNew("<e2>"));
+  ASSERT_TRUE(v.has_value());
+  EXPECT_FLOAT_EQ((*v)[1], 1.f);
+
+  // Exact search returns the three surviving entities with new ids.
+  std::vector<float> queryE0{1.f, 0.f, 0.f, 0.f};
+  auto exact = idx.searchExact(queryE0, 10);
+  ASSERT_EQ(exact.size(), 3u);
+  EXPECT_EQ(exact[0].entity_, getIdNew("<e0>"));
+  EXPECT_EQ(exact[1].entity_, getIdNew("<e1>"));
+
+  // The (untouched, row-keyed) HNSW graph also serves the new ids and skips
+  // the tombstone, even when more results are requested than remain live.
+  // (Note that <e3> cannot even be named here: it has no id in the new KG.)
+  std::vector<float> queryE3{0.f, 0.f, 1.f, 0.f};  // <e3>'s old vector
+  auto hnsw = idx.searchHnsw(queryE3, 4);
+  ASSERT_EQ(hnsw.size(), 3u);
+  std::set<uint64_t> liveIds{getIdNew("<e0>").getBits(),
+                             getIdNew("<e1>").getBits(),
+                             getIdNew("<e2>").getBits()};
+  for (const auto& hit : hnsw) {
+    EXPECT_TRUE(liveIds.contains(hit.entity_.getBits()));
+  }
+
+  for (auto* suffix :
+       {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + ".vec.clip" + suffix, ec);
+  }
 }
