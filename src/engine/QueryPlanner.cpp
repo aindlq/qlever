@@ -14,8 +14,8 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <typeindex>
 #include <range/v3/view/cartesian_product.hpp>
+#include <typeindex>
 #include <variant>
 
 #include "backports/StartsWithAndEndsWith.h"
@@ -35,6 +35,7 @@
 #include "engine/IndexScan.h"
 #include "engine/Join.h"
 #include "engine/Load.h"
+#include "engine/MagicServicePlanning.h"
 #include "engine/MaterializedViews.h"
 #include "engine/Minus.h"
 #include "engine/MultiColumnJoin.h"
@@ -55,7 +56,6 @@
 #include "engine/TextLimit.h"
 #include "engine/TransitivePathBase.h"
 #include "engine/Union.h"
-#include "engine/MagicServicePlanning.h"
 #include "engine/Values.h"
 #include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/NaryExpression.h"
@@ -3144,6 +3144,7 @@ void QueryPlanner::GraphPatternPlanner::graphPatternOperationVisitor(Arg& arg) {
   } else if constexpr (std::is_same_v<T, p::TextSearchQuery>) {
     visitTextSearch(arg);
   } else if constexpr (std::is_same_v<T, p::MagicService>) {
+    AD_CORRECTNESS_CHECK(arg.query_ != nullptr);
     planMagicService(*arg.query_);
   } else if constexpr (std::is_same_v<T, p::ExternalValuesQuery>) {
     visitExternalValues(arg);
@@ -3310,7 +3311,8 @@ void QueryPlanner::GraphPatternPlanner::visitMaterializedViewQuery(
 void QueryPlanner::GraphPatternPlanner::planMagicService(
     parsedQuery::MagicServiceQuery& query) {
   // Concrete façade backed by this planner; the only place that touches the
-  // planner internals (`makeSubtreePlan`, `optimize`, `visitGroupOptionalOrMinus`).
+  // planner internals (`makeSubtreePlan`, `optimize`,
+  // `visitGroupOptionalOrMinus`).
   struct ContextImpl : MagicServicePlanningContext {
     GraphPatternPlanner& self_;
     explicit ContextImpl(GraphPatternPlanner& self) : self_{self} {}
@@ -3321,11 +3323,15 @@ void QueryPlanner::GraphPatternPlanner::planMagicService(
       self_.visitGroupOptionalOrMinus(std::move(candidates));
     }
     void addOperationWithChildPattern(
-        parsedQuery::GraphPattern& childPattern,
-        std::function<std::shared_ptr<Operation>(
-            std::shared_ptr<QueryExecutionTree>)>
+        const parsedQuery::GraphPattern& childPattern,
+        std::function<
+            std::shared_ptr<Operation>(std::shared_ptr<QueryExecutionTree>)>
             makeOperation) override {
-      auto childCandidates = self_.planner_.optimize(&childPattern);
+      // Plan a COPY: `optimize` mutates the pattern, but the parsed query is
+      // aliased by every copy of the `ParsedQuery` (the `MagicService` node
+      // holds it by `shared_ptr`), so it must stay unmodified.
+      parsedQuery::GraphPattern patternCopy = childPattern;
+      auto childCandidates = self_.planner_.optimize(&patternCopy);
       std::vector<SubtreePlan> candidates;
       for (auto& sub : childCandidates) {
         candidates.push_back(
@@ -3343,6 +3349,7 @@ void QueryPlanner::GraphPatternPlanner::planMagicService(
   (*handler)(context, query);
 }
 
+// _______________________________________________________________
 void QueryPlanner::GraphPatternPlanner::visitSpatialSearch(
     parsedQuery::SpatialQuery& spatialQuery) {
   auto config = spatialQuery.toSpatialJoinConfiguration();

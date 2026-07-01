@@ -1220,29 +1220,21 @@ GraphPatternOperation Visitor::visit(Parser::OptionalGraphPatternContext* ctx) {
 }
 
 // _____________________________________________________________________________
-CPP_variadic_template_def(typename T, typename... Args)(
-    requires std::is_constructible_v<T, Args...>)
-    parsedQuery::GraphPatternOperation Visitor::visitMagicServiceQuery(
-        Parser::ServiceGraphPatternContext* ctx, Args&&... args) {
-  T target{AD_FWD(args)...};
-  auto parseGraphPattern =
-      [&target](const parsedQuery::GraphPatternOperation& op) {
-        if (std::holds_alternative<parsedQuery::BasicGraphPattern>(op)) {
-          target.addBasicPattern(std::get<parsedQuery::BasicGraphPattern>(op));
-        } else if (std::holds_alternative<parsedQuery::GroupGraphPattern>(op)) {
-          target.addGraph(op);
-        } else {
-          throw std::runtime_error{absl::StrCat(
-              "Unsupported element in a magic service query of type `",
-              target.name(),
-              "`. Only triples and `{ group graph patterns }` are allowed ")};
-        }
-      };
-
+void Visitor::parseMagicServiceBody(Parser::ServiceGraphPatternContext* ctx,
+                                    parsedQuery::MagicServiceQuery& target) {
   parsedQuery::GraphPattern graphPattern = visit(ctx->groupGraphPattern());
   try {
     for (const auto& op : graphPattern._graphPatterns) {
-      parseGraphPattern(op);
+      if (std::holds_alternative<parsedQuery::BasicGraphPattern>(op)) {
+        target.addBasicPattern(std::get<parsedQuery::BasicGraphPattern>(op));
+      } else if (std::holds_alternative<parsedQuery::GroupGraphPattern>(op)) {
+        target.addGraph(op);
+      } else {
+        throw std::runtime_error{absl::StrCat(
+            "Unsupported element in a magic service query of type `",
+            target.name(),
+            "`. Only triples and `{ group graph patterns }` are allowed ")};
+      }
     }
   } catch (const std::exception& e) {
     // Annotate the occurring exceptions with the correct position inside the
@@ -1256,7 +1248,15 @@ CPP_variadic_template_def(typename T, typename... Args)(
   } catch (const std::exception& ex) {
     reportError(ctx, ex.what());
   }
+}
 
+// _____________________________________________________________________________
+CPP_variadic_template_def(typename T, typename... Args)(
+    requires std::is_constructible_v<T, Args...>)
+    parsedQuery::GraphPatternOperation Visitor::visitMagicServiceQuery(
+        Parser::ServiceGraphPatternContext* ctx, Args&&... args) {
+  T target{AD_FWD(args)...};
+  parseMagicServiceBody(ctx, target);
   return target;
 }
 
@@ -1309,28 +1309,7 @@ GraphPatternOperation Visitor::visit(Parser::ServiceGraphPatternContext* ctx) {
     // polymorphic `MagicService` node.
     std::shared_ptr<parsedQuery::MagicServiceQuery> target =
         factory.value()(serviceIri);
-    parsedQuery::GraphPattern graphPattern = visit(ctx->groupGraphPattern());
-    try {
-      for (const auto& op : graphPattern._graphPatterns) {
-        if (std::holds_alternative<parsedQuery::BasicGraphPattern>(op)) {
-          target->addBasicPattern(std::get<parsedQuery::BasicGraphPattern>(op));
-        } else if (std::holds_alternative<parsedQuery::GroupGraphPattern>(op)) {
-          target->addGraph(op);
-        } else {
-          throw std::runtime_error{absl::StrCat(
-              "Unsupported element in a magic service query of type `",
-              target->name(),
-              "`. Only triples and `{ group graph patterns }` are allowed ")};
-        }
-      }
-    } catch (const std::exception& e) {
-      reportError(ctx->groupGraphPattern(), e.what());
-    }
-    try {
-      target->validate();
-    } catch (const std::exception& ex) {
-      reportError(ctx, ex.what());
-    }
+    parseMagicServiceBody(ctx, *target);
     return parsedQuery::MagicService{std::move(target)};
   }
   // Parse the body of the SERVICE query. Add the visible variables from the

@@ -174,7 +174,6 @@ qlever::IndexBuilderConfig::WriteMaterializedViews parseMaterializedViewsJson(
   return views;
 }
 
-
 // Main function.
 int main(int argc, char** argv) {
   // Copy the git hash and datetime of compilation (which require relinking)
@@ -294,8 +293,10 @@ int main(int argc, char** argv) {
       "mapping view names to SELECT queries for writing the view, for example: "
       R"({"view1": "SELECT ...", "view2": "SELECT ..."})");
   add("service-index", po::value(&serviceIndexJson),
-      "build custom service index-extensions after index building. Takes a JSON "
-      "object keyed by service name; each registered service interprets its own "
+      "build custom service index-extensions after index building. Takes a "
+      "JSON "
+      "object keyed by service name; each registered service interprets its "
+      "own "
       "value, e.g.: "
       R"({"<service-name>": <service-specific JSON>})");
 

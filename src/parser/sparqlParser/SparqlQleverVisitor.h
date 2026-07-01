@@ -344,6 +344,13 @@ class SparqlQleverVisitor {
       visitMagicServiceQuery(Parser::ServiceGraphPatternContext* ctx,
                              Args&&... args);
 
+  // Shared body of `visitMagicServiceQuery` and the registry-based dispatch:
+  // parse the SERVICE body's config triples and nested group patterns into
+  // `target` and validate it, reporting errors with the correct position
+  // inside the query.
+  void parseMagicServiceBody(Parser::ServiceGraphPatternContext* ctx,
+                             parsedQuery::MagicServiceQuery& target);
+
   parsedQuery::GraphPatternOperation visit(Parser::BindContext* ctx);
 
   parsedQuery::GraphPatternOperation visit(Parser::InlineDataContext* ctx);
