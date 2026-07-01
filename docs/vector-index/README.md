@@ -69,8 +69,9 @@ the HNSW graph is constructed concurrently on `buildThreads` threads with the
 vectors read from the memory-mapped store (usearch holds only the graph in
 RAM, roughly `N * connectivity * 10` bytes). A concurrently built graph is not
 bit-for-bit deterministic (recall is unaffected); set `buildThreads: 1` for a
-deterministic build. Reference point: 500k x 128-dim f32 vectors build in
-~7.5 s on 48 cores with recall@10 = 0.98 on clustered data.
+deterministic build. Reference point (48-core AVX-512 Xeon, clustered data):
+2M x 128-dim f32 vectors build in ~24 s with recall@10 = 1.0 and ~1.5 GB peak
+builder RSS, i.e. ~83k vectors/s -- roughly 20 minutes per 100M vectors.
 
 On-disk layout per index `N` of database `B` (see `VectorIndexFormat.h` for
 details): `B.vec.N.meta` (JSON), `B.vec.N.data` (row-major floats; immutable),
@@ -161,9 +162,12 @@ empty result. Results computed through an external embedding endpoint
   HNSW search share one `metric_punned_t` (comparable distances). The exact
   search switches between per-candidate lookups and a sequential
   scan-with-filter depending on candidate density.
-- SIMD kernels (NumKong) can be enabled with `-DQLEVER_VECTOR_SEARCH_SIMD=ON`;
-  they are OFF by default because the current usearch integration measured
-  slower than the portable scalar kernels (see the note in `CMakeLists.txt`).
+- SIMD kernels (NumKong, usearch's SimSIMD successor) are ON by default
+  (`-DQLEVER_VECTOR_SEARCH_SIMD=OFF` to disable). The per-ISA kernels
+  (AVX2/AVX-512/AMX on x86) are enabled by compiler probes and selected per
+  CPU at run time -- no `-march` change, the binary stays portable. Beware
+  when integrating usearch/NumKong elsewhere: without the probe-driven
+  `NK_TARGET_*` defines it silently compiles serial-only kernels.
 - **Operations**: `VectorSearch` (point query, optional candidate restriction)
   and `VectorSearchJoin` (per-row form, memoizes repeated query entities)
   follow the `SpatialJoin` conventions — allocator-backed `IdTable`s,

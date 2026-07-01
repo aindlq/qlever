@@ -226,15 +226,17 @@ if (QLEVER_WITH_VECTOR_SEARCH)
             GIT_TAG 9fd6b0115dcdd0016e037fb5335f36824dd02090  # v2.25.3
             GIT_SUBMODULES ""  # submodules are fetched separately (see NumKong)
     )
-    # OPTIONAL, off by default: NumKong SIMD distance kernels with runtime CPU
-    # dispatch. The pinned commit is exactly the submodule pointer of the
-    # usearch version above, so the two are guaranteed compatible. Measured on
-    # this integration (usearch 2.25.3 + NumKong 7.6.0, 500k x 128 f32,
-    # 48 threads), the NumKong path was 2.5x SLOWER on HNSW build and 5.7x
-    # slower on queries than usearch's portable scalar kernels, so it stays
-    # opt-in until the upstream integration improves.
+    # NumKong SIMD distance kernels with runtime CPU dispatch. The pinned
+    # commit is exactly the submodule pointer of the usearch version above, so
+    # the two are guaranteed compatible. The per-ISA kernels are enabled by
+    # explicit compiler probes (see `src/services/vectorSearch/CMakeLists.txt`)
+    # -- WITHOUT those probe-driven defines NumKong silently compiles
+    # serial-only kernels, which are SLOWER than usearch's scalar fallback.
+    # Measured correctly configured (500k x 128 f32, 48 threads, AVX-512
+    # Xeon): 1.8x faster HNSW build and ~1.7x faster queries than the scalar
+    # kernels.
     option(QLEVER_VECTOR_SEARCH_SIMD
-            "Use SIMD distance kernels (NumKong) for the vector search" OFF)
+            "Use SIMD distance kernels (NumKong) for the vector search" ON)
     if (QLEVER_VECTOR_SEARCH_SIMD)
         FetchContent_Declare(
                 numkong
