@@ -518,6 +518,79 @@ TEST(VectorIndex, f16AndI8Storage) {
   }
 }
 
+#ifdef QLEVER_WITH_PARQUET
+#include <arrow/api.h>
+#include <arrow/io/file.h>
+#include <parquet/arrow/writer.h>
+
+// _____________________________________________________________________________
+// The Parquet ingest: a file with `uri` (string) and `embedding`
+// (list<float32>) columns round-trips through `ParquetVectorInputReader`.
+TEST(VectorIndex, parquetInputReader) {
+  std::string path = uniqueTmpBasename() + ".parquet";
+  auto* pool = arrow::default_memory_pool();
+  arrow::StringBuilder uriBuilder{pool};
+  auto valueBuilder = std::make_shared<arrow::FloatBuilder>(pool);
+  arrow::ListBuilder listBuilder{pool, valueBuilder};
+  constexpr size_t numRows = 10;
+  constexpr size_t dim = 4;
+  for (size_t i = 0; i < numRows; ++i) {
+    // Both bare URIs and bracketed IRIs occur in the wild; the reader passes
+    // them through as-is (the build hook normalizes).
+    std::string uri = i % 2 == 0 ? "http://ex/" + std::to_string(i)
+                                 : "<http://ex/" + std::to_string(i) + ">";
+    ASSERT_TRUE(uriBuilder.Append(uri).ok());
+    ASSERT_TRUE(listBuilder.Append().ok());
+    for (size_t j = 0; j < dim; ++j) {
+      ASSERT_TRUE(valueBuilder->Append(static_cast<float>(i * dim + j)).ok());
+    }
+  }
+  std::shared_ptr<arrow::Array> uriArray;
+  std::shared_ptr<arrow::Array> embeddingArray;
+  ASSERT_TRUE(uriBuilder.Finish(&uriArray).ok());
+  ASSERT_TRUE(listBuilder.Finish(&embeddingArray).ok());
+  auto schema =
+      arrow::schema({arrow::field("uri", arrow::utf8()),
+                     arrow::field("embedding", arrow::list(arrow::float32()))});
+  auto table = arrow::Table::Make(schema, {uriArray, embeddingArray});
+  auto outResult = arrow::io::FileOutputStream::Open(path);
+  ASSERT_TRUE(outResult.ok());
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*table, pool, outResult.ValueUnsafe(), 1024)
+          .ok());
+
+  ParquetVectorInputReader reader{path};
+  EXPECT_EQ(reader.numRows(), numRows);
+  std::string iri;
+  std::vector<float> vec;
+  size_t count = 0;
+  while (reader.next(iri, vec)) {
+    ASSERT_EQ(vec.size(), dim);
+    EXPECT_FLOAT_EQ(vec[0], static_cast<float>(count * dim));
+    EXPECT_TRUE(iri.find("http://ex/" + std::to_string(count)) !=
+                std::string::npos);
+    ++count;
+  }
+  EXPECT_EQ(count, numRows);
+  EXPECT_EQ(reader.dimensions(), dim);
+
+  // A file without the expected columns is rejected with a clear error.
+  std::string badPath = uniqueTmpBasename() + "-bad.parquet";
+  auto badSchema = arrow::schema({arrow::field("uri", arrow::utf8())});
+  auto badTable = arrow::Table::Make(badSchema, {uriArray});
+  auto badOut = arrow::io::FileOutputStream::Open(badPath);
+  ASSERT_TRUE(badOut.ok());
+  ASSERT_TRUE(
+      parquet::arrow::WriteTable(*badTable, pool, badOut.ValueUnsafe(), 1024)
+          .ok());
+  EXPECT_THROW(ParquetVectorInputReader{badPath}, std::exception);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  std::filesystem::remove(badPath, ec);
+}
+#endif  // QLEVER_WITH_PARQUET
+
 // _____________________________________________________________________________
 // Manual scale/performance smoke check (excluded from regular runs; it builds
 // a multi-million-vector index). Run with:

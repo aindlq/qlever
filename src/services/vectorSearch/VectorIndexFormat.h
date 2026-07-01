@@ -159,11 +159,15 @@ struct VectorIndexConfig {
 // built knowledge-graph vocabulary; rows whose IRI is unknown are skipped.
 struct VectorIndexBuildSpec {
   VectorIndexConfig config_;
+  // Row-aligned IRI list (not used for the Parquet input, which carries the
+  // URIs itself).
   std::string irisPath_;
   // Exactly one source of vectors:
-  std::string npyPath_;    // precomputed vectors in a .npy matrix, or
-  std::string textsPath_;  // a row-aligned file of texts to embed at index time
-                           // (requires `config_.embeddingUrl_`).
+  std::string npyPath_;      // precomputed vectors in a .npy matrix, or
+  std::string textsPath_;    // a row-aligned file of texts to embed at index
+                             // time (requires `config_.embeddingUrl_`), or
+  std::string parquetPath_;  // a Parquet file with `uri` + `embedding` columns
+                             // (requires -DQLEVER_VECTOR_SEARCH_PARQUET=ON).
   // If true, do not build anything: re-resolve the existing index's `.iris`
   // against the (re-indexed) knowledge graph and rewrite `.keys`/`.rowmap`.
   bool remap_ = false;

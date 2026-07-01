@@ -52,6 +52,28 @@ class NpyVectorInputReader : public VectorInputReader {
   std::ifstream iris_;
 };
 
+#ifdef QLEVER_WITH_PARQUET
+// Streams rows from a Parquet file with a string column `uri` (alias `iri`;
+// with or without angle brackets) and a column `embedding` (alias `vector`)
+// holding `list`/`large_list`/`fixed_size_list` of float32 or float64. This is
+// the recommended bulk format for large inputs (one self-contained file,
+// column compression). Only available when QLever was configured with
+// `-DQLEVER_VECTOR_SEARCH_PARQUET=ON` (requires Apache Arrow/Parquet).
+class ParquetVectorInputReader : public VectorInputReader {
+ public:
+  explicit ParquetVectorInputReader(const std::string& parquetPath);
+  ~ParquetVectorInputReader() override;
+
+  uint32_t dimensions() const override;
+  uint64_t numRows() const override;
+  bool next(std::string& iri, std::vector<float>& vector) override;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+#endif  // QLEVER_WITH_PARQUET
+
 }  // namespace qlever::vector
 
 #endif  // QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINPUTREADER_H

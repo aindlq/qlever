@@ -118,6 +118,7 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
                                         "iris",
                                         "npy",
                                         "texts",
+                                        "parquet",
                                         "dimensions",
                                         "metric",
                                         "scalar",
@@ -139,7 +140,11 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
     }
   }
   try {
-    spec.irisPath_ = obj.at("iris").get<std::string>();
+    spec.parquetPath_ = obj.value("parquet", std::string{});
+    // Parquet carries the URIs itself; the other inputs need the sidecar.
+    spec.irisPath_ = spec.parquetPath_.empty()
+                         ? obj.at("iris").get<std::string>()
+                         : obj.value("iris", std::string{});
     spec.npyPath_ = obj.value("npy", std::string{});
     spec.textsPath_ = obj.value("texts", std::string{});
     spec.config_.dimensions_ = obj.value("dimensions", uint32_t{0});
@@ -160,8 +165,13 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
   } catch (const nlohmann::json::exception& e) {
     AD_THROW(std::string{"Malformed vectorSearch build spec: "} + e.what());
   }
-  if (spec.npyPath_.empty() == spec.textsPath_.empty()) {
-    AD_THROW("Each vector index needs exactly one of `npy` or `texts`.");
+  int numInputs = static_cast<int>(!spec.npyPath_.empty()) +
+                  static_cast<int>(!spec.textsPath_.empty()) +
+                  static_cast<int>(!spec.parquetPath_.empty());
+  if (numInputs != 1) {
+    AD_THROW(
+        "Each vector index needs exactly one of `npy`, `texts`, or "
+        "`parquet`.");
   }
   return spec;
 }
@@ -224,20 +234,14 @@ std::vector<std::optional<Id>> resolveBatch(
   return out;
 }
 
-VectorIndexMetadata buildFromNpy(const Index& index,
-                                 const std::string& basename,
-                                 const VectorIndexBuildSpec& spec,
-                                 uint64_t& resolved, uint64_t& skipped) {
-  NpyVectorInputReader reader{spec.npyPath_, spec.irisPath_};
-  VectorIndexConfig config = spec.config_;
-  if (config.dimensions_ == 0) {
-    config.dimensions_ = reader.dimensions();
-  }
-  if (config.dimensions_ != reader.dimensions()) {
-    AD_THROW("The configured dimension (" + std::to_string(config.dimensions_) +
-             ") does not match the .npy file (" +
-             std::to_string(reader.dimensions()) + ").");
-  }
+// Shared by the .npy and Parquet inputs: stream `(iri, vector)` rows from
+// `reader` into a builder, resolving the IRIs in parallel batches.
+VectorIndexMetadata buildFromReader(const Index& index,
+                                    const std::string& basename,
+                                    VectorIndexConfig config,
+                                    VectorInputReader& reader,
+                                    bool normalizeIris, uint64_t& resolved,
+                                    uint64_t& skipped) {
   const size_t numThreads = effectiveThreads(config.buildThreads_);
   VectorIndexBuilder builder{basename, config};
   builder.setVocabSize(vocabFingerprint(index.getImpl()));
@@ -256,6 +260,9 @@ VectorIndexMetadata buildFromNpy(const Index& index,
         done = true;
         break;
       }
+      if (normalizeIris && !ql::starts_with(iri, "<")) {
+        iri = "<" + iri + ">";
+      }
       iris.push_back(iri);
       vectors.insert(vectors.end(), vec.begin(), vec.end());
     }
@@ -272,6 +279,55 @@ VectorIndexMetadata buildFromNpy(const Index& index,
     lineNumber += iris.size();
   }
   return builder.build();
+}
+
+#ifdef QLEVER_WITH_PARQUET
+VectorIndexMetadata buildFromParquet(const Index& index,
+                                     const std::string& basename,
+                                     const VectorIndexBuildSpec& spec,
+                                     uint64_t& resolved, uint64_t& skipped) {
+  ParquetVectorInputReader reader{spec.parquetPath_};
+  VectorIndexConfig config = spec.config_;
+  // For `list` columns the dimension is only known after the first row; peek
+  // is not needed -- validate against the config where given, else infer.
+  if (config.dimensions_ == 0 && reader.dimensions() == 0) {
+    // Streamed inference: read the first row through a small detour.
+    std::string iri;
+    std::vector<float> vec;
+    ParquetVectorInputReader probe{spec.parquetPath_};
+    if (!probe.next(iri, vec)) {
+      AD_THROW("The Parquet input " + spec.parquetPath_ + " is empty.");
+    }
+    config.dimensions_ = static_cast<uint32_t>(vec.size());
+  } else if (config.dimensions_ == 0) {
+    config.dimensions_ = reader.dimensions();
+  } else if (reader.dimensions() != 0 &&
+             config.dimensions_ != reader.dimensions()) {
+    AD_THROW("The configured dimension (" + std::to_string(config.dimensions_) +
+             ") does not match the Parquet file (" +
+             std::to_string(reader.dimensions()) + ").");
+  }
+  return buildFromReader(index, basename, config, reader,
+                         /*normalizeIris=*/true, resolved, skipped);
+}
+#endif  // QLEVER_WITH_PARQUET
+
+VectorIndexMetadata buildFromNpy(const Index& index,
+                                 const std::string& basename,
+                                 const VectorIndexBuildSpec& spec,
+                                 uint64_t& resolved, uint64_t& skipped) {
+  NpyVectorInputReader reader{spec.npyPath_, spec.irisPath_};
+  VectorIndexConfig config = spec.config_;
+  if (config.dimensions_ == 0) {
+    config.dimensions_ = reader.dimensions();
+  }
+  if (config.dimensions_ != reader.dimensions()) {
+    AD_THROW("The configured dimension (" + std::to_string(config.dimensions_) +
+             ") does not match the .npy file (" +
+             std::to_string(reader.dimensions()) + ").");
+  }
+  return buildFromReader(index, basename, config, reader,
+                         /*normalizeIris=*/false, resolved, skipped);
 }
 
 VectorIndexMetadata buildFromTexts(const Index& index,
@@ -404,10 +460,21 @@ void buildHook(const Index& index, const std::string& basename,
     }
     uint64_t resolved = 0;
     uint64_t skipped = 0;
-    VectorIndexMetadata meta =
-        spec.textsPath_.empty()
-            ? buildFromNpy(index, basename, spec, resolved, skipped)
-            : buildFromTexts(index, basename, spec, resolved, skipped);
+    VectorIndexMetadata meta;
+    if (!spec.parquetPath_.empty()) {
+#ifdef QLEVER_WITH_PARQUET
+      meta = buildFromParquet(index, basename, spec, resolved, skipped);
+#else
+      AD_THROW(
+          "This QLever build has no Parquet support; rebuild with "
+          "-DQLEVER_VECTOR_SEARCH_PARQUET=ON (requires Apache "
+          "Arrow/Parquet), or use the `npy` input.");
+#endif
+    } else if (!spec.textsPath_.empty()) {
+      meta = buildFromTexts(index, basename, spec, resolved, skipped);
+    } else {
+      meta = buildFromNpy(index, basename, spec, resolved, skipped);
+    }
     AD_LOG_INFO << "Vector index '" << spec.config_.name_ << "': indexed "
                 << resolved << " vectors, skipped " << skipped
                 << " (IRI not in the knowledge graph), HNSW="

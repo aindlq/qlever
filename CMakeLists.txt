@@ -237,6 +237,13 @@ if (QLEVER_WITH_VECTOR_SEARCH)
     # kernels.
     option(QLEVER_VECTOR_SEARCH_SIMD
             "Use SIMD distance kernels (NumKong) for the vector search" ON)
+    # OPTIONAL, off by default: Parquet bulk ingest for vector indices.
+    # Requires an external Apache Arrow/Parquet installation (found via
+    # `find_package`; e.g. from the system, vcpkg, or conan) -- Arrow is far
+    # too heavy to fetch and build as part of the QLever build.
+    option(QLEVER_VECTOR_SEARCH_PARQUET
+            "Support Parquet input files for the vector search (requires Apache Arrow/Parquet)"
+            OFF)
     if (QLEVER_VECTOR_SEARCH_SIMD)
         FetchContent_Declare(
                 numkong

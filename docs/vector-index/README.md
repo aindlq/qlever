@@ -41,12 +41,13 @@ Per-index keys (unknown keys are rejected):
 | key | meaning | default |
 |---|---|---|
 | `name` | index name (letters, digits, `-`, `_`) | required |
-| `iris` | text file, one `<IRI>` per line, aligned with the vector rows | required |
-| `npy` | 2-D little-endian float32 `.npy` matrix (v1/v2/v3 header) | one of `npy`/`texts` |
-| `texts` | text file whose lines are embedded via `embeddingUrl` at build time | one of `npy`/`texts` |
+| `iris` | text file, one `<IRI>` per line, aligned with the vector rows | required except for `parquet` |
+| `npy` | 2-D little-endian float32 `.npy` matrix (v1/v2/v3 header) | one of `npy`/`texts`/`parquet` |
+| `texts` | text file whose lines are embedded via `embeddingUrl` at build time | |
+| `parquet` | Parquet file with `uri` (string) + `embedding` (list of float32/float64) columns; carries the URIs itself, so `iris` is not needed. Requires `-DQLEVER_VECTOR_SEARCH_PARQUET=ON` (external Apache Arrow) | |
 | `dimensions` | vector dimension (inferred if omitted) | inferred |
 | `metric` | `cosine`, `l2sq`, `innerProduct` | `cosine` |
-| `scalar` | `f32` (f16/i8 are planned) | `f32` |
+| `scalar` | storage type `f32`, `f16`, or `i8` (half/quarter footprint; `i8` expects inputs in [-1, 1]) | `f32` |
 | `hnsw` | also build a usearch HNSW index | `true` |
 | `hnswConnectivity` | usearch M | 16 |
 | `hnswExpansionAdd` | efConstruction | 128 |
@@ -132,9 +133,19 @@ Exactly one **query point** must be given:
 - `vec:imageUrl <...>` / `vec:imageBase64 "..."` — an image, embedded at query
   time (server-local file paths are deliberately not supported: that would let
   remote clients read arbitrary server files);
-- `vec:left ?x` — the **join form**: for each `?x` bound by a nested
-  `{ ... }` pattern, emit the k nearest entities. The nested pattern must not
-  bind `vec:result`/`vec:bindScore`.
+- `vec:left ?x` — the **join form**: for each `?x`, emit the k nearest
+  entities. `?x` is bound either by a nested `{ ... }` pattern inside the
+  SERVICE, or — like the spatial join — by the **surrounding query**:
+
+  ```sparql
+  ?x <is-a> <Painting> .
+  SERVICE vec: { _:c vec:index "clip" ; vec:left ?x ;
+                 vec:result ?nn ; vec:k 10 . }
+  ```
+
+  (The `<left>` variable must then be the only variable shared with the
+  service clause, and the nested pattern must not bind
+  `vec:result`/`vec:bindScore`.)
 
 Further parameters: `vec:result`/`vec:right` (required; the result entity
 variable), `vec:bindScore` (optional distance variable, smaller = more
@@ -183,13 +194,16 @@ empty result. Results computed through an external embedding endpoint
 ## Known limitations / follow-ups
 
 - For a fast HNSW build, the flat store should fit in the page cache (graph
-  construction reads vectors in random order); with data much larger than RAM,
-  expect the build to become NVMe-bound. The graph itself always stays small.
-- The join form requires `vec:left` to be bound **inside** the SERVICE's
-  nested pattern (unlike the spatial join's `<left>`); joining with the
-  surrounding query and restricting its search space need the planner's
-  incomplete-join machinery (follow-up).
+  construction reads vectors in random order); with data much larger than
+  RAM, expect the build to become NVMe-bound. `f16`/`i8` storage halves or
+  quarters that requirement — and is also FASTER at query time on modern CPUs
+  (memory-bandwidth-bound workload with FP16/VNNI kernels): at 500k x 128 on
+  a 48-core AVX-512 Xeon, queries took 1.6 s (f32) / 1.0 s (f16) / 0.5 s (i8)
+  at recall@10 0.98–1.0. The graph itself always stays small.
+- The outer-bound `vec:left` form searches the whole index per row; combining
+  it with a candidate restriction (an additional nested pattern) is a
+  follow-up.
 - Tombstones accumulate over repeated remaps; rebuild when a large fraction of
   the indexed entities has disappeared (searches over-fetch past tombstones).
-- `f16`/`i8` storage, Parquet ingest, and migrating the six pre-existing magic
-  services onto the registry are follow-ups.
+- Migrating the six pre-existing magic services onto the registry is a
+  follow-up.
