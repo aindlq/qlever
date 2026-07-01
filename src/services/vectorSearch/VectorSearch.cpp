@@ -206,9 +206,12 @@ Result VectorSearch::computeResult([[maybe_unused]] bool requestLaziness) {
 
   IdTable idTable{getResultWidth(), getExecutionContext()->getAllocator()};
 
-  // Resolve the query vector (explicit, embedded from text/image, or the
-  // vector of a given entity).
+  // Resolve the query point: an explicit or embedded vector goes into
+  // `query`; a constant entity (`vec:query <iri>`) is searched by its STORED
+  // vector directly (no decode/re-encode through f32), tracked in
+  // `queryEntity`.
   std::vector<float> query;
+  std::optional<Id> queryEntity;
   if (config_.queryVector_.has_value()) {
     query = config_.queryVector_.value();
   } else if (config_.queryText_.has_value()) {
@@ -237,18 +240,13 @@ Result VectorSearch::computeResult([[maybe_unused]] bool requestLaziness) {
     TripleComponent tc{ad_utility::triple_component::Iri::fromIriref(
         config_.queryEntityIri_.value())};
     std::optional<Id> id = tc.toValueId(index.getImpl());
-    if (id.has_value()) {
-      auto v = vidx->getVector(id.value());
-      if (v.has_value()) {
-        query.assign(v->begin(), v->end());
-      }
-    }
-    if (query.empty()) {
+    if (!id.has_value() || !vidx->hasVector(id.value())) {
       // The query entity is unknown or has no vector -> empty result.
       return {std::move(idTable), resultSortedOn(), LocalVocab{}};
     }
+    queryEntity = id;
   }
-  if (query.size() != vidx->dimensions()) {
+  if (!queryEntity.has_value() && query.size() != vidx->dimensions()) {
     throw std::runtime_error{absl::StrCat(
         "The query vector has dimension ", query.size(), ", but vector index '",
         config_.indexName_, "' has dimension ", vidx->dimensions(), ".")};
@@ -285,16 +283,30 @@ Result VectorSearch::computeResult([[maybe_unused]] bool requestLaziness) {
     }
     // NOTE: an empty candidate set correctly yields an empty result here (the
     // restriction pattern matched nothing).
-    results =
-        vidx->searchExact(query, config_.k_, ql::span<const Id>{candidateIds},
-                          config_.maxDistance_, checkInterrupt);
-  } else {
-    // Whole-index search.
-    bool useHnsw = vidx->hasHnsw() && config_.algorithm_ != Algo::Exact;
-    results = useHnsw
-                  ? vidx->searchHnsw(query, config_.k_, config_.maxDistance_)
-                  : vidx->searchExact(query, config_.k_, std::nullopt,
+    ql::span<const Id> candidateSpan{candidateIds};
+    results = queryEntity.has_value()
+                  ? vidx->searchExactByEntity(
+                        queryEntity.value(), config_.k_, candidateSpan,
+                        config_.maxDistance_, checkInterrupt)
+                  : vidx->searchExact(query, config_.k_, candidateSpan,
                                       config_.maxDistance_, checkInterrupt);
+  } else {
+    // Whole-index search (by the stored vector for the entity form -- no
+    // decode/re-encode through f32).
+    bool useHnsw = vidx->hasHnsw() && config_.algorithm_ != Algo::Exact;
+    if (queryEntity.has_value()) {
+      results = useHnsw
+                    ? vidx->searchHnswByEntity(queryEntity.value(), config_.k_,
+                                               config_.maxDistance_)
+                    : vidx->searchExactByEntity(
+                          queryEntity.value(), config_.k_, std::nullopt,
+                          config_.maxDistance_, checkInterrupt);
+    } else {
+      results = useHnsw
+                    ? vidx->searchHnsw(query, config_.k_, config_.maxDistance_)
+                    : vidx->searchExact(query, config_.k_, std::nullopt,
+                                        config_.maxDistance_, checkInterrupt);
+    }
   }
 
   idTable.resize(results.size());

@@ -70,10 +70,13 @@ class VectorIndex {
   VectorMetric metric() const;
   bool hasHnsw() const;
 
-  // The stored vector of `entity`, or `nullopt` if this index has none for it.
-  // The span points into the mmaped store and is valid for this object's
-  // lifetime.
-  std::optional<ql::span<const float>> getVector(Id entity) const;
+  // True iff this index stores a (live) vector for `entity`.
+  bool hasVector(Id entity) const;
+
+  // The stored vector of `entity` decoded to f32, or `nullopt` if this index
+  // has none for it. (The store may hold f16/i8; searching BY an entity does
+  // not decode -- see the `...ByEntity` methods.)
+  std::optional<std::vector<float>> getVector(Id entity) const;
 
   // Exact brute-force top-`k` nearest neighbours of `query`.
   //  - If `candidates` is `nullopt`, searches over ALL (live) entities.
@@ -93,6 +96,19 @@ class VectorIndex {
   // `hasHnsw()`. Results are ascending by distance.
   std::vector<ScoredEntity> searchHnsw(
       ql::span<const float> query, size_t k,
+      std::optional<float> maxDistance = std::nullopt) const;
+
+  // The same two searches with a STORED entity's vector as the query point
+  // (used by the join form and `vec:query <iri>`). The stored bytes are used
+  // directly -- no decode/re-encode round trip through f32. An entity without
+  // a (live) vector yields an empty result.
+  std::vector<ScoredEntity> searchExactByEntity(
+      Id entity, size_t k,
+      std::optional<ql::span<const Id>> candidates = std::nullopt,
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {}) const;
+  std::vector<ScoredEntity> searchHnswByEntity(
+      Id entity, size_t k,
       std::optional<float> maxDistance = std::nullopt) const;
 
  private:

@@ -8,6 +8,7 @@
 #include "services/vectorSearch/VectorIndex.h"
 
 #include <condition_variable>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <queue>
@@ -81,16 +82,36 @@ struct VectorIndex::Impl {
   VectorIndexMetadata meta_;
   ad_utility::MmapVectorView<uint64_t> keys_;  // row -> id (or TOMBSTONE_KEY)
   ad_utility::MmapVectorView<IdRowPair> rowmap_;  // id -> row, sorted by id
-  ad_utility::MmapVectorView<float> data_;     // row-major, stride = dimensions
+  // Row-major matrix in the configured storage scalar (f32/f16/i8).
+  ad_utility::MmapVectorView<char> data_;
   std::optional<uu::metric_punned_t> metric_;  // shared by exact + HNSW
+  uu::casts_punned_t casts_;                   // f32 <-> storage scalar
   std::optional<GraphIndex> graph_;            // present iff meta_.hasHnsw_
   std::unique_ptr<SearchSlotPool> searchSlots_;
 
   size_t dim() const { return meta_.config_.dimensions_; }
+  size_t rowBytes() const {
+    return dim() * bytesPerScalar(meta_.config_.scalar_);
+  }
   size_t numLive() const { return meta_.numVectors_ - meta_.numTombstones_; }
 
-  // Pointer to the start of row `i` in the flat float store.
-  const float* rowPtr(size_t i) const { return data_.data() + i * dim(); }
+  // Pointer to the start of row `i` in the flat store (storage scalar bytes).
+  const char* rowPtr(size_t i) const { return data_.data() + i * rowBytes(); }
+
+  // Encode an f32 query into the storage scalar. Returns a pointer to the
+  // encoded bytes; `buffer` provides the storage when a conversion happens.
+  const char* encodeQuery(ql::span<const float> query,
+                          std::vector<char>& buffer) const {
+    const char* raw = reinterpret_cast<const char*>(query.data());
+    auto fromF32 = casts_.from.f32;
+    if (fromF32 != nullptr) {
+      buffer.resize(rowBytes());
+      if (fromF32(raw, dim(), buffer.data())) {
+        return buffer.data();
+      }
+    }
+    return raw;
+  }
 
   // Row index of `entity`, or nullopt if it has no (live) vector here.
   std::optional<size_t> rowOf(Id entity) const {
@@ -104,16 +125,16 @@ struct VectorIndex::Impl {
     return static_cast<size_t>(it->row_);
   }
 
-  // Distance between the query and row `i`, using the (punned) index metric so
-  // that exact and HNSW distances are identical.
-  float distanceToRow(const float* query, size_t i) const {
+  // Distance between an (encoded) query and row `i`, using the (punned) index
+  // metric so that exact and HNSW distances are identical.
+  float distanceToRow(const char* queryBytes, size_t i) const {
     return static_cast<float>(
-        metric_.value()(reinterpret_cast<const uu::byte_t*>(query),
+        metric_.value()(reinterpret_cast<const uu::byte_t*>(queryBytes),
                         reinterpret_cast<const uu::byte_t*>(rowPtr(i))));
   }
 
   FlatStoreMetric graphMetric() const {
-    return FlatStoreMetric{data_.data(), dim(), metric_.value()};
+    return FlatStoreMetric{data_.data(), rowBytes(), metric_.value()};
   }
 };
 
@@ -177,15 +198,16 @@ void VectorIndex::open(const std::string& basename, const std::string& name) {
       impl.rowmap_.size() != impl.numLive()) {
     complainInterrupted("the entity mapping on disk");
   }
-  if (impl.data_.size() !=
-      impl.meta_.numVectors_ * impl.meta_.config_.dimensions_) {
+  if (impl.data_.size() != impl.meta_.numVectors_ * impl.rowBytes()) {
     complainInterrupted("the data size on disk");
   }
 
-  // 3. The shared metric.
+  // 3. The shared metric (over the storage scalar) and the f32 casts.
   impl.metric_.emplace(impl.meta_.config_.dimensions_,
                        toUsearchMetric(impl.meta_.config_.metric_),
                        toUsearchScalar(impl.meta_.config_.scalar_));
+  impl.casts_ =
+      uu::casts_punned_t::make(toUsearchScalar(impl.meta_.config_.scalar_));
 
   // 4. The optional HNSW graph, memory-mapped read-only via usearch `view`.
   //    The graph is keyed by row; vectors come from the flat store above.
@@ -232,12 +254,25 @@ VectorMetric VectorIndex::metric() const {
 bool VectorIndex::hasHnsw() const { return impl_->meta_.hasHnsw_; }
 
 // ____________________________________________________________________________
-std::optional<ql::span<const float>> VectorIndex::getVector(Id entity) const {
-  auto row = impl_->rowOf(entity);
+bool VectorIndex::hasVector(Id entity) const {
+  return impl_->rowOf(entity).has_value();
+}
+
+// ____________________________________________________________________________
+std::optional<std::vector<float>> VectorIndex::getVector(Id entity) const {
+  const auto& impl = *impl_;
+  auto row = impl.rowOf(entity);
   if (!row.has_value()) {
     return std::nullopt;
   }
-  return ql::span<const float>{impl_->rowPtr(row.value()), impl_->dim()};
+  std::vector<float> out(impl.dim());
+  auto toF32 = impl.casts_.to.f32;
+  if (toF32 == nullptr || !toF32(impl.rowPtr(row.value()), impl.dim(),
+                                 reinterpret_cast<char*>(out.data()))) {
+    // Same representation (f32): copy the raw bytes.
+    std::memcpy(out.data(), impl.rowPtr(row.value()), impl.rowBytes());
+  }
+  return out;
 }
 
 namespace {
@@ -273,17 +308,15 @@ class TopK {
 }  // namespace
 
 // ____________________________________________________________________________
-std::vector<ScoredEntity> VectorIndex::searchExact(
-    ql::span<const float> query, size_t k,
+// The scalar-agnostic core of the exact search: `queryBytes` is already in the
+// storage representation. (A template so that it can take the private
+// `VectorIndex::Impl` without naming it.)
+template <typename ImplT>
+std::vector<ScoredEntity> searchExactBytes(
+    const ImplT& impl, const char* queryBytes, size_t k,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt) const {
-  const auto& impl = *impl_;
-  if (query.size() != impl.dim()) {
-    AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
-             ", but vector index \"" + impl.meta_.config_.name_ +
-             "\" has dimension " + std::to_string(impl.dim()) + ".");
-  }
+    const CheckInterruptCallback& checkInterrupt) {
   if (k == 0 || impl.numLive() == 0) {
     return {};
   }
@@ -294,7 +327,7 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
       sinceCheck = 0;
       checkInterrupt();
     }
-    float dist = impl.distanceToRow(query.data(), row);
+    float dist = impl.distanceToRow(queryBytes, row);
     if (!maxDistance.has_value() || dist <= maxDistance.value()) {
       top.offer(dist, id);
     }
@@ -331,23 +364,51 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
 }
 
 // ____________________________________________________________________________
-std::vector<ScoredEntity> VectorIndex::searchHnsw(
+std::vector<ScoredEntity> VectorIndex::searchExact(
     ql::span<const float> query, size_t k,
-    std::optional<float> maxDistance) const {
+    std::optional<ql::span<const Id>> candidates,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt) const {
   const auto& impl = *impl_;
-  AD_CONTRACT_CHECK(impl.graph_.has_value(),
-                    "searchHnsw called but this index has no HNSW structure.");
   if (query.size() != impl.dim()) {
     AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
              ", but vector index \"" + impl.meta_.config_.name_ +
              "\" has dimension " + std::to_string(impl.dim()) + ".");
   }
+  std::vector<char> buffer;
+  const char* queryBytes = impl.encodeQuery(query, buffer);
+  return searchExactBytes(impl, queryBytes, k, candidates, maxDistance,
+                          checkInterrupt);
+}
+
+// ____________________________________________________________________________
+std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
+    Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt) const {
+  const auto& impl = *impl_;
+  auto row = impl.rowOf(entity);
+  if (!row.has_value()) {
+    return {};
+  }
+  return searchExactBytes(impl, impl.rowPtr(row.value()), k, candidates,
+                          maxDistance, checkInterrupt);
+}
+
+// ____________________________________________________________________________
+// The scalar-agnostic core of the HNSW search (see `searchExactBytes`).
+template <typename ImplT>
+std::vector<ScoredEntity> searchHnswBytes(const ImplT& impl,
+                                          const char* queryBytesIn, size_t k,
+                                          std::optional<float> maxDistance) {
+  AD_CONTRACT_CHECK(impl.graph_.has_value(),
+                    "searchHnsw called but this index has no HNSW structure.");
   if (k == 0 || impl.numLive() == 0) {
     return {};
   }
   auto slot = impl.searchSlots_->acquire();
   FlatStoreMetric metric = impl.graphMetric();
-  const auto* queryBytes = reinterpret_cast<const uu::byte_t*>(query.data());
+  const auto* queryBytes = reinterpret_cast<const uu::byte_t*>(queryBytesIn);
 
   // Tombstoned rows are filtered AFTER the graph search; if too few live
   // results remain, retry with a doubled result count (bounded by the graph
@@ -386,6 +447,32 @@ std::vector<ScoredEntity> VectorIndex::searchHnsw(
     wanted = std::min<size_t>(impl.meta_.numVectors_, wanted * 2);
   }
   return out;
+}
+
+// ____________________________________________________________________________
+std::vector<ScoredEntity> VectorIndex::searchHnsw(
+    ql::span<const float> query, size_t k,
+    std::optional<float> maxDistance) const {
+  const auto& impl = *impl_;
+  if (query.size() != impl.dim()) {
+    AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
+             ", but vector index \"" + impl.meta_.config_.name_ +
+             "\" has dimension " + std::to_string(impl.dim()) + ".");
+  }
+  std::vector<char> buffer;
+  const char* queryBytes = impl.encodeQuery(query, buffer);
+  return searchHnswBytes(impl, queryBytes, k, maxDistance);
+}
+
+// ____________________________________________________________________________
+std::vector<ScoredEntity> VectorIndex::searchHnswByEntity(
+    Id entity, size_t k, std::optional<float> maxDistance) const {
+  const auto& impl = *impl_;
+  auto row = impl.rowOf(entity);
+  if (!row.has_value()) {
+    return {};
+  }
+  return searchHnswBytes(impl, impl.rowPtr(row.value()), k, maxDistance);
 }
 
 }  // namespace qlever::vector

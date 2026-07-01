@@ -53,9 +53,10 @@ class VectorIndexBuilder {
   // vector files are not silently applied to a rebuilt main index.
   void setVocabSize(uint64_t vocabSize) { vocabSize_ = vocabSize; }
 
-  // Add one entity's vector. `vector.size()` must equal `config.dimensions_`.
-  // The `iri` is persisted row-aligned so that the index can be cheaply
-  // remapped after the knowledge graph is re-indexed.
+  // Add one entity's vector (always given as f32; it is converted to the
+  // configured storage scalar). `vector.size()` must equal
+  // `config.dimensions_`. The `iri` is persisted row-aligned so that the index
+  // can be cheaply remapped after the knowledge graph is re-indexed.
   void add(Id entity, std::string_view iri, ql::span<const float> vector);
 
   // Number of vectors added so far (before deduplication).
@@ -68,6 +69,12 @@ class VectorIndexBuilder {
   std::string basename_;
   VectorIndexConfig config_;
   uint64_t vocabSize_ = 0;
+  size_t rowBytes_ = 0;
+  // f32 -> storage-scalar conversion (function-pointer type identical to
+  // usearch's `cast_punned_t`; kept here so this header stays usearch-free).
+  using CastFn = bool (*)(const char*, std::size_t, char*);
+  CastFn fromF32_ = nullptr;
+  std::vector<char> castBuffer_;
 
   // Per-row bookkeeping (the only per-row state held in RAM).
   std::vector<uint64_t> ids_;         // entity ids, insertion order

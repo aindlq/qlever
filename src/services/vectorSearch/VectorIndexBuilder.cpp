@@ -92,9 +92,10 @@ VectorIndexBuilder::VectorIndexBuilder(std::string basename,
   if (config_.dimensions_ == 0) {
     AD_THROW("A vector index needs a positive dimension.");
   }
-  if (config_.scalar_ != VectorScalar::F32) {
-    AD_THROW("Only f32 vectors are supported so far.");
-  }
+  rowBytes_ = config_.dimensions_ * bytesPerScalar(config_.scalar_);
+  fromF32_ =
+      uu::casts_punned_t::make(toUsearchScalar(config_.scalar_)).from.f32;
+  castBuffer_.resize(rowBytes_);
   vecSpillPath_ = vectorDataFile(basename_, config_.name_) + ".spill";
   iriSpillPath_ = vectorIrisFile(basename_, config_.name_) + ".spill";
   vecSpill_.open(vecSpillPath_, std::ios::binary | std::ios::trunc);
@@ -114,8 +115,13 @@ void VectorIndexBuilder::add(Id entity, std::string_view iri,
              "\", which is configured with dimension " +
              std::to_string(config_.dimensions_) + ".");
   }
-  vecSpill_.write(reinterpret_cast<const char*>(vector.data()),
-                  static_cast<std::streamsize>(vector.size() * sizeof(float)));
+  // Convert to the storage scalar (no-op for f32).
+  const char* rowBytesPtr = reinterpret_cast<const char*>(vector.data());
+  if (fromF32_ != nullptr &&
+      fromF32_(rowBytesPtr, config_.dimensions_, castBuffer_.data())) {
+    rowBytesPtr = castBuffer_.data();
+  }
+  vecSpill_.write(rowBytesPtr, static_cast<std::streamsize>(rowBytes_));
   iriSpill_.write(iri.data(), static_cast<std::streamsize>(iri.size()));
   iriSpill_.put('\n');
   if (!vecSpill_ || !iriSpill_) {
@@ -130,7 +136,6 @@ void VectorIndexBuilder::add(Id entity, std::string_view iri,
 
 // ____________________________________________________________________________
 VectorIndexMetadata VectorIndexBuilder::build() {
-  const size_t dim = config_.dimensions_;
   vecSpill_.close();
   iriSpill_.close();
   // The spill files are always removed -- also on success (`dismiss` is only
@@ -194,16 +199,15 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   //    positional reads directly into the memory-mapped destination).
   {
     outputsCleanup.track(tmp(dataPath));
-    ad_utility::MmapVector<float> data;
-    data.open(n * dim, tmp(dataPath));
+    ad_utility::MmapVector<char> data;
+    data.open(n * rowBytes_, tmp(dataPath));
     ad_utility::File spill{vecSpillPath_.c_str(), "r"};
-    const size_t rowBytes = dim * sizeof(float);
-    float* dataBegin = n > 0 ? &data[0] : nullptr;
+    char* dataBegin = n > 0 ? &data[0] : nullptr;
     parallelOverRows(n, numThreads, [&](size_t, size_t first, size_t last) {
       for (size_t i = first; i < last; ++i) {
-        ssize_t read = spill.read(dataBegin + i * dim, rowBytes,
-                                  static_cast<off_t>(rows[i] * rowBytes));
-        if (read != static_cast<ssize_t>(rowBytes)) {
+        ssize_t read = spill.read(dataBegin + i * rowBytes_, rowBytes_,
+                                  static_cast<off_t>(rows[i] * rowBytes_));
+        if (read != static_cast<ssize_t>(rowBytes_)) {
           throw std::runtime_error{
               "Reading back the temporary vector file failed."};
         }
@@ -254,11 +258,12 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   bool hasHnsw = config_.buildHnsw_ && n > 0;
   if (hasHnsw) {
     outputsCleanup.track(tmp(hnswPath));
-    ad_utility::MmapVectorView<float> data;
+    ad_utility::MmapVectorView<char> data;
     data.open(tmp(dataPath));
-    uu::metric_punned_t metric{dim, toUsearchMetric(config_.metric_),
-                               uu::scalar_kind_t::f32_k};
-    FlatStoreMetric graphMetric{data.data(), dim, metric};
+    uu::metric_punned_t metric{config_.dimensions_,
+                               toUsearchMetric(config_.metric_),
+                               toUsearchScalar(config_.scalar_)};
+    FlatStoreMetric graphMetric{data.data(), rowBytes_, metric};
     GraphIndex graph{uu::index_config_t{config_.hnswConnectivity_,
                                         config_.hnswConnectivity_ * 2}};
     uu::index_limits_t limits;

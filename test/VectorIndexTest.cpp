@@ -458,6 +458,67 @@ TEST(VectorIndex, hnswMatchesExactReasonably) {
 }
 
 // _____________________________________________________________________________
+// f16 and i8 storage: half/quarter disk and page-cache footprint. `getVector`
+// decodes to f32; searches work both with f32 queries (encoded once) and with
+// stored-entity queries (raw stored bytes, no conversion); the HNSW graph is
+// built directly over the quantized store.
+TEST(VectorIndex, f16AndI8Storage) {
+  auto data = makeData();  // unit vectors -- also in i8's expected [-1, 1]
+  for (auto scalar : {VectorScalar::F16, VectorScalar::I8}) {
+    std::string basename = uniqueTmpBasename() + "-" + toString(scalar);
+    VectorIndexConfig cfg;
+    cfg.name_ = "q";
+    cfg.dimensions_ = DIM;
+    cfg.metric_ = VectorMetric::Cosine;
+    cfg.scalar_ = scalar;
+    cfg.buildHnsw_ = true;
+    cfg.hnswExpansionSearch_ = 200;
+    VectorIndexBuilder builder{basename, cfg};
+    for (size_t i = 0; i < NUM_VECTORS; ++i) {
+      builder.add(data.id(i), data.iri(i), data.vecs[i]);
+    }
+    auto meta = builder.build();
+    EXPECT_EQ(meta.numVectors_, NUM_VECTORS);
+
+    // The data file shrinks according to the scalar width (plus the small
+    // trailer of the mmap format).
+    EXPECT_LE(std::filesystem::file_size(basename + ".vec.q.data"),
+              NUM_VECTORS * DIM * bytesPerScalar(scalar) + 4096);
+
+    VectorIndex idx;
+    idx.open(basename, "q");
+    // Decode round trip within the quantization error.
+    auto v = idx.getVector(data.id(7));
+    ASSERT_TRUE(v.has_value());
+    float tolerance = scalar == VectorScalar::F16 ? 5e-3f : 3e-2f;
+    for (size_t j = 0; j < DIM; ++j) {
+      EXPECT_NEAR((*v)[j], data.vecs[7][j], tolerance);
+    }
+    // f32 query (encoded to the storage scalar once): nearest is self.
+    auto res = idx.searchExact(data.vecs[10], 3);
+    ASSERT_FALSE(res.empty());
+    EXPECT_EQ(res.front().entity_, data.id(10));
+    EXPECT_NEAR(res.front().distance_, 0.f,
+                scalar == VectorScalar::F16 ? 1e-3 : 5e-2);
+    // Stored-entity query through the HNSW graph: nearest is self.
+    auto hnswRes = idx.searchHnswByEntity(data.id(20), 3);
+    ASSERT_FALSE(hnswRes.empty());
+    EXPECT_EQ(hnswRes.front().entity_, data.id(20));
+    // ... and over a candidate subset.
+    std::vector<Id> subset{data.id(20), data.id(21), data.id(22)};
+    auto sub =
+        idx.searchExactByEntity(data.id(20), 2, ql::span<const Id>{subset});
+    ASSERT_FALSE(sub.empty());
+    EXPECT_EQ(sub.front().entity_, data.id(20));
+    for (auto* suffix :
+         {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
+      std::error_code ec;
+      std::filesystem::remove(basename + ".vec.q" + suffix, ec);
+    }
+  }
+}
+
+// _____________________________________________________________________________
 // Manual scale/performance smoke check (excluded from regular runs; it builds
 // a multi-million-vector index). Run with:
 //   --gtest_also_run_disabled_tests --gtest_filter='*scaleBenchmark*'
@@ -475,6 +536,9 @@ TEST(VectorIndex, DISABLED_scaleBenchmark) {
   // The default is clustered data, which is what real embeddings look like.
   const char* clustersEnv = std::getenv("QLEVER_BENCH_CLUSTERS");
   const size_t clusters = clustersEnv ? std::stoull(clustersEnv) : 1000;
+  const char* scalarEnv = std::getenv("QLEVER_BENCH_SCALAR");
+  const VectorScalar scalar =
+      scalarEnv ? vectorScalarFromString(scalarEnv) : VectorScalar::F32;
   constexpr size_t dim = 128;
   std::string basename = uniqueTmpBasename();
   std::mt19937 rng{42};
@@ -486,6 +550,7 @@ TEST(VectorIndex, DISABLED_scaleBenchmark) {
   cfg.buildHnsw_ = true;
   cfg.buildThreads_ = threads;
   cfg.hnswExpansionSearch_ = ef;
+  cfg.scalar_ = scalar;
   std::vector<std::vector<float>> centroids;
   for (size_t c = 0; c < clusters; ++c) {
     std::vector<float> centroid(dim);

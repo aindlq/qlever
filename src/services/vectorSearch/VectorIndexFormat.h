@@ -20,9 +20,10 @@
 // the following files:
 //
 //   B.vec.N.meta    JSON metadata (this file's `VectorIndexMetadata`)
-//   B.vec.N.data    flat row-major float matrix, stride = `dimensions` floats.
-//                   IMMUTABLE after the build: row indices are the permanent
-//                   identity of the vectors.
+//   B.vec.N.data    flat row-major matrix in the configured scalar type
+//                   (f32/f16/i8), stride = `dimensions` scalars. IMMUTABLE
+//                   after the build: row indices are the permanent identity of
+//                   the vectors.
 //   B.vec.N.iris    one IRI per line, aligned with the rows. IMMUTABLE. Kept so
 //                   that the entity mapping can be recomputed cheaply after the
 //                   knowledge graph is re-indexed (see "remapping" below).
@@ -50,8 +51,9 @@ namespace qlever::vector {
 // `indexFormatVersion`, so adding or changing vector indices never forces a
 // rebuild of the main index. Version history: 1 = initial; 2 = added the
 // `vocabSize` fingerprint; 3 = row-keyed graph-only `.hnsw`, `.iris` +
-// `.rowmap` sidecars, tombstones (cheap remapping after a KG re-index).
-inline constexpr uint32_t VECTOR_INDEX_VERSION = 3;
+// `.rowmap` sidecars, tombstones (cheap remapping after a KG re-index);
+// 4 = `.data` holds the configured scalar type (f32/f16/i8) as raw bytes.
+inline constexpr uint32_t VECTOR_INDEX_VERSION = 4;
 
 // The `.keys` value of a row whose entity is not part of the current knowledge
 // graph. Real keys are `ValueId` bits, whose datatype (high) bits never have
@@ -68,9 +70,24 @@ struct IdRowPair {
 // The similarity metric of an index. Maps 1:1 to a `usearch` metric kind.
 enum class VectorMetric : uint8_t { Cosine, L2Sq, InnerProduct };
 
-// The scalar type the vectors are stored as. `F32` is the default; the smaller
-// types trade recall for size (and are added in a later phase).
+// The scalar type the vectors are stored as. `F32` is the default; the
+// smaller types trade a little recall for a half/quarter storage (and page
+// cache) footprint. `I8` expects roughly normalized inputs (values in
+// [-1, 1], as produced by cosine-ready embedding models).
 enum class VectorScalar : uint8_t { F32, F16, I8 };
+
+// Bytes per stored scalar value.
+inline size_t bytesPerScalar(VectorScalar s) {
+  switch (s) {
+    case VectorScalar::F32:
+      return 4;
+    case VectorScalar::F16:
+      return 2;
+    case VectorScalar::I8:
+      return 1;
+  }
+  return 4;
+}
 
 // String conversions (used both for the SPARQL surface and the JSON metadata).
 inline std::string toString(VectorMetric m) {

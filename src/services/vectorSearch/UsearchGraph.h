@@ -40,12 +40,12 @@ class FlatStoreMetric {
   using member_cref_t = GraphIndex::member_cref_t;
   using member_citerator_t = GraphIndex::member_citerator_t;
 
-  // `data` is the base pointer of the row-major float matrix with
-  // `floatsPerRow` floats per row; `metric` computes the distance between two
-  // raw vector pointers.
-  FlatStoreMetric(const float* data, size_t floatsPerRow,
+  // `data` is the base pointer of the row-major matrix (in the index's
+  // storage scalar type) with `rowBytes` bytes per row; `metric` computes the
+  // distance between two raw vector pointers of that type.
+  FlatStoreMetric(const char* data, size_t rowBytes,
                   const uu::metric_punned_t& metric) noexcept
-      : data_{data}, floatsPerRow_{floatsPerRow}, metric_{&metric} {}
+      : data_{data}, rowBytes_{rowBytes}, metric_{&metric} {}
 
   uu::distance_punned_t operator()(const uu::byte_t* a,
                                    member_cref_t b) const noexcept {
@@ -69,7 +69,7 @@ class FlatStoreMetric {
   }
 
   const uu::byte_t* rowPtr(uint64_t row) const noexcept {
-    return reinterpret_cast<const uu::byte_t*>(data_ + row * floatsPerRow_);
+    return reinterpret_cast<const uu::byte_t*>(data_ + row * rowBytes_);
   }
 
  private:
@@ -81,8 +81,8 @@ class FlatStoreMetric {
     return (*metric_)(a, b);
   }
 
-  const float* data_;
-  size_t floatsPerRow_;
+  const char* data_;
+  size_t rowBytes_;
   const uu::metric_punned_t* metric_;
 };
 
