@@ -63,6 +63,24 @@ std::shared_ptr<const VectorIndex> getVectorIndex(const Index& index,
 
 namespace {
 
+// Removes a set of files on destruction unless `dismiss()` was called; used so
+// that a failed remap does not leave `.tmp` outputs behind.
+class RemapTmpCleanup {
+ public:
+  explicit RemapTmpCleanup(std::vector<std::string> paths)
+      : paths_{std::move(paths)} {}
+  void dismiss() { paths_.clear(); }
+  ~RemapTmpCleanup() {
+    for (const auto& path : paths_) {
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+    }
+  }
+
+ private:
+  std::vector<std::string> paths_;
+};
+
 // How many input rows are read, resolved, and (for the texts input) embedded
 // per batch.
 constexpr size_t RESOLVE_BATCH_SIZE = 16384;
@@ -663,6 +681,9 @@ std::pair<uint64_t, uint64_t> remapVectorIndex(const Index& index,
   const std::string keysPath = vectorKeysFile(basename, name);
   const std::string rowmapPath = vectorRowmapFile(basename, name);
   const std::string metaPath = vectorMetaFile(basename, name);
+  // Remove any `.tmp` outputs if we throw before the renames (e.g. disk full).
+  RemapTmpCleanup cleanup{
+      {keysPath + ".tmp", rowmapPath + ".tmp", metaPath + ".tmp"}};
   {
     ad_utility::MmapVector<uint64_t> keys;
     keys.open(newKeys.size(), keysPath + ".tmp");
@@ -690,10 +711,16 @@ std::pair<uint64_t, uint64_t> remapVectorIndex(const Index& index,
       AD_THROW("Could not write the vector metadata file " + metaPath + ".tmp");
     }
     metaOut << nlohmann::json(meta).dump(2);
+    metaOut.close();
+    if (metaOut.fail()) {
+      AD_THROW("Could not write the vector metadata file " + metaPath +
+               ".tmp (disk full?).");
+    }
   }
   std::filesystem::rename(keysPath + ".tmp", keysPath);
   std::filesystem::rename(rowmapPath + ".tmp", rowmapPath);
   std::filesystem::rename(metaPath + ".tmp", metaPath);
+  cleanup.dismiss();
   return {meta.numVectors_ - tombstones, tombstones};
 }
 

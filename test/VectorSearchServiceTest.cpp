@@ -22,6 +22,7 @@
 #include "./util/GTestHelpers.h"
 #include "./util/IndexTestHelpers.h"
 #include "engine/QueryPlanner.h"
+#include "index/IndexExtension.h"
 #include "index/IndexImpl.h"
 #include "parser/SparqlParser.h"
 #include "services/vectorSearch/VectorIndex.h"
@@ -279,7 +280,7 @@ TEST(VectorSearchService, parseErrors) {
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"clip\" ; vec:result ?x ; "
                            "vec:queryVector \"1,zwei,3\" .")),
-      HasSubstr("not a number"));
+      HasSubstr("not a finite number"));
   // Empty query vector.
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"clip\" ; vec:result ?x ; "
@@ -600,5 +601,106 @@ TEST(VectorSearchService, remapAfterKgReindex) {
        {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
     std::error_code ec;
     std::filesystem::remove(basename + ".vec.clip" + suffix, ec);
+  }
+}
+
+// _____________________________________________________________________________
+// When the ONLY subtree binding the outer `<left>` variable also binds the
+// `<result>` variable (jcs > 1), there is no completion order -- this must be a
+// clear user error, not an internal planner assertion.
+TEST(VectorSearchService, outerBoundLeftAndResultSameTripleRejected) {
+  auto* qec = qecWithVectorIndex();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT * WHERE { ?x <rel> ?nn . SERVICE vec: { _:c "
+                         "vec:index \"clip\" ; vec:left ?x ; vec:result ?nn "
+                         "; vec:k 2 . } }"),
+      HasSubstr("only"));
+}
+
+// _____________________________________________________________________________
+// End-to-end test of the `--service-index` plumbing: drive the registered
+// build hook with a JSON spec + a `.npy`/iris input, then the load hook, then
+// query -- exercising `parseSpec`, `buildFromNpy`, `IndexExtensionRegistry`,
+// and `getVectorIndex` (which `qecWithVectorIndex` above bypasses).
+TEST(VectorSearchService, buildAndLoadHookRoundTrip) {
+  // A fresh KG (its own on-disk basename; NOT the shared cached test index).
+  std::string kg =
+      "<a0> <is-a> <Doc> . <a1> <is-a> <Doc> . <a2> <is-a> <Doc> .";
+  Index index = ad_utility::testing::makeTestIndex("vecHookTest", kg);
+  const std::string& base = index.getOnDiskBase();
+
+  // Write a 3x4 float32 .npy + an aligned iris file for <a0>,<a1>,<a2>.
+  std::string npy = base + ".input.npy";
+  std::string iris = base + ".input.iris";
+  std::vector<float> data{1.f, 0.f, 0.f, 0.f, 0.9f, 0.1f,
+                          0.f, 0.f, 0.f, 1.f, 0.f,  0.f};
+  {
+    std::string dict =
+        "{'descr': '<f4', 'fortran_order': False, 'shape': (3, 4), }";
+    size_t pad = (64 - ((10 + dict.size() + 1) % 64)) % 64;
+    dict.append(pad, ' ');
+    dict.push_back('\n');
+    std::ofstream out{npy, std::ios::binary};
+    out.write("\x93NUMPY", 6);
+    char ver[2] = {1, 0};
+    out.write(ver, 2);
+    uint16_t hlen = static_cast<uint16_t>(dict.size());
+    char lb[2] = {static_cast<char>(hlen & 0xff),
+                  static_cast<char>((hlen >> 8) & 0xff)};
+    out.write(lb, 2);
+    out.write(dict.data(), dict.size());
+    out.write(reinterpret_cast<const char*>(data.data()),
+              data.size() * sizeof(float));
+    std::ofstream irisOut{iris};
+    irisOut << "<a0>\n<a1>\n<a2>\n";
+  }
+
+  auto spec = [&](const std::string& extra) {
+    return nlohmann::json::parse(
+        "{\"vectorSearch\":[{\"name\":\"docs\",\"npy\":\"" + npy +
+        "\",\"iris\":\"" + iris + "\",\"metric\":\"cosine\"" + extra + "}]}");
+  };
+
+  ASSERT_FALSE(IndexExtensionRegistry::get().buildHooks().empty());
+  ASSERT_FALSE(IndexExtensionRegistry::get().loadHooks().empty());
+  // Build via every registered build hook (the vector one consumes the key).
+  for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
+    hook(index, base, spec(""));
+  }
+  // Load via the registered load hooks into the index's `IndexImpl`.
+  for (const auto& hook : IndexExtensionRegistry::get().loadHooks()) {
+    hook(index.getImpl(), base);
+  }
+
+  auto vidx = qlever::vector::getVectorIndex(index, "docs");
+  ASSERT_TRUE(vidx != nullptr);
+  EXPECT_EQ(vidx->numLiveVectors(), 3u);
+  auto getId = makeGetId(index);
+  auto res = vidx->searchExact(std::vector<float>{1.f, 0.f, 0.f, 0.f}, 2);
+  ASSERT_EQ(res.size(), 2u);
+  EXPECT_EQ(res[0].entity_, getId("<a0>"));
+  EXPECT_EQ(res[1].entity_, getId("<a1>"));
+
+  // parseSpec validation surfaces through the build hook: unknown key, and the
+  // i8+non-cosine rejection.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      IndexExtensionRegistry::get().buildHooks().front()(
+          index, base, spec(",\"frobnicate\":1")),
+      HasSubstr("Unknown key"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      IndexExtensionRegistry::get().buildHooks().front()(
+          index, base,
+          nlohmann::json::parse(
+              "{\"vectorSearch\":[{\"name\":\"q\",\"npy\":\"" + npy +
+              "\",\"iris\":\"" + iris +
+              "\",\"scalar\":\"i8\",\"metric\":\"l2sq\"}]}")),
+      HasSubstr("cosine"));
+
+  for (auto* suffix : {".vec.docs.meta", ".vec.docs.keys", ".vec.docs.rowmap",
+                       ".vec.docs.data", ".vec.docs.iris", ".vec.docs.hnsw",
+                       ".input.npy", ".input.iris"}) {
+    std::error_code ec;
+    std::filesystem::remove(base + suffix, ec);
   }
 }

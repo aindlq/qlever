@@ -29,6 +29,15 @@ namespace {
 // for sub-second cancellation latency, rare enough to not show up in profiles.
 constexpr size_t CHECK_INTERRUPT_PERIOD = 65536;
 
+// Hard upper bound on the number of results a single search returns, regardless
+// of the user's `k` and the index size. `k` is remote and unbounded; without
+// this cap a query like `vec:k 100000000` on a 100M-vector index would drive
+// gigabytes of (unaccounted) scratch and an effectively whole-index HNSW probe.
+// A nearest-neighbour query asking for more than this is pathological; the
+// result is capped (not an error). 100k results = ~1.2 MB of key+distance
+// buffers, and a bounded HNSW search.
+constexpr size_t MAX_SEARCH_RESULTS = 100'000;
+
 // A pool of usearch search-context ids. Each concurrent HNSW search needs a
 // distinct context; a request beyond the pool size briefly WAITS for a free
 // context instead of failing the query (the pool is sized generously above the
@@ -150,7 +159,8 @@ struct VectorIndex::Impl {
   }
 
   FlatStoreMetric graphMetric() const {
-    return FlatStoreMetric{data_.data(), rowBytes(), metric_.value()};
+    return FlatStoreMetric{data_.data(), rowBytes(), meta_.numVectors_,
+                           metric_.value()};
   }
 };
 
@@ -254,6 +264,15 @@ void VectorIndex::open(const std::string& basename, const std::string& name) {
     if (impl.graph_->size() != impl.meta_.numVectors_) {
       complainInterrupted("the HNSW graph on disk");
     }
+    // Validate the graph member keys: they are row indices and are used
+    // (unchecked, inside usearch's traversal) to read the flat store, so a
+    // corrupt `.hnsw` with an out-of-range key must be rejected here rather
+    // than cause an out-of-bounds read at query time. O(numVectors), once.
+    for (auto it = impl.graph_->cbegin(); it != impl.graph_->cend(); ++it) {
+      if (static_cast<uint64_t>(uu::get_key(*it)) >= impl.meta_.numVectors_) {
+        complainInterrupted("the HNSW graph on disk");
+      }
+    }
     // Reserve one search context per pooled slot. QLever's query-thread count
     // (`-j`) may exceed the hardware concurrency; searches beyond the pool
     // size wait briefly for a free slot instead of failing.
@@ -347,9 +366,10 @@ std::vector<ScoredEntity> searchExactBytes(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt) {
-  // Clamp `k` (user-supplied, unbounded) to the number of live vectors: it
-  // bounds the `TopK` heap and would otherwise be a remote OOM lever.
-  k = std::min(k, impl.numLive());
+  // Clamp `k` (user-supplied, unbounded) to the live vector count AND a hard
+  // maximum: it bounds the `TopK` heap and would otherwise be a remote OOM
+  // lever.
+  k = std::min({k, impl.numLive(), MAX_SEARCH_RESULTS});
   if (k == 0) {
     return {};
   }
@@ -437,19 +457,21 @@ std::vector<ScoredEntity> searchHnswBytes(
     const CheckInterruptCallback& checkInterrupt) {
   AD_CONTRACT_CHECK(impl.graph_.has_value(),
                     "searchHnsw called but this index has no HNSW structure.");
-  // Clamp to the number of live vectors: `k` is user-supplied and unbounded,
-  // and drives the allocations below -- an unclamped `k` is a remote OOM lever.
-  k = std::min(k, impl.numLive());
+  // Clamp `k` (user-supplied, unbounded) to the live vector count AND a hard
+  // maximum -- it drives the allocations and the search expansion below.
+  k = std::min({k, impl.numLive(), MAX_SEARCH_RESULTS});
   if (k == 0) {
     return {};
   }
   // Fetch `k + numTombstones` results: at most `numTombstones` of the nearest
   // can be tombstoned, so this provably captures the k nearest LIVE results in
-  // a SINGLE search -- no unbounded retry loop, and the allocation is bounded
-  // by the index size. (A heavily tombstoned index inflates `wanted`; that is
-  // the documented "rebuild after many removals" case.)
-  size_t wanted =
-      std::min<size_t>(impl.meta_.numVectors_, k + impl.meta_.numTombstones_);
+  // a SINGLE search -- no unbounded retry loop. Cap the over-fetch (and hence
+  // the allocation and the search expansion) at a bounded value: on a heavily
+  // tombstoned index this may return fewer than k results, which is exactly
+  // the documented "rebuild after many removals" case.
+  constexpr size_t MAX_HNSW_FETCH = 1'000'000;
+  size_t wanted = std::min<size_t>(
+      {impl.meta_.numVectors_, k + impl.meta_.numTombstones_, MAX_HNSW_FETCH});
   if (checkInterrupt) {
     checkInterrupt();
   }

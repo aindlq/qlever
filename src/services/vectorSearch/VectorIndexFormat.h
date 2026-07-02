@@ -60,6 +60,11 @@ inline constexpr uint32_t VECTOR_INDEX_VERSION = 4;
 // all bits set, so this value cannot collide.
 inline constexpr uint64_t TOMBSTONE_KEY = ~uint64_t{0};
 
+// A sanity ceiling on the vector dimension. Real embedding models are far
+// below this; the bound prevents a crafted/typo'd input from requesting a
+// multi-gigabyte per-vector allocation.
+inline constexpr uint32_t MAX_VECTOR_DIMENSIONS = 1u << 16;  // 65536
+
 // One entry of the `.rowmap` file: the id -> row direction of the entity
 // mapping, sorted by `idBits_`.
 struct IdRowPair {

@@ -10,6 +10,7 @@
 #include <array>
 #include <charconv>
 
+#include "services/vectorSearch/VectorIndexFormat.h"
 #include "util/Exception.h"
 
 namespace qlever::vector {
@@ -158,6 +159,11 @@ NpyVectorInputReader::NpyVectorInputReader(const std::string& npyPath,
   if (dimensions_ == 0) {
     AD_THROW("The .npy input " + npyPath + " has zero dimension.");
   }
+  if (dimensions_ > MAX_VECTOR_DIMENSIONS) {
+    AD_THROW("The .npy input " + npyPath +
+             " declares an implausible dimension (" +
+             std::to_string(dimensions_) + ").");
+  }
   dataOffset_ = static_cast<uint64_t>(npy_.tellg());
 }
 
@@ -281,6 +287,7 @@ ParquetVectorInputReader::ParquetVectorInputReader(
                   "Could not iterate the Parquet file " + parquetPath);
 }
 
+// ____________________________________________________________________________
 ParquetVectorInputReader::~ParquetVectorInputReader() = default;
 
 // ____________________________________________________________________________

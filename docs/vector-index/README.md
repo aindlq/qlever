@@ -47,7 +47,7 @@ Per-index keys (unknown keys are rejected):
 | `parquet` | Parquet file with `uri` (string) + `embedding` (list of float32/float64) columns; carries the URIs itself, so `iris` is not needed. Requires `-DQLEVER_VECTOR_SEARCH_PARQUET=ON` (external Apache Arrow) | |
 | `dimensions` | vector dimension (inferred if omitted) | inferred |
 | `metric` | `cosine`, `l2sq`, `innerProduct` | `cosine` |
-| `scalar` | storage type `f32`, `f16`, or `i8` (half/quarter footprint; `i8` expects inputs in [-1, 1]) | `f32` |
+| `scalar` | storage type `f32`, `f16`, or `i8` (half/quarter footprint; `i8` normalizes each vector, so it requires `metric: cosine`) | `f32` |
 | `hnsw` | also build a usearch HNSW index | `true` |
 | `hnswConnectivity` | usearch M | 16 |
 | `hnswExpansionAdd` | efConstruction | 128 |
@@ -208,5 +208,10 @@ empty result. Results computed through an external embedding endpoint
   follow-up.
 - Tombstones accumulate over repeated remaps; rebuild when a large fraction of
   the indexed entities has disappeared (searches over-fetch past tombstones).
-- Migrating the six pre-existing magic services onto the registry is a
-  follow-up.
+- Four of the six built-in magic services (path search, text search, external
+  values, named cached results) now dispatch through this same registry (parser
+  factory + planner handler), with their dedicated parse-tree/dispatch code
+  removed; spatial search and materialized views still use dedicated dispatch
+  because of their deeper planner integration (filter substitutes /
+  incomplete-join machinery for spatial, a dedicated query-analysis pass for
+  materialized views).

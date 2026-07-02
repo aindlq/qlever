@@ -277,7 +277,12 @@ std::vector<std::vector<float>> embedManyOpenAI(
     }
     out[index].reserve(embedding.size());
     for (const auto& value : embedding) {
-      out[index].push_back(value.get<float>());
+      float f = value.get<float>();
+      // A non-finite value would poison every distance comparison it enters.
+      if (!std::isfinite(f)) {
+        AD_THROW("The embedding response contains a non-finite value.");
+      }
+      out[index].push_back(f);
     }
     ++position;
   }

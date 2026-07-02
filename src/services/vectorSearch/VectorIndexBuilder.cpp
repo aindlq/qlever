@@ -7,6 +7,8 @@
 
 #include "services/vectorSearch/VectorIndexBuilder.h"
 
+#include <unistd.h>
+
 #include <atomic>
 #include <filesystem>
 #include <mutex>
@@ -24,6 +26,18 @@
 namespace qlever::vector {
 
 namespace {
+
+// Total physical RAM in bytes, or 0 if it cannot be determined.
+uint64_t totalPhysicalMemoryBytes() {
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGE_SIZE)
+  long pages = sysconf(_SC_PHYS_PAGES);
+  long pageSize = sysconf(_SC_PAGE_SIZE);
+  if (pages > 0 && pageSize > 0) {
+    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(pageSize);
+  }
+#endif
+  return 0;
+}
 
 // Removes the given files on destruction unless `dismiss()` was called.
 // Used so that a failed build does not leave temporary files behind.
@@ -102,6 +116,12 @@ VectorIndexBuilder::VectorIndexBuilder(std::string basename,
   if (config_.dimensions_ == 0) {
     AD_THROW("A vector index needs a positive dimension.");
   }
+  if (config_.dimensions_ > MAX_VECTOR_DIMENSIONS) {
+    AD_THROW("Vector index \"" + config_.name_ +
+             "\" has an implausible "
+             "dimension (" +
+             std::to_string(config_.dimensions_) + ").");
+  }
   rowBytes_ = config_.dimensions_ * bytesPerScalar(config_.scalar_);
   fromF32_ =
       uu::casts_punned_t::make(toUsearchScalar(config_.scalar_)).from.f32;
@@ -114,6 +134,16 @@ VectorIndexBuilder::VectorIndexBuilder(std::string basename,
     AD_THROW("Could not create temporary build files for vector index \"" +
              config_.name_ + "\" next to " + basename_);
   }
+}
+
+// ____________________________________________________________________________
+VectorIndexBuilder::~VectorIndexBuilder() {
+  // Idempotent: `build()` already removes these on success (and its
+  // `FileCleanup` removes them on a throw inside `build()`); this covers a
+  // builder destroyed before `build()` was called.
+  std::error_code ec;
+  std::filesystem::remove(vecSpillPath_, ec);
+  std::filesystem::remove(iriSpillPath_, ec);
 }
 
 // ____________________________________________________________________________
@@ -285,6 +315,15 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     }
   }
 
+  // The spill files are no longer needed (the flat store and the `.iris` file
+  // have been written). Remove them NOW, before the multi-hour HNSW build, so
+  // the transient disk footprint is ~1x the vector matrix rather than ~2x.
+  {
+    std::error_code ec;
+    std::filesystem::remove(vecSpillPath_, ec);
+    std::filesystem::remove(iriSpillPath_, ec);
+  }
+
   // 6. Optionally build and save the HNSW graph, keyed by ROW INDEX, with the
   //    vectors read from the just-written memory-mapped flat store: neither
   //    the build nor the resulting file contains a second copy of the vectors.
@@ -292,11 +331,26 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   if (hasHnsw) {
     outputsCleanup.track(tmp(hnswPath));
     ad_utility::MmapVectorView<char> data;
-    data.open(tmp(dataPath));
+    // Random access: graph construction reads vectors in graph order, not
+    // sequentially, so read-ahead only pollutes the page cache.
+    data.open(tmp(dataPath), ad_utility::AccessPattern::Random);
+    // Warn if the flat store cannot plausibly stay page-cache-resident: HNSW
+    // construction random-accesses it, so once it exceeds RAM the build
+    // becomes disk-bound.
+    if (uint64_t ram = totalPhysicalMemoryBytes();
+        ram != 0 && n * rowBytes_ > ram) {
+      AD_LOG_WARN << "Vector index \"" << config_.name_ << "\": the "
+                  << (n * rowBytes_ >> 30)
+                  << " GiB flat store exceeds physical "
+                  << "memory (" << (ram >> 30)
+                  << " GiB); the HNSW build will be disk-bound. Consider a "
+                     "smaller scalar type (f16/i8) or more RAM."
+                  << std::endl;
+    }
     uu::metric_punned_t metric{config_.dimensions_,
                                toUsearchMetric(config_.metric_),
                                toUsearchScalar(config_.scalar_)};
-    FlatStoreMetric graphMetric{data.data(), rowBytes_, metric};
+    FlatStoreMetric graphMetric{data.data(), rowBytes_, n, metric};
     GraphIndex graph{uu::index_config_t{config_.hnswConnectivity_,
                                         config_.hnswConnectivity_ * 2}};
     uu::index_limits_t limits;

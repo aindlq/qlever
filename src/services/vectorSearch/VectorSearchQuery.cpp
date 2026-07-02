@@ -11,6 +11,8 @@
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
 
+#include <cmath>
+
 #include "parser/SparqlTriple.h"
 
 namespace parsedQuery {
@@ -31,10 +33,11 @@ std::vector<float> parseFloatList(std::string_view s) {
     float value{};
     auto [ptr, ec] =
         absl::from_chars(token.data(), token.data() + token.size(), value);
-    if (ec != std::errc{} || ptr != token.data() + token.size()) {
+    if (ec != std::errc{} || ptr != token.data() + token.size() ||
+        !std::isfinite(value)) {
       throw VectorSearchException{absl::StrCat(
-          "`<queryVector>` contains a value that is not a number: \"", token,
-          "\".")};
+          "`<queryVector>` contains a value that is not a finite number: \"",
+          token, "\".")};
     }
     out.push_back(value);
   }

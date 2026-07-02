@@ -41,11 +41,14 @@ class FlatStoreMetric {
   using member_citerator_t = GraphIndex::member_citerator_t;
 
   // `data` is the base pointer of the row-major matrix (in the index's
-  // storage scalar type) with `rowBytes` bytes per row; `metric` computes the
-  // distance between two raw vector pointers of that type.
-  FlatStoreMetric(const char* data, size_t rowBytes,
+  // storage scalar type) with `rowBytes` bytes per row and `numRows` rows;
+  // `metric` computes the distance between two raw vector pointers of that
+  // type. `numRows` is used to clamp graph member keys so that a corrupt
+  // `.hnsw` (whose keys are supposed to be row indices in `[0, numRows)`)
+  // cannot drive an out-of-bounds read of the flat store during traversal.
+  FlatStoreMetric(const char* data, size_t rowBytes, size_t numRows,
                   const uu::metric_punned_t& metric) noexcept
-      : data_{data}, rowBytes_{rowBytes}, metric_{&metric} {}
+      : data_{data}, rowBytes_{rowBytes}, numRows_{numRows}, metric_{&metric} {}
 
   uu::distance_punned_t operator()(const uu::byte_t* a,
                                    member_cref_t b) const noexcept {
@@ -74,7 +77,11 @@ class FlatStoreMetric {
 
  private:
   const uu::byte_t* v(member_cref_t m) const noexcept {
-    return rowPtr(uu::get_key(m));
+    uint64_t key = uu::get_key(m);
+    // Clamp an out-of-range key (only possible from a corrupt `.hnsw`) to a
+    // valid row so the read below stays in bounds; the resulting distance is
+    // merely wrong for that corrupt node, never an OOB access.
+    return rowPtr(key < numRows_ ? key : 0);
   }
   uu::distance_punned_t f(const uu::byte_t* a,
                           const uu::byte_t* b) const noexcept {
@@ -83,6 +90,7 @@ class FlatStoreMetric {
 
   const char* data_;
   size_t rowBytes_;
+  size_t numRows_;
   const uu::metric_punned_t* metric_;
 };
 

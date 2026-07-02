@@ -47,6 +47,12 @@ namespace qlever::vector {
 class VectorIndexBuilder {
  public:
   VectorIndexBuilder(std::string basename, VectorIndexConfig config);
+  // Removes the temporary spill files, so that a builder abandoned without a
+  // successful `build()` (e.g. because reading/embedding a later input batch
+  // threw) does not leak the spilled vectors -- which can be hundreds of GB.
+  ~VectorIndexBuilder();
+  VectorIndexBuilder(const VectorIndexBuilder&) = delete;
+  VectorIndexBuilder& operator=(const VectorIndexBuilder&) = delete;
 
   // Record the size of the knowledge-graph vocabulary this index is built
   // against. Stored in the metadata and checked at load time, so that stale
