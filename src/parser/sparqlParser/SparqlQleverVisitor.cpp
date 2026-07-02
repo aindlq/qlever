@@ -1304,6 +1304,19 @@ GraphPatternOperation Visitor::visit(Parser::ServiceGraphPatternContext* ctx) {
         factory.value()(serviceIri);
     parseMagicServiceBody(ctx, *target);
     return parsedQuery::MagicService{std::move(target)};
+  } else if (looksLikeMagicServiceIri(serviceIri.toStringRepresentation())) {
+    // An IRI in QLever's magic-service namespace that no service handles: this
+    // is a misspelled service name or a feature not compiled into this binary
+    // (e.g. the vector-search service). Fail clearly instead of silently
+    // treating it as a federated `SERVICE` request to a non-existent endpoint.
+    reportError(
+        ctx->varOrIri(),
+        absl::StrCat(
+            "There is no magic SERVICE for the IRI ",
+            serviceIri.toStringRepresentation(),
+            ", which is in QLever's reserved magic-service namespace. The "
+            "service name may be misspelled, or the corresponding feature may "
+            "not be compiled into this QLever binary."));
   }
   // Parse the body of the SERVICE query. Add the visible variables from the
   // SERVICE clause to the visible variables so far, but also remember them

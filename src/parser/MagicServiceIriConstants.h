@@ -50,6 +50,34 @@ constexpr inline std::string_view MATERIALIZED_VIEW_IRI =
     ad_utility::constexprStrCat<MATERIALIZED_VIEW_IRI_WITHOUT_CLOSING_BRACKET,
                                 string_constants::detail::CLOSING_BRACKET>();
 
+// The namespace under which QLever's magic `SERVICE`s live. A base
+// magic-service IRI is `<MAGIC_SERVICE_IRI_NAMESPACE><serviceName>/>` (e.g.
+// `vectorSearch/>`).
+constexpr inline std::string_view MAGIC_SERVICE_IRI_NAMESPACE =
+    "<https://qlever.cs.uni-freiburg.de/";
+
+// Heuristic: does `iri` (bracketed representation) look like a magic-service
+// base IRI -- i.e. the QLever namespace followed by a single path segment (a
+// service name of `[A-Za-z0-9-]`) and a trailing `/`? Used to turn an
+// unresolved magic-service IRI into a clear error rather than silently
+// federating to a non-existent endpoint. Real QLever federation endpoints
+// (`.../api/<dataset>`) have a second path segment / no trailing slash, so they
+// are not matched.
+inline bool looksLikeMagicServiceIri(std::string_view iri) {
+  if (iri.size() < MAGIC_SERVICE_IRI_NAMESPACE.size() + 2 ||
+      iri.substr(0, MAGIC_SERVICE_IRI_NAMESPACE.size()) !=
+          MAGIC_SERVICE_IRI_NAMESPACE ||
+      iri.back() != '>' || iri[iri.size() - 2] != '/') {
+    return false;
+  }
+  std::string_view name =
+      iri.substr(MAGIC_SERVICE_IRI_NAMESPACE.size(),
+                 iri.size() - MAGIC_SERVICE_IRI_NAMESPACE.size() - 2);
+  return !name.empty() && name.find_first_not_of(
+                              "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV"
+                              "WXYZ0123456789-") == std::string_view::npos;
+}
+
 // For backward compatibility: invocation of SpatialJoin via special predicates.
 static const std::string MAX_DIST_IN_METERS = "<max-distance-in-meters:";
 static const std::string NEAREST_NEIGHBORS = "<nearest-neighbors:";

@@ -605,6 +605,25 @@ TEST(VectorSearchService, remapAfterKgReindex) {
 }
 
 // _____________________________________________________________________________
+// An IRI in QLever's reserved magic-service namespace that no service handles
+// is a clear error (feature not linked / typo), not a silent federated request.
+TEST(VectorSearchService, unknownMagicServiceIriRejected) {
+  auto* qec = qecWithVectorIndex();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                "SELECT * WHERE { SERVICE "
+                "<https://qlever.cs.uni-freiburg.de/nosuchservice/> { ?s "
+                "?p ?o } }"),
+      HasSubstr("reserved magic-service namespace"));
+  // A real federated endpoint under the same domain (with an `/api/` path) is
+  // NOT treated as a magic service and parses as an ordinary SERVICE.
+  EXPECT_NO_THROW(planQuery(
+      qec,
+      "SELECT * WHERE { SERVICE SILENT "
+      "<https://qlever.cs.uni-freiburg.de/api/wikidata> { ?s ?p ?o } }"));
+}
+
+// _____________________________________________________________________________
 // When the ONLY subtree binding the outer `<left>` variable also binds the
 // `<result>` variable (jcs > 1), there is no completion order -- this must be a
 // clear user error, not an internal planner assertion.
