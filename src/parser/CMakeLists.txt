@@ -27,6 +27,7 @@ add_library(parser
         DatasetClauses.cpp
         TextSearchQuery.cpp
         MagicServiceRegistry.cpp
+        BuiltinMagicServiceParsers.cpp
         MaterializedViewQuery.cpp
         Quads.cpp
         UpdateTriples.cpp

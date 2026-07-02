@@ -39,6 +39,14 @@ class MagicServicePlanningContext {
   // Add a leaf operation (no children) as a candidate result for this service.
   virtual void addLeafOperation(std::shared_ptr<Operation> operation) = 0;
 
+  // Add each operation as an INDEPENDENT seed of the current group's join
+  // planning (they are joined together with the rest of the group, rather than
+  // being alternatives for a single node). Use this for services that emit
+  // several leaf scans to be combined (e.g. a text search's word/entity
+  // scans).
+  virtual void addSeedOperations(
+      std::vector<std::shared_ptr<Operation>> operations) = 0;
+
   // Plan the nested `childPattern`; for each resulting candidate child subtree,
   // call `makeOperation(child)` to build the service's operation, and add it as
   // a candidate. Use this for services whose operation wraps a nested pattern.

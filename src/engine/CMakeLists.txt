@@ -21,7 +21,7 @@ add_library(engine
         PermutationSelector.cpp ConstructTripleGenerator.cpp
         ConstructTemplatePreprocessor.cpp ConstructTripleInstantiator.cpp ConstructBatchEvaluator.cpp
         MaterializedViewsQueryAnalysis.cpp UpdateMetadata.cpp ExternalValues.cpp
-        MagicServicePlanning.cpp)
+        MagicServicePlanning.cpp BuiltinMagicServicePlanners.cpp)
 
 # `Boost::program_options` is not used inside `engine` itself, but the
 # `qlever-server` target reuses the engine PCH (`target_precompile_headers

@@ -37,6 +37,7 @@
 #include "generated/SparqlAutomaticParser.h"
 #include "global/Constants.h"
 #include "global/RuntimeParameters.h"
+#include "parser/BuiltinMagicServiceParsers.h"
 #include "parser/GraphPatternOperation.h"
 #include "parser/MagicServiceIriConstants.h"
 #include "parser/MagicServiceQuery.h"
@@ -1283,21 +1284,13 @@ GraphPatternOperation Visitor::visit(Parser::ServiceGraphPatternContext* ctx) {
                      [](const Iri& iri) -> Iri { return iri; }},
                  varOrIri);
 
-  if (serviceIri.toStringRepresentation() == PATH_SEARCH_IRI) {
-    return visitMagicServiceQuery<parsedQuery::PathQuery>(ctx);
-  } else if (serviceIri.toStringRepresentation() == SPATIAL_SEARCH_IRI) {
+  // Make sure the built-in magic services that live on the registry (path/text
+  // search, external values, named cached results) are registered before we
+  // look an IRI up (idempotent, `call_once`).
+  parsedQuery::registerBuiltinMagicServiceParsers();
+
+  if (serviceIri.toStringRepresentation() == SPATIAL_SEARCH_IRI) {
     return visitMagicServiceQuery<parsedQuery::SpatialQuery>(ctx);
-  } else if (serviceIri.toStringRepresentation() == TEXT_SEARCH_IRI) {
-    return visitMagicServiceQuery<parsedQuery::TextSearchQuery>(ctx);
-  } else if (serviceIri.toStringRepresentation() == EXTERNAL_VALUES_IRI ||
-             ql::starts_with(serviceIri.toStringRepresentation(),
-                             EXTERNAL_VALUES_IRI_PREFIX)) {
-    return visitMagicServiceQuery<parsedQuery::ExternalValuesQuery>(ctx,
-                                                                    serviceIri);
-  } else if (ql::starts_with(asStringViewUnsafe(serviceIri.getContent()),
-                             CACHED_RESULT_WITH_NAME_PREFIX)) {
-    return visitMagicServiceQuery<parsedQuery::NamedCachedResult>(ctx,
-                                                                  serviceIri);
   } else if (ql::starts_with(asStringViewUnsafe(serviceIri.getContent()),
                              MATERIALIZED_VIEW_IRI_WITHOUT_BRACKETS)) {
     return visitMagicServiceQuery<parsedQuery::MaterializedViewQuery>(

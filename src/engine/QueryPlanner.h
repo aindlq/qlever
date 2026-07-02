@@ -687,15 +687,11 @@ class QueryPlanner {
     void visitBasicGraphPattern(const parsedQuery::BasicGraphPattern& pattern);
     void visitBind(const parsedQuery::Bind& bind);
     void visitTransitivePath(parsedQuery::TransPath& transitivePath);
-    void visitPathSearch(parsedQuery::PathQuery& config);
     void visitSpatialSearch(parsedQuery::SpatialQuery& config);
-    void visitTextSearch(const parsedQuery::TextSearchQuery& config);
     // Generic dispatch for a `MagicService` node: looks the concrete query type
     // up in the `MagicServicePlannerRegistry` and runs its (externally
     // registered) handler. No per-service code anywhere in the planner.
     void planMagicService(parsedQuery::MagicServiceQuery& query);
-    void visitExternalValues(const parsedQuery::ExternalValuesQuery& config);
-    void visitNamedCachedResult(const parsedQuery::NamedCachedResult& config);
     void visitMaterializedViewQuery(
         const parsedQuery::MaterializedViewQuery& viewQuery);
     void visitUnion(parsedQuery::Union& un);

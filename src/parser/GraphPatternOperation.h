@@ -244,9 +244,8 @@ struct MagicService {
 // class actually becomes `using GraphPatternOperation = std::variant<...>`
 using GraphPatternOperationVariant =
     std::variant<Optional, Union, Subquery, TransPath, Bind, BasicGraphPattern,
-                 Values, Service, PathQuery, SpatialQuery, TextSearchQuery,
-                 Minus, GroupGraphPattern, Describe, Load, NamedCachedResult,
-                 MaterializedViewQuery, ExternalValuesQuery, MagicService>;
+                 Values, Service, SpatialQuery, Minus, GroupGraphPattern,
+                 Describe, Load, MaterializedViewQuery, MagicService>;
 struct GraphPatternOperation
     : public GraphPatternOperationVariant,
       public VisitMixin<GraphPatternOperation, GraphPatternOperationVariant> {

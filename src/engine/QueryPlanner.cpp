@@ -22,6 +22,7 @@
 #include "backports/algorithm.h"
 #include "backports/type_traits.h"
 #include "engine/Bind.h"
+#include "engine/BuiltinMagicServicePlanners.h"
 #include "engine/CartesianProductJoin.h"
 #include "engine/CheckUsePatternTrick.h"
 #include "engine/CountAvailablePredicates.h"
@@ -3236,21 +3237,13 @@ void QueryPlanner::GraphPatternPlanner::graphPatternOperationVisitor(Arg& arg) {
       c.type = SubtreePlan::MINUS;
     }
     visitGroupOptionalOrMinus(std::move(candidates));
-  } else if constexpr (std::is_same_v<T, p::PathQuery>) {
-    visitPathSearch(arg);
   } else if constexpr (std::is_same_v<T, p::Describe>) {
     visitDescribe(arg);
   } else if constexpr (std::is_same_v<T, p::SpatialQuery>) {
     visitSpatialSearch(arg);
-  } else if constexpr (std::is_same_v<T, p::TextSearchQuery>) {
-    visitTextSearch(arg);
   } else if constexpr (std::is_same_v<T, p::MagicService>) {
     AD_CORRECTNESS_CHECK(arg.query_ != nullptr);
     planMagicService(*arg.query_);
-  } else if constexpr (std::is_same_v<T, p::ExternalValuesQuery>) {
-    visitExternalValues(arg);
-  } else if constexpr (std::is_same_v<T, p::NamedCachedResult>) {
-    visitNamedCachedResult(arg);
   } else if constexpr (std::is_same_v<T, p::MaterializedViewQuery>) {
     visitMaterializedViewQuery(arg);
   } else {
@@ -3370,26 +3363,6 @@ void QueryPlanner::GraphPatternPlanner::visitTransitivePath(
 }
 
 // _______________________________________________________________
-void QueryPlanner::GraphPatternPlanner::visitPathSearch(
-    parsedQuery::PathQuery& pathQuery) {
-  auto config = pathQuery.toPathSearchConfiguration(planner_._qec->getIndex());
-
-  // The path search requires a child graph pattern
-  AD_CORRECTNESS_CHECK(pathQuery.childGraphPattern_.has_value());
-  std::vector<SubtreePlan> candidatesIn =
-      planner_.optimize(&pathQuery.childGraphPattern_.value());
-  std::vector<SubtreePlan> candidatesOut;
-
-  for (auto& sub : candidatesIn) {
-    auto pathSearch =
-        std::make_shared<PathSearch>(qec_, std::move(sub._qet), config);
-    auto plan = makeSubtreePlan<PathSearch>(std::move(pathSearch));
-    candidatesOut.push_back(std::move(plan));
-  }
-  visitGroupOptionalOrMinus(std::move(candidatesOut));
-}
-
-// _______________________________________________________________
 SubtreePlan QueryPlanner::getMaterializedViewIndexScanPlan(
     const parsedQuery::MaterializedViewQuery& viewQuery) const {
   return makeSubtreePlan<IndexScan>(
@@ -3423,6 +3396,15 @@ void QueryPlanner::GraphPatternPlanner::planMagicService(
       candidates.push_back(makeSubtreePlan(std::move(operation)));
       self_.visitGroupOptionalOrMinus(std::move(candidates));
     }
+    void addSeedOperations(
+        std::vector<std::shared_ptr<Operation>> operations) override {
+      // Each operation is an independent seed node for this group (matching the
+      // way multi-scan services push directly to the candidate list).
+      for (auto& operation : operations) {
+        self_.candidatePlans_.push_back(
+            std::vector{makeSubtreePlan(std::move(operation))});
+      }
+    }
     void addOperationWithChildPattern(
         const parsedQuery::GraphPattern& childPattern,
         std::function<
@@ -3442,6 +3424,9 @@ void QueryPlanner::GraphPatternPlanner::planMagicService(
     }
   } context{*this};
 
+  // Make sure the migrated built-in services' handlers are registered
+  // (idempotent, `call_once`), so this works in every binary.
+  qlever::registerBuiltinMagicServicePlanners();
   const MagicServicePlanner* handler =
       MagicServicePlannerRegistry::get().lookup(std::type_index(typeid(query)));
   AD_CONTRACT_CHECK(handler != nullptr,
@@ -3493,42 +3478,6 @@ void QueryPlanner::GraphPatternPlanner::visitSpatialSearch(
     }
   }
   visitGroupOptionalOrMinus(std::move(candidatesOut));
-}
-
-// _______________________________________________________________
-void QueryPlanner::GraphPatternPlanner::visitTextSearch(
-    const parsedQuery::TextSearchQuery& textSearchQuery) {
-  auto visitor = [this](auto& arg) -> SubtreePlan {
-    using T = std::decay_t<decltype(arg)>;
-    static_assert(
-        ad_utility::SimilarToAny<T, TextIndexScanForEntityConfiguration,
-                                 TextIndexScanForWordConfiguration>);
-    using Op = std::conditional_t<
-        ad_utility::isSimilar<T, TextIndexScanForEntityConfiguration>,
-        TextIndexScanForEntity, TextIndexScanForWord>;
-    return makeSubtreePlan<Op>(this->qec_, std::move(arg));
-  };
-  for (auto config : textSearchQuery.toConfigs(qec_)) {
-    candidatePlans_.push_back(std::vector{std::visit(visitor, config)});
-  }
-}
-
-// _______________________________________________________________
-void QueryPlanner::GraphPatternPlanner::visitExternalValues(
-    const parsedQuery::ExternalValuesQuery& externalValuesQuery) {
-  auto externalValues =
-      std::make_shared<ExternalValues>(qec_, externalValuesQuery);
-  auto candidate = makeSubtreePlan<ExternalValues>(std::move(externalValues));
-  visitGroupOptionalOrMinus(std::vector{std::move(candidate)});
-}
-
-// _____________________________________________________________________________
-void QueryPlanner::GraphPatternPlanner::visitNamedCachedResult(
-    const parsedQuery::NamedCachedResult& arg) {
-  auto candidate =
-      SubtreePlan{planner_._qec, planner_._qec->namedResultCache().getOperation(
-                                     arg.identifier(), planner_._qec)};
-  visitGroupOptionalOrMinus(std::vector{std::move(candidate)});
 }
 
 // _______________________________________________________________

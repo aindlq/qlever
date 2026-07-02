@@ -39,12 +39,11 @@ struct BasicGraphPatternsInvariantTo {
     // The presence of any of these operations might remove or duplicate rows.
     namespace pq = parsedQuery;
     static_assert(
-        ad_utility::SimilarToAny<
-            T, pq::Optional, pq::Union, pq::Subquery, pq::TransPath,
-            pq::BasicGraphPattern, pq::Service, pq::PathQuery, pq::SpatialQuery,
-            pq::TextSearchQuery, pq::Minus, pq::GroupGraphPattern, pq::Describe,
-            pq::Load, pq::NamedCachedResult, pq::MaterializedViewQuery,
-            pq::ExternalValuesQuery, pq::MagicService>);
+        ad_utility::SimilarToAny<T, pq::Optional, pq::Union, pq::Subquery,
+                                 pq::TransPath, pq::BasicGraphPattern,
+                                 pq::Service, pq::SpatialQuery, pq::Minus,
+                                 pq::GroupGraphPattern, pq::Describe, pq::Load,
+                                 pq::MaterializedViewQuery, pq::MagicService>);
     return false;
   }
 };
