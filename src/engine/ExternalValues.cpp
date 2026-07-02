@@ -10,6 +10,7 @@
 #include "engine/ExternalValues.h"
 
 #include "absl/strings/str_cat.h"
+#include "parser/ExternalValuesQuery.h"
 #include "util/HashSet.h"
 
 // ____________________________________________________________________________

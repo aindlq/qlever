@@ -26,9 +26,12 @@ namespace parsedQuery {
 // here and parses into a generic `MagicService` node (see
 // `GraphPatternOperation.h`).
 //
-// Services self-register via a static initializer (see e.g.
-// a service`s own .cpp). The registry is a function-local static, so
-// registration order across translation units is safe.
+// Services register a factory either from a static initializer in their own
+// translation unit (drop-in services under `src/services/`, kept alive via an
+// OBJECT library) or via an explicit `register...()` function called before
+// the first lookup (the migrated built-ins; see `BuiltinMagicServiceParsers`).
+// The registry is a function-local static, so registration order across
+// translation units is safe.
 class MagicServiceRegistry {
  public:
   using Iri = ad_utility::triple_component::Iri;
