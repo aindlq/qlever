@@ -431,28 +431,25 @@ class QueryPlanner {
   static std::optional<SubtreePlan> createJoinWithPathSearch(
       const SubtreePlan& a, const SubtreePlan& b, const JoinColumns& jcs);
 
-  // Helper that returns `true` for each of the subtree plans `a` and `b` iff
-  // the subtree plan is a spatial join and it is not yet fully constructed
-  // (it does not have both children set)
-  static std::pair<bool, bool> checkSpatialJoin(const SubtreePlan& a,
-                                                const SubtreePlan& b);
+  // Returns `true` for each of the subtree plans `a` and `b` iff its root is an
+  // `IncompleteJoinOperation` (a `SpatialJoin` or a registry-based magic
+  // service, e.g. an outer-bound `VectorSearchJoin`) still missing a join
+  // child. Such an operation must not take part in a normal join.
+  static std::pair<bool, bool> checkIncompleteJoin(const SubtreePlan& a,
+                                                   const SubtreePlan& b);
 
-  // if one of the inputs is a spatial join which is compatible with the other
-  // input, then add that other input to the spatial join as a child instead of
-  // creating a normal join.
-  static std::optional<SubtreePlan> createSpatialJoin(const SubtreePlan& a,
-                                                      const SubtreePlan& b,
-                                                      const JoinColumns& jcs);
-
-  // The generic pendants to `checkSpatialJoin`/`createSpatialJoin` for
-  // registry-based magic services whose operations implement
-  // `IncompleteJoinOperation` (see `engine/MagicServicePlanning.h`): an
-  // operation that still misses its join child must not take part in normal
-  // joins; instead the other input is added to it as that child.
-  static std::pair<bool, bool> checkMagicServiceJoin(const SubtreePlan& a,
-                                                     const SubtreePlan& b);
-  static std::optional<SubtreePlan> createMagicServiceJoin(
-      const SubtreePlan& a, const SubtreePlan& b, const JoinColumns& jcs);
+  // If exactly one input is an incomplete `IncompleteJoinOperation` compatible
+  // with the other input, complete it by adding the other input as its missing
+  // child. `.completed` holds the resulting plan; if empty, `.fallThrough`
+  // says whether the caller should still try a normal join (spatial filter
+  // substitution) or block the pairing entirely (completion required).
+  struct IncompleteJoinResult {
+    std::optional<SubtreePlan> completed;
+    bool fallThrough = false;
+  };
+  static IncompleteJoinResult createIncompleteJoin(const SubtreePlan& a,
+                                                   const SubtreePlan& b,
+                                                   const JoinColumns& jcs);
 
   // Helper that generates `IndexScan` query plans on materialized views if they
   // can be used to avoid joins between some of the `triples`. The resulting

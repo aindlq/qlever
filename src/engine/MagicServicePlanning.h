@@ -64,29 +64,46 @@ class MagicServicePlanningContext {
 using MagicServicePlanner = std::function<void(
     MagicServicePlanningContext&, parsedQuery::MagicServiceQuery&)>;
 
-// Interface for operations of registry-based magic services that take one side
-// of a binary join from the SURROUNDING query (mirroring how `SpatialJoin` is
-// planned): the handler adds the operation as an "incomplete" leaf whose
-// variable-to-column map exposes the join variable as a possibly-undefined
-// column; when the join enumeration meets a subtree that binds this variable,
-// it completes the operation via `addJoinChild` instead of creating a normal
-// join. An operation that is still incomplete at execution time must throw a
-// clear user-facing error (the query then contains no other occurrence of the
-// join variable).
+// Interface for a binary-join operation that takes one (or both) of its join
+// sides from the SURROUNDING query, planned by an "incomplete leaf" + join
+// completion instead of a normal join. Both the built-in `SpatialJoin` and
+// registry-based magic services (e.g. an outer-bound `VectorSearchJoin`)
+// implement it, so `QueryPlanner` has a single generic completion path.
+//
+// The operation is planned as an incomplete leaf whose variable-to-column map
+// exposes its still-missing join variable(s) as possibly-undefined columns;
+// when the join enumeration meets a subtree that binds one of them, the planner
+// completes the operation via `addJoinChild` instead of creating a normal join.
+// An operation still incomplete at execution time must throw a clear
+// user-facing error.
 class IncompleteJoinOperation {
  public:
   virtual ~IncompleteJoinOperation() = default;
 
-  // False while the join child is still missing.
+  // False while a required join child is still missing.
   virtual bool isJoinConstructed() const = 0;
 
-  // The variable that the surrounding query has to bind.
-  virtual const Variable& joinVariable() const = 0;
+  // True iff `var` is a still-missing join variable that the surrounding query
+  // can bind to (partially) complete this operation. (An operation may expose
+  // OUTPUT variables too; those are not join variables and return false, which
+  // makes the planner complete via a join variable in another order.)
+  virtual bool canBindJoinVariable(const Variable& var) const = 0;
 
-  // A NEW, completed operation with `child` -- a subtree that binds
-  // `joinVariable()` -- as the missing side.
+  // When the operation is connected to the rest of the query through MORE than
+  // one variable at once: if this returns true a normal join between the two
+  // sides is acceptable (the planner falls through to it), otherwise the
+  // connection is unsupported and the planner reports
+  // `multipleJoinVariablesError()`. (True for a spatial join that merely
+  // substitutes a geo filter; false for a service that requires completion.)
+  virtual bool allowsNormalJoinOnMultipleVariables() const { return false; }
+
+  // The user-facing error for an unsupported multi-variable connection.
+  virtual std::string multipleJoinVariablesError() const = 0;
+
+  // A NEW operation with `child` (which binds `var`, one of the missing join
+  // variables) added as that side.
   virtual std::shared_ptr<Operation> addJoinChild(
-      std::shared_ptr<QueryExecutionTree> child) const = 0;
+      std::shared_ptr<QueryExecutionTree> child, const Variable& var) const = 0;
 };
 
 // Registry of planner handlers, keyed by the concrete `MagicServiceQuery`

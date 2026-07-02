@@ -56,12 +56,15 @@ class VectorSearchJoin : public Operation, public IncompleteJoinOperation {
   size_t getCostEstimate() override;
 
   // `IncompleteJoinOperation` interface (see `engine/MagicServicePlanning.h`).
+  // The single missing join variable is `<left>`.
   bool isJoinConstructed() const override { return child_ != nullptr; }
-  const Variable& joinVariable() const override {
-    return config_.leftVariable_.value();
+  bool canBindJoinVariable(const Variable& var) const override {
+    return var == config_.leftVariable_.value();
   }
+  std::string multipleJoinVariablesError() const override;
   std::shared_ptr<Operation> addJoinChild(
-      std::shared_ptr<QueryExecutionTree> child) const override;
+      std::shared_ptr<QueryExecutionTree> child,
+      const Variable& var) const override;
 
  private:
   uint64_t getSizeEstimateBeforeLimit() override;

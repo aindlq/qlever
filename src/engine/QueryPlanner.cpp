@@ -2276,41 +2276,28 @@ std::vector<SubtreePlan> QueryPlanner::createJoinCandidates(
 
   // Incomplete binary-join operations -- a `SpatialJoin` still missing a child,
   // or a registry-based `IncompleteJoinOperation` (e.g. an outer-bound
-  // `VectorSearchJoin`) -- must not take part in a normal join, and must not
-  // consume ANOTHER incomplete op as their child (which would bury it where the
-  // completion machinery, that only inspects the plan root, can never reach
-  // it). So if BOTH sides are incomplete (of either kind), block this pairing
-  // and let the planner complete each in another enumeration order.
-  auto [aSpatial, bSpatial] = checkSpatialJoin(a, b);
-  auto [aMagic, bMagic] = checkMagicServiceJoin(a, b);
-  bool aIncomplete = aSpatial || aMagic;
-  bool bIncomplete = bSpatial || bMagic;
-  if (aIncomplete && bIncomplete) {
-    return candidates;
-  }
-
-  // If exactly one input is an incomplete SpatialJoin and the other is
-  // compatible, add it as a child to the spatial join. Evaluated before any
-  // normal-join option so no other candidates get considered.
-  if (auto opt = createSpatialJoin(a, b, jcs)) {
-    candidates.push_back(std::move(opt.value()));
-    return candidates;
-  }
-
-  // The same for a registry-based magic service whose operation takes one join
-  // side from the surrounding query. Because such an operation exposes its
-  // OUTPUT variables (so that consumers of them stay in the same connected
-  // component), a subtree may share one of those output variables with it --
-  // that pairing must NOT become a normal join (the operation would never be
-  // completed). So whenever either side is an incomplete magic-service
-  // operation, this is the ONLY place its join is handled: we either complete
-  // it (connection == the join variable) or block the pair (empty candidates)
-  // so the planner completes it in another order.
-  if (aMagic || bMagic) {
-    if (auto opt = createMagicServiceJoin(a, b, jcs)) {
-      candidates.push_back(std::move(opt.value()));
+  // `VectorSearchJoin`) -- take one join side from the surrounding query. They
+  // must not take part in an ordinary join, and must not consume ANOTHER
+  // incomplete op as their child (which would bury it where the completion
+  // machinery, that only inspects the plan root, can never reach it). So this
+  // is the ONLY place such a pairing is handled: if both sides are incomplete,
+  // block; otherwise complete the one that is (or block / fall through per its
+  // policy).
+  if (auto [aInc, bInc] = checkIncompleteJoin(a, b); aInc || bInc) {
+    if (aInc && bInc) {
+      return candidates;
     }
-    return candidates;
+    auto result = createIncompleteJoin(a, b, jcs);
+    if (result.completed.has_value()) {
+      candidates.push_back(std::move(result.completed.value()));
+      return candidates;
+    }
+    if (!result.fallThrough) {
+      // Block this pairing so the operation is completed in another order.
+      return candidates;
+    }
+    // Otherwise (a geo-filter-substitute spatial join sharing multiple
+    // variables) fall through to the normal-join handling below.
   }
 
   if (a.type == SubtreePlan::MINUS) {
@@ -2379,68 +2366,8 @@ std::vector<SubtreePlan> QueryPlanner::createJoinCandidates(
 }
 
 // _____________________________________________________________________________
-std::pair<bool, bool> QueryPlanner::checkSpatialJoin(const SubtreePlan& a,
-                                                     const SubtreePlan& b) {
-  auto isIncompleteSpatialJoin = [](const SubtreePlan& sj) {
-    auto sjCasted = std::dynamic_pointer_cast<const SpatialJoin>(
-        sj._qet->getRootOperation());
-    return sjCasted != nullptr && !sjCasted->isConstructed();
-  };
-  return {isIncompleteSpatialJoin(a), isIncompleteSpatialJoin(b)};
-}
-
-// _____________________________________________________________________________
-auto QueryPlanner::createSpatialJoin(const SubtreePlan& a, const SubtreePlan& b,
-                                     const JoinColumns& jcs)
-    -> std::optional<SubtreePlan> {
-  auto [aIs, bIs] = checkSpatialJoin(a, b);
-
-  // Exactly one of the inputs must be a SpatialJoin.
-  if (aIs == bIs) {
-    return std::nullopt;
-  }
-
-  const SubtreePlan& spatialSubtreePlan = aIs ? a : b;
-  const SubtreePlan& otherSubtreePlan = aIs ? b : a;
-
-  std::shared_ptr<Operation> op = spatialSubtreePlan._qet->getRootOperation();
-  auto spatialJoin = static_cast<SpatialJoin*>(op.get());
-
-  if (spatialJoin->isConstructed()) {
-    return std::nullopt;
-  }
-
-  if (jcs.size() > 1) {
-    // If a spatial join operation substitutes a geometric relation filter,
-    // we might have multiple spatial joins for different pairs of variables
-    // that share some variable.
-    if (spatialJoin->getSubstitutesFilterOp()) {
-      return std::nullopt;
-    }
-    // TODO<ullingerc> Handle this case for a non-substitute spatial join (e.g.
-    // a `SpatialQuery` as `SERVICE qlss:`, explicitly given by the user's
-    // query): If multiple such spatial joins occur on the same pair of
-    // variables, all except for one should be rewritten to a FILTER if they
-    // request a maximum distance search (for nearest neighbor search this is
-    // not possible). This however requires changes to `geof:distance` first.
-    AD_THROW(
-        "Currently, if both sides of a SpatialJoin are variables, then the"
-        "SpatialJoin must be the only connection between these variables");
-  }
-  ColumnIndex ind = aIs ? jcs[0][1] : jcs[0][0];
-  const Variable& var =
-      otherSubtreePlan._qet->getVariableAndInfoByColumnIndex(ind).first;
-
-  auto newSpatialJoin = spatialJoin->addChild(otherSubtreePlan._qet, var);
-
-  SubtreePlan plan = makeSubtreePlan<SpatialJoin>(std::move(newSpatialJoin));
-  mergeSubtreePlanIds(plan, a, b);
-  return plan;
-}
-
-// _____________________________________________________________________________
-std::pair<bool, bool> QueryPlanner::checkMagicServiceJoin(
-    const SubtreePlan& a, const SubtreePlan& b) {
+std::pair<bool, bool> QueryPlanner::checkIncompleteJoin(const SubtreePlan& a,
+                                                        const SubtreePlan& b) {
   auto isIncomplete = [](const SubtreePlan& plan) {
     auto casted = std::dynamic_pointer_cast<const IncompleteJoinOperation>(
         plan._qet->getRootOperation());
@@ -2450,74 +2377,67 @@ std::pair<bool, bool> QueryPlanner::checkMagicServiceJoin(
 }
 
 // _____________________________________________________________________________
-auto QueryPlanner::createMagicServiceJoin(
+auto QueryPlanner::createIncompleteJoin(
     const SubtreePlan& a, const SubtreePlan& b,
-    const JoinColumns& jcs) -> std::optional<SubtreePlan> {
-  auto [aIs, bIs] = checkMagicServiceJoin(a, b);
-
-  // Exactly one of the inputs must be an incomplete magic-service join.
+    const JoinColumns& jcs) -> IncompleteJoinResult {
+  auto [aIs, bIs] = checkIncompleteJoin(a, b);
+  // Exactly one input must be an incomplete join operation (the caller has
+  // already handled the both-incomplete case).
   if (aIs == bIs) {
-    return std::nullopt;
+    return {std::nullopt, false};
   }
 
-  const SubtreePlan& servicePlan = aIs ? a : b;
+  const SubtreePlan& incompletePlan = aIs ? a : b;
   const SubtreePlan& otherPlan = aIs ? b : a;
   auto incomplete = std::dynamic_pointer_cast<const IncompleteJoinOperation>(
-      servicePlan._qet->getRootOperation());
+      incompletePlan._qet->getRootOperation());
 
   // Taking the join side from an OPTIONAL/MINUS pattern would silently change
   // the join semantics (left-join / set-minus become inner joins); it is not
-  // supported. Use the nested-pattern form of the service inside such patterns.
-  if (servicePlan.type != SubtreePlan::BASIC ||
+  // supported.
+  if (incompletePlan.type != SubtreePlan::BASIC ||
       otherPlan.type != SubtreePlan::BASIC) {
-    AD_THROW(absl::StrCat(
-        "The join variable ", incomplete->joinVariable().name(),
-        " of a magic service cannot be taken from an OPTIONAL or MINUS "
-        "pattern. Move the variable binding out of the OPTIONAL/MINUS, or use "
-        "the nested-pattern form of the service."));
+    AD_THROW(
+        "The join variable of an incomplete join operation (a spatial join or "
+        "a magic service) cannot be taken from an OPTIONAL or MINUS pattern. "
+        "Move the variable binding out of the OPTIONAL/MINUS, or use a form "
+        "that keeps the join inside it.");
   }
   // A LIMIT/OFFSET on the incomplete operation (e.g. it is the root of a
   // subquery) would be dropped when the operation is rebuilt on completion.
-  if (!servicePlan._qet->getRootOperation()
+  if (!incompletePlan._qet->getRootOperation()
            ->getLimitOffset()
            .isUnconstrained()) {
-    AD_THROW(absl::StrCat(
-        "A magic service whose join variable ",
-        incomplete->joinVariable().name(),
-        " comes from the surrounding query cannot be the outermost operation "
-        "of a subquery with LIMIT/OFFSET."));
+    AD_THROW(
+        "An incomplete join operation whose join variable comes from the "
+        "surrounding query cannot be the outermost operation of a subquery "
+        "with LIMIT/OFFSET.");
   }
 
-  // The connection must be EXACTLY the join variable. If the shared variable
-  // is one of the operation's OUTPUT variables (which it also exposes), block
-  // this pairing (return nullopt -> the caller adds no candidate) so the
-  // planner completes the operation via its join variable in another order.
-  //
-  // When there is more than one shared variable (`jcs.size() > 1`) the two
-  // sides also share an output variable, and there is no completion order that
-  // avoids it -- report a clear error instead of blocking into an internal
-  // "no query plan" assertion (mirrors how `SpatialJoin` handles the analogous
-  // multi-variable case).
+  // More than one shared variable: either a normal join is acceptable (a
+  // spatial join that merely substitutes a geo filter -> fall through) or the
+  // connection is unsupported (-> clear error).
   if (jcs.size() > 1) {
-    AD_THROW(absl::StrCat(
-        "A magic service whose join variable ",
-        incomplete->joinVariable().name(),
-        " comes from the surrounding query must be connected to the rest of "
-        "the query through that variable only; it also shares one of its "
-        "result variables. Rename the shared result variable, or bind the "
-        "extra connection in a separate pattern."));
+    if (incomplete->allowsNormalJoinOnMultipleVariables()) {
+      return {std::nullopt, /*fallThrough=*/true};
+    }
+    AD_THROW(incomplete->multipleJoinVariablesError());
   }
+
   ColumnIndex ind = aIs ? jcs[0][1] : jcs[0][0];
   const Variable& var =
       otherPlan._qet->getVariableAndInfoByColumnIndex(ind).first;
-  if (var != incomplete->joinVariable()) {
-    return std::nullopt;
+  // If the connection is not one of the operation's join variables (it may
+  // expose OUTPUT variables too), block this pairing so it is completed via a
+  // join variable in another enumeration order.
+  if (!incomplete->canBindJoinVariable(var)) {
+    return {std::nullopt, false};
   }
 
   SubtreePlan plan =
-      makeSubtreePlan<Operation>(incomplete->addJoinChild(otherPlan._qet));
+      makeSubtreePlan<Operation>(incomplete->addJoinChild(otherPlan._qet, var));
   mergeSubtreePlanIds(plan, a, b);
-  return plan;
+  return {std::move(plan), false};
 }
 
 // _____________________________________________________________________________________________________________________

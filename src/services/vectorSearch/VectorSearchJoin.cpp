@@ -80,8 +80,20 @@ VectorSearchJoin::VectorSearchJoin(
 }
 
 // ____________________________________________________________________________
+std::string VectorSearchJoin::multipleJoinVariablesError() const {
+  return absl::StrCat(
+      "A vector search whose join variable ",
+      config_.leftVariable_.value().name(),
+      " comes from the surrounding query must be connected to the rest of the "
+      "query through that variable only; it also shares one of its result "
+      "variables. Rename the shared result variable, or bind the extra "
+      "connection in a separate pattern.");
+}
+
+// ____________________________________________________________________________
 std::shared_ptr<Operation> VectorSearchJoin::addJoinChild(
-    std::shared_ptr<QueryExecutionTree> child) const {
+    std::shared_ptr<QueryExecutionTree> child, const Variable& var) const {
+  AD_CONTRACT_CHECK(var == config_.leftVariable_.value());
   auto completed = std::make_shared<VectorSearchJoin>(
       getExecutionContext(), config_, std::move(child));
   // Carry over any warnings accrued on the incomplete operation (mirrors
