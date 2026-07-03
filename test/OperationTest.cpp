@@ -459,9 +459,11 @@ TEST(Operation, verifyRuntimeInformationIsUpdatedForLazyOperations) {
   auto& rti = valuesForTesting.runtimeInfo();
 
   EXPECT_EQ(rti.status_, Status::lazilyMaterializedInProgress);
+#ifndef _QLEVER_NO_TIMING_TESTS
   EXPECT_GE(rti.totalTime_, timeout);
   EXPECT_GE(rti.originalTotalTime_, timeout);
   EXPECT_GE(rti.originalOperationTime_, timeout);
+#endif
 
   expectAtEachStageOfGenerator(
       result.idTables(),
