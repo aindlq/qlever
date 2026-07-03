@@ -5,6 +5,7 @@
 #include "util/CancellationHandle.h"
 
 #include "util/Exception.h"
+#include "util/PortableTimedWait.h"
 
 namespace ad_utility {
 using detail::CancellationMode;
@@ -48,8 +49,12 @@ CPP_member_def auto CancellationHandle<Mode>::startWatchDogInternal()
         // already
         break;
       }
-    } while (!watchDogState_.conditionVariable_.wait_for(
-        lock, DESIRED_CANCELLATION_CHECK_INTERVAL,
+      // Wait for the check interval, waking early once a stop is requested
+      // (`running_` cleared). See `util/PortableTimedWait.h` for the
+      // platform-specific wait mechanism.
+    } while (!ad_utility::waitForPredicateOrTimeout(
+        watchDogState_.conditionVariable_, lock,
+        DESIRED_CANCELLATION_CHECK_INTERVAL,
         [this]() { return !watchDogState_.running_; }));
   }};
 }

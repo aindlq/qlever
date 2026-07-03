@@ -18,10 +18,13 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <type_traits>
 
 #include "util/Exception.h"
 #include "util/Forward.h"
 #include "util/Log.h"
+#include "util/PortableFileOpen.h"
+#include "util/PositionedReader.h"
 
 namespace ad_utility {
 //! Wrapper class for file access. Is supposed to provide
@@ -36,6 +39,11 @@ class File {
 
   string name_;
   FILE* file_;
+
+  // Strategy for positioned reads (`read` at an explicit offset) with an
+  // optional memory-mapped fast path; platform-selected in
+  // `util/PositionedReader.h`. Reset in `open`/`close`.
+  PositionedReader positionedReader_;
 
  public:
   //! Default constructor
@@ -65,11 +73,14 @@ class File {
 
     file_ = std::exchange(rhs.file_, nullptr);
     name_ = std::move(rhs.name_);
+    positionedReader_ = std::move(rhs.positionedReader_);
     return *this;
   }
 
   File(File&& rhs) noexcept
-      : name_{std::move(rhs.name_)}, file_{std::exchange(rhs.file_, nullptr)} {}
+      : name_{std::move(rhs.name_)}, file_{std::exchange(rhs.file_, nullptr)} {
+    positionedReader_ = std::move(rhs.positionedReader_);
+  }
 
   //! Destructor closes file if still open
   ~File() {
@@ -78,7 +89,11 @@ class File {
 
   //! OPEN FILE (exit with error if fails, returns true otherwise)
   bool open(const char* filename, const char* mode) {
-    file_ = fopen(filename, mode);
+    // A reused `File` (re-`open`ed without an intervening `close`) must not
+    // keep serving positioned reads from the *previous* file's mapping/handles;
+    // drop them so they are re-opened lazily against the new file.
+    positionedReader_.close();
+    file_ = detail::openFilePortable(filename, mode);
     if (file_ == NULL) {
       std::stringstream err;
       err << "! ERROR opening file \"" << filename << "\" with mode \"" << mode
@@ -108,6 +123,7 @@ class File {
     if (not isOpen()) {
       return true;
     }
+    positionedReader_.close();
     if (fclose(file_) != 0) {
       std::cout << "! ERROR closing file \"" << name_ << "\" ("
                 << strerror(errno) << ")" << std::endl;
@@ -160,7 +176,11 @@ class File {
     while (bytesRead < nofBytesToRead) {
       size_t toRead = nofBytesToRead - bytesRead;
 
-      const ssize_t ret = pread(fd, to + bytesRead, toRead, offset + bytesRead);
+      // Served from a memory-mapped view via `memcpy` when one is enabled,
+      // otherwise via `pread` (POSIX) / the positioned-`ReadFile` handle pool
+      // (Windows). See `util/PositionedReader.h`.
+      const ssize_t ret = positionedReader_.readAtOffset(
+          fd, name_, to + bytesRead, toRead, offset + bytesRead);
 
       if (ret < 0) {
         return ret;
@@ -168,6 +188,17 @@ class File {
       bytesRead += ret;
     }
     return bytesRead;
+  }
+
+  // Enable memory-mapped positioned reads. Afterwards `read(..., offset)` is
+  // served from a memory-mapped view (a `memcpy`) instead of a per-call read,
+  // dramatically faster for the many small random reads of the on-disk
+  // vocabulary. Always active on Windows; opt-in on POSIX (gated by
+  // `QLEVER_LINUX_MMAP`, so the default Linux build keeps using `pread`).
+  // Best-effort: on a mapping failure the read path is kept. Intended for
+  // read-only files that fit in RAM; call after `open(..., "r")`.
+  void enableMemoryMappedReads() {
+    positionedReader_.enableMemoryMappedReads(name_);
   }
 
   //! Returns the number of bytes from the beginning
@@ -219,6 +250,11 @@ inline void deleteFile(const std::filesystem::path& path,
 namespace detail {
 template <typename Stream, bool forWriting>
 Stream makeFilestream(const std::filesystem::path& path, auto&&... args) {
+  // On Windows a truncating rewrite must POSIX-unlink the old file first (it
+  // may still be memory-mapped); a no-op on POSIX. See `PortableFileOpen.h`.
+  if constexpr (forWriting) {
+    prepareTruncatingRewrite(path, args...);
+  }
   Stream stream{path.string(), AD_FWD(args)...};
   std::string_view mode = forWriting ? "for writing" : "for reading";
   if (!stream.is_open()) {

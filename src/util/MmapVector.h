@@ -12,6 +12,7 @@
 #include "util/Exception.h"
 #include "util/ExceptionHandling.h"
 #include "util/File.h"
+#include "util/FileMapping.h"
 #include "util/Forward.h"
 #include "util/Iterators.h"
 #include "util/ResetWhenMoved.h"
@@ -114,8 +115,7 @@ struct MmapVectorMetaData {
 class CreateTag {};
 class ReuseTag {};
 
-// Enum that specifies access patterns to this array
-enum class AccessPattern { None, Random, Sequential };
+// `AccessPattern` is defined in `util/FileMapping.h` (included above).
 
 // STL-like class which implements a dynamic array (similar to std::vector)
 // whose contents are stored persistently in a file on memory and are accessed
@@ -326,6 +326,10 @@ class MmapVector {
   ResetWhenMoved<size_t, 0> _bytesize;
   std::string _filename = "";
   AccessPattern _pattern = AccessPattern::None;
+  // Owns the platform mapping resources (nothing extra on POSIX, the
+  // Boost.Interprocess region plus its share-delete file handle on Windows).
+  // `_ptr` points into whatever this maps.
+  FileMapping fileMapping_;
   static constexpr float ResizeFactor = 1.5;
 };
 
