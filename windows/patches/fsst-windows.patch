@@ -1,0 +1,13 @@
+diff --git a/fsst_avx512.cpp b/fsst_avx512.cpp
+index 150683d..5dfd0a2 100644
+--- a/fsst_avx512.cpp
++++ b/fsst_avx512.cpp
+@@ -20,7 +20,7 @@
+ #if defined(__x86_64__) || defined(_M_X64)
+ #include <immintrin.h>
+ 
+-#ifdef _WIN32
++#if defined(_MSC_VER)
+ namespace libfsst {
+ bool fsst_hasAVX512() {
+    int info[4];
