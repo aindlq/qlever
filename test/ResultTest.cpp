@@ -236,15 +236,21 @@ TEST(Result, verifyRunOnNewChunkComputedFiresCorrectly) {
         if (callCounter == 1) {
           EXPECT_EQ(idTable1, idTable);
           EXPECT_EQ(pair.localVocab_.size(), 1);
+#ifndef _QLEVER_NO_TIMING_TESTS
           EXPECT_GE(duration, 1ms);
+#endif
         } else if (callCounter == 2) {
           EXPECT_EQ(idTable2, idTable);
           EXPECT_EQ(pair.localVocab_.size(), 0);
+#ifndef _QLEVER_NO_TIMING_TESTS
           EXPECT_GE(duration, 3ms);
+#endif
         } else if (callCounter == 3) {
           EXPECT_EQ(idTable3, idTable);
           EXPECT_EQ(pair.localVocab_.size(), 0);
+#ifndef _QLEVER_NO_TIMING_TESTS
           EXPECT_GE(duration, 5ms);
+#endif
         }
       },
       [&](Result::GeneratorState state) {
