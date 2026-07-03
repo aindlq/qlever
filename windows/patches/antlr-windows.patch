@@ -1,0 +1,21 @@
+diff --git a/runtime/Cpp/runtime/src/internal/Synchronization.h b/runtime/Cpp/runtime/src/internal/Synchronization.h
+index 4f969a8ab..5ca12e416 100644
+--- a/runtime/Cpp/runtime/src/internal/Synchronization.h
++++ b/runtime/Cpp/runtime/src/internal/Synchronization.h
+@@ -80,7 +80,16 @@ namespace antlr4::internal {
+   // Must be compatible with C++ standard library SharedMutex requirement.
+   class ANTLR4CPP_PUBLIC SharedMutex final {
+   public:
++#if ANTLR4CPP_USING_ABSEIL
+     SharedMutex() = default;
++#else
++    // Eager-initialize the underlying std::shared_mutex to avoid winpthreads'
++    // lazy rwlock-init race (mingw-w64 #883), which silently breaks mutual
++    // exclusion on cold concurrent first use. A single-threaded lock/unlock in
++    // the constructor forces the pthread_rwlock to be created once, before the
++    // mutex is shared between threads.
++    SharedMutex() { _impl.lock(); _impl.unlock(); }
++#endif
+ 
+     // No copying or moving, we are as strict as possible to support other implementations.
+     SharedMutex(const SharedMutex&) = delete;

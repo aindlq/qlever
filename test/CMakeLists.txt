@@ -24,7 +24,17 @@ endfunction()
 # if a test binary requires multiple sources
 function(linkAndDiscoverTest basename)
     linkTest(${basename} ${ARGN})
-    gtest_discover_tests(${basename} ${basename} DISCOVERY_TIMEOUT 600 PROPERTIES LABELS "${basename}")
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename})
+    # On Windows a file can't be deleted/renamed while another test still has it
+    # open, so serialize each binary's own tests (RESOURCE_LOCK) to avoid
+    # temp-file clashes between concurrently-running cases. On POSIX this isn't
+    # needed and would only serialize `ctest -j` needlessly, so keep the upstream
+    # parallel behavior there.
+    set(_resourceLock "")
+    if (WIN32)
+        set(_resourceLock RESOURCE_LOCK "${basename}")
+    endif ()
+    gtest_discover_tests(${basename} ${basename} DISCOVERY_TIMEOUT 600 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename} PROPERTIES LABELS "${basename}" ${_resourceLock})
 endfunction()
 
 # Same as `linkAndDiscoverTest`, but marks the discovered tests as
@@ -35,7 +45,8 @@ endfunction()
 # issues should be fixed via per-test unique filenames instead.
 function(linkAndDiscoverTestSerial basename)
     linkTest(${basename} ${ARGN})
-    gtest_discover_tests(${basename} ${basename} DISCOVERY_TIMEOUT 600 PROPERTIES RUN_SERIAL
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename})
+    gtest_discover_tests(${basename} ${basename} DISCOVERY_TIMEOUT 600 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename} PROPERTIES RUN_SERIAL
             TRUE LABELS "${basename}")
 endfunction()
 
@@ -248,6 +259,10 @@ addLinkAndDiscoverTest(PriorityQueueTest)
 
 addLinkAndDiscoverTestNoLibs(SynchronizedTest)
 
+addLinkAndDiscoverTestNoLibs(ThreadAgnosticSharedMutexTest)
+
+
+
 addLinkAndDiscoverTest(AllocatorWithLimitTest)
 
 addLinkAndDiscoverTestNoLibs(AlignedAllocatorTest)
@@ -450,6 +465,19 @@ endif ()
 addLinkAndDiscoverTest(UniqueCleanupTest)
 
 addLinkAndDiscoverTest(WebSocketSessionTest http)
+if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # WORKAROUND: GCC 13 on MinGW (SEH, x64) miscompiles the SEH unwind tables
+    # (.pdata/.xdata) for some C++20 coroutine frames. When an exception (e.g. an
+    # Asio `operation_aborted` from a cancellation) unwinds through such a frame,
+    # `_Unwind_Resume` jumps to a NULL target -> STATUS_BAD_FUNCTION_TABLE crash.
+    # The faulting frame is a `.cold` clone; disabling the hot/cold block
+    # partitioning that creates `.cold`/`.text.unlikely` sections avoids it.
+    # set_source_files_properties (not target_compile_options) so this also works
+    # with SINGLE_TEST_BINARY=ON, where WebSocketSessionTest.cpp is compiled into
+    # QLeverAllUnitTestsMain and no per-test target exists.
+    set_source_files_properties(WebSocketSessionTest.cpp PROPERTIES
+            COMPILE_OPTIONS -fno-reorder-blocks-and-partition)
+endif ()
 
 addLinkAndDiscoverTest(QueryIdTest)
 

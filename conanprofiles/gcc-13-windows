@@ -1,0 +1,28 @@
+# Conan profile for the native Windows port: winlibs MinGW-w64 GCC 13.3 (UCRT,
+# posix threads, SEH) — the same GCC major as the Linux CI. Used to build the C
+# dependencies (ICU, OpenSSL, zstd, zlib, bzip2) from source on Windows. Boost
+# is NOT built through Conan here (see conanfile-windows-deps.txt and WINDOWS.md):
+# Conan's Boost recipe runs `b2`, which hits a MinGW archive bug, so Boost is
+# built from source separately in the CI workflow.
+[settings]
+os=Windows
+arch=x86_64
+build_type=Release
+compiler=gcc
+compiler.version=13
+# gnu20, not 20: with strict -std=c++20 winlibs GCC 13 defines __STRICT_ANSI__,
+# which disables the GNU `Q` __float128 literal suffix that libstdc++ <numbers>
+# relies on — building ICU then fails with "unable to find numeric literal
+# operator operator\"\"Q". gnu++20 keeps the suffix; the C deps don't need
+# strict ANSI. (The benchmark harness passes the same via -s:a compiler.cppstd.)
+compiler.cppstd=gnu20
+compiler.libcxx=libstdc++11
+compiler.threads=posix
+compiler.exception=seh
+
+[conf]
+tools.build:compiler_executables={"c": "gcc", "cpp": "g++"}
+# Autotools-based dependencies (OpenSSL, ICU) need a Unix shell + make; route
+# them through the runner's MSYS2 bash.
+tools.microsoft.bash:subsystem=msys2
+tools.microsoft.bash:path=C:/msys64/usr/bin/bash.exe
