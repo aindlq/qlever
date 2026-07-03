@@ -83,4 +83,10 @@ void VocabularyOnDisk::open(const std::string& filename) {
       ad_utility::MmapVectorMetaData::readFromFile(offsetsFile_).size_;
   AD_CORRECTNESS_CHECK(numOffsets > 0);
   size_ = numOffsets - 1;
+  // On Windows, serve the two small random reads per word lookup from a
+  // memory-mapped view (a `memcpy`) instead of a per-call `ReadFile`, which
+  // costs ~microseconds even when the data is warm in the OS cache. This is the
+  // hot path for string-heavy queries. No effect on other platforms.
+  file_.enableMemoryMappedReads();
+  offsetsFile_.enableMemoryMappedReads();
 }

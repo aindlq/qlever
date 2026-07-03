@@ -638,8 +638,9 @@ TEST(GeometryInfoTest, ParseGeoPointOrWktVisitor) {
   };
 
   // Test for `GeoPoint`.
-  EXPECT_THAT(parseGeoPointOrWkt(GeoPoint{1, 2}),
-              parseResultNear(ParseResult{POINT, DPoint(2, 1)}));
+  EXPECT_THAT(
+      parseGeoPointOrWkt(GeoPoint{1, 2}),
+      parseResultNear(ParseResult{util::geo::WKTType::POINT, DPoint(2, 1)}));
 
   // Explicit test for a real-world WKT string.
   EXPECT_THAT(

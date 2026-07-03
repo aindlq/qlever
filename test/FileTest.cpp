@@ -4,6 +4,11 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+
 #include "util/File.h"
 
 namespace ad_utility {
@@ -67,4 +72,66 @@ TEST(File, makeFilestream) {
   // Throw on nonexisting file
   ASSERT_THROW(ad_utility::makeIfstream("nonExisting1620349.datxyz"),
                std::runtime_error);
+}
+
+// `ad_utility::File` must do binary I/O (openWithPosixSharing passes
+// `_O_BINARY`). In text mode, writing would insert `\r` before each `\n` and
+// reading would stop at byte 0x1A (ctrl-Z = EOF), silently corrupting binary
+// data. On POSIX this is a no-op; on Windows it guards the `_O_BINARY` flag.
+TEST(File, BinaryModePreservesSpecialBytes) {
+  std::string filename = "testFileBinary.tmp";
+  const std::array<unsigned char, 10> bytes = {0x00, 0x0D, 0x0A, 0x1A, 0xFF,
+                                               0x0A, 0x0D, 0x1A, 0x41, 0x00};
+  {
+    ad_utility::File w(filename, "w");
+    w.write(bytes.data(), bytes.size());
+    w.close();
+  }
+  // Text mode would inflate the file (each `\n` -> `\r\n`).
+  EXPECT_EQ(std::filesystem::file_size(filename), bytes.size());
+  ad_utility::File r(filename, "r");
+  std::array<unsigned char, 10> got{};
+  EXPECT_EQ(r.read(got.data(), got.size(), 0),
+            static_cast<ssize_t>(bytes.size()));  // not truncated at 0x1A
+  EXPECT_EQ(got, bytes);                          // byte-identical round trip
+  r.close();
+  ad_utility::deleteFile(filename);
+}
+
+// The process-wide binary default (`_set_fmode(_O_BINARY)` in
+// `ProcessInit.cpp`): raw `fopen()`/`open()` without `"b"`/`_O_BINARY` must
+// still be binary, because dependencies (e.g. libspatialjoin) open binary
+// files that way. Guards the global fmode on Windows; a no-op on POSIX.
+TEST(File, RawFopenDefaultsToBinaryMode) {
+  std::string filename = "testFileFmode.tmp";
+  const unsigned char bytes[8] = {0x0A, 0x0D, 0x1A, 0x00,
+                                  0xFF, 0x0A, 0x1A, 0x42};
+  FILE* w = std::fopen(filename.c_str(), "w");  // NB: no "b"
+  ASSERT_NE(w, nullptr);
+  ASSERT_EQ(std::fwrite(bytes, 1, sizeof(bytes), w), sizeof(bytes));
+  std::fclose(w);
+  EXPECT_EQ(std::filesystem::file_size(filename), sizeof(bytes));  // no `\r`
+  FILE* r = std::fopen(filename.c_str(), "r");                     // NB: no "b"
+  ASSERT_NE(r, nullptr);
+  unsigned char got[8] = {};
+  EXPECT_EQ(std::fread(got, 1, sizeof(got), r),
+            sizeof(got));  // not cut at 0x1A
+  std::fclose(r);
+  EXPECT_EQ(std::memcmp(got, bytes, sizeof(bytes)), 0);
+  ad_utility::deleteFile(filename);
+}
+
+// POSIX unlink-while-open semantics (`FILE_SHARE_DELETE` in
+// `openWithPosixSharing`): an open file must be deletable — QLever's
+// index-rebuild logic relies on it. On Windows this fails without
+// `FILE_SHARE_DELETE`; on POSIX it always works.
+TEST(File, OpenFileCanBeDeletedWhileOpen) {
+  std::string filename = "testFileShareDelete.tmp";
+  ad_utility::File f(filename, "w");
+  f.write("xyz", 3);
+  std::error_code ec;
+  const bool removed = std::filesystem::remove(filename, ec);
+  EXPECT_TRUE(removed) << "could not delete an open file (FILE_SHARE_DELETE?): "
+                       << ec.message();
+  f.close();
 }

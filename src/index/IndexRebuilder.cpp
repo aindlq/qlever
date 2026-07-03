@@ -10,15 +10,20 @@
 #ifndef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
 #include "index/IndexRebuilder.h"
 
+#include <absl/cleanup/cleanup.h>
+
 #include <array>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/this_coro.hpp>
-#include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/use_future.hpp>
 #include <cstdint>
 #include <fstream>
+#include <future>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -37,6 +42,7 @@
 #include "util/HashMap.h"
 #include "util/InputRangeUtils.h"
 #include "util/Log.h"
+#include "util/jthread.h"
 
 namespace qlever::indexRebuilder {
 
@@ -391,19 +397,43 @@ indexRebuilder::IndexRebuildMapping materializeToIndex(
   auto patternThreads = static_cast<size_t>(index.usePatterns());
   size_t numberOfPermutations = index.hasAllPermutations() ? 8 : 4;
   namespace net = boost::asio;
-  net::thread_pool threadPool{patternThreads + numberOfPermutations};
-
-  // Collect the first exception thrown by any worker so it can be rethrown to
-  // the caller after `threadPool.join()`. Without this, exceptions escaping a
-  // `net::post` handler call `std::terminate` and exceptions from a detached
-  // `co_spawn` are silently swallowed. NOTE: `exceptionCollector` must outlive
-  // `threadPool`, since the worker callables capture a pointer to it via
-  // `wrap()` / `std::ref`; the declaration order here guarantees that.
+  // We deliberately do NOT use `boost::asio::thread_pool` here. On MinGW
+  // (winpthreads) `thread_pool::join()` can return before its worker threads
+  // have actually left `scheduler::run()`, so the pool's scheduler is freed
+  // while a worker is still using it -> use-after-free (observed as a crash on
+  // an asio worker thread inside `scheduler::run`). Instead we drive an
+  // `io_context` with explicitly managed worker threads and a teardown whose
+  // ordering we fully control: reset the work guard, join every worker, and
+  // only then (guaranteed by declaration order) destroy the `io_context`.
+  //
+  // `ioContext` and `exceptionCollector` are declared before `poolThreads`, so
+  // the workers are joined before either is destroyed (the worker callables
+  // capture `exceptionCollector` via `wrap()` and use the `io_context`'s
+  // executor). Without this, exceptions escaping a `net::post` handler would
+  // call `std::terminate` and exceptions from a `co_spawn` would be swallowed.
+  net::io_context ioContext;
   ad_utility::ExceptionCollector exceptionCollector;
+  auto ioWorkGuard = net::make_work_guard(ioContext);
+  std::vector<ad_utility::JThread> poolThreads;
+  poolThreads.reserve(patternThreads + numberOfPermutations);
+  for (size_t i = 0; i < patternThreads + numberOfPermutations; ++i) {
+    poolThreads.emplace_back([&ioContext]() { ioContext.run(); });
+  }
+  // Reset the work guard and join all workers exactly once -- before the
+  // `io_context` is destroyed and before we rethrow, even if a writer future
+  // throws below. After this runs, no worker thread can touch the scheduler.
+  absl::Cleanup joinPool{[&ioWorkGuard, &poolThreads]() {
+    ioWorkGuard.reset();
+    for (auto& t : poolThreads) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
+  }};
 
   if (index.usePatterns()) {
-    net::post(threadPool, exceptionCollector.wrap([&newIndex, &index,
-                                                   &insertionPositions]() {
+    net::post(ioContext, exceptionCollector.wrap([&newIndex, &index,
+                                                  &insertionPositions]() {
       newIndex.getPatterns() = index.getPatterns().cloneAndRemap(
           [&insertionPositions](const Id& oldId) {
             return remapVocabId(oldId, insertionPositions);
@@ -424,6 +454,9 @@ indexRebuilder::IndexRebuildMapping materializeToIndex(
     permutationSettings.push_back({{OPS, OSP}, false});
   }
 
+  // Collect a future per writer and wait on each explicitly (`future::get()`
+  // also rethrows any exception the writer threw).
+  std::vector<std::future<void>> writerFutures;
   for (const auto& [permutationEnums, isInternal] : permutationSettings) {
     auto [a, b] = permutationEnums;
     auto getPermutation =
@@ -432,16 +465,22 @@ indexRebuilder::IndexRebuildMapping materializeToIndex(
       return isInternal ? perm.internalPermutation() : perm;
     };
 
-    net::co_spawn(
-        threadPool,
+    writerFutures.push_back(net::co_spawn(
+        ioContext,
         createPermutationWriterTask(
             newIndex, getPermutation(a), getPermutation(b), isInternal,
             locatedTriplesSharedState, localVocabMapping, insertionPositions,
             blankNodeBlocks, minBlankNodeIndex, cancellationHandle),
-        std::ref(exceptionCollector));
+        net::use_future));
   }
 
-  threadPool.join();
+  for (auto& writerFuture : writerFutures) {
+    writerFuture.get();
+  }
+  // Reset the work guard and join every worker (this also lets the pattern
+  // `net::post` work finish), then surface any collected exception. After this,
+  // no worker thread can still be touching the `io_context`'s scheduler.
+  std::move(joinPool).Invoke();
   exceptionCollector.rethrowIfException();
 
   REBUILD_LOG_INFO << "Index rebuild completed" << std::endl;

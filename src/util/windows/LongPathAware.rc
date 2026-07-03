@@ -1,0 +1,5 @@
+// Embed the manifest that declares QLever executables long-path aware, so
+// that paths longer than MAX_PATH (260 characters) work whenever the system
+// has long paths enabled. Resource ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID,
+// type 24 = RT_MANIFEST (numeric literals to keep this file self-contained).
+1 24 "LongPathAware.manifest"
