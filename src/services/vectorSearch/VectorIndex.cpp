@@ -7,18 +7,24 @@
 
 #include "services/vectorSearch/VectorIndex.h"
 
+#include <sys/mman.h>
+
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
 
 #include "backports/algorithm.h"
 #include "services/vectorSearch/UsearchGraph.h"
+#include "services/vectorSearch/VectorMemory.h"
 #include "util/Exception.h"
 #include "util/HashSet.h"
+#include "util/Log.h"
 #include "util/MmapVector.h"
 #include "util/json.h"
 
@@ -101,6 +107,12 @@ class SearchSlotPool {
 };
 }  // namespace
 
+// Deleter for the `posix_memalign`-allocated aligned copy (freed with
+// `std::free`, NOT `delete`).
+struct AlignedFree {
+  void operator()(void* p) const { std::free(p); }
+};
+
 // All heavy members (mmaped files + usearch) live here so that neither usearch
 // nor `MmapVector` leak into the public header.
 struct VectorIndex::Impl {
@@ -113,6 +125,14 @@ struct VectorIndex::Impl {
   uu::casts_punned_t casts_;                   // f32 <-> storage scalar
   std::optional<GraphIndex> graph_;            // present iff meta_.hasHnsw_
   std::unique_ptr<SearchSlotPool> searchSlots_;
+  // Byte stride between consecutive rows in `.data` (>= `rowBytes()`). Derived
+  // from the metadata at open; for a `Residency::AlignedCopy` it becomes the
+  // padded stride of `alignedBuf_`.
+  size_t stride_ = 0;
+  // Optional 64-byte-aligned RAM copy of the whole matrix (`Residency`
+  // `AlignedCopy`). When set, `base()` reads from it (with the padded
+  // `stride_`) instead of the memory-mapped file.
+  std::unique_ptr<char, AlignedFree> alignedBuf_;
 
   size_t dim() const { return meta_.config_.dimensions_; }
   size_t rowBytes() const {
@@ -120,8 +140,16 @@ struct VectorIndex::Impl {
   }
   size_t numLive() const { return meta_.numVectors_ - meta_.numTombstones_; }
 
-  // Pointer to the start of row `i` in the flat store (storage scalar bytes).
-  const char* rowPtr(size_t i) const { return data_.data() + i * rowBytes(); }
+  // Base pointer of the active matrix: the aligned RAM copy if present, else
+  // the memory-mapped file.
+  const char* base() const {
+    return alignedBuf_ ? alignedBuf_.get() : data_.data();
+  }
+
+  // Pointer to the start of row `i` in the active matrix (storage scalar
+  // bytes). Uses the per-row stride, which may exceed `rowBytes()` when rows
+  // are padded for SIMD alignment; the metric reads only `dim()` scalars.
+  const char* rowPtr(size_t i) const { return base() + i * stride_; }
 
   // Encode an f32 query into the storage scalar. Returns a pointer to the
   // encoded bytes; `buffer` provides the storage when a conversion happens.
@@ -159,8 +187,7 @@ struct VectorIndex::Impl {
   }
 
   FlatStoreMetric graphMetric() const {
-    return FlatStoreMetric{data_.data(), rowBytes(), meta_.numVectors_,
-                           metric_.value()};
+    return FlatStoreMetric{base(), stride_, meta_.numVectors_, metric_.value()};
   }
 };
 
@@ -171,7 +198,8 @@ VectorIndex::VectorIndex(VectorIndex&&) noexcept = default;
 VectorIndex& VectorIndex::operator=(VectorIndex&&) noexcept = default;
 
 // ____________________________________________________________________________
-void VectorIndex::open(const std::string& basename, const std::string& name) {
+void VectorIndex::open(const std::string& basename, const std::string& name,
+                       Residency residency) {
   auto& impl = *impl_;
 
   // 1. Metadata.
@@ -188,12 +216,13 @@ void VectorIndex::open(const std::string& basename, const std::string& name) {
     AD_THROW("The metadata file of vector index \"" + name + "\" (" +
              vectorMetaFile(basename, name) + ") is malformed: " + e.what());
   }
-  if (impl.meta_.version_ != VECTOR_INDEX_VERSION) {
+  if (!isSupportedVectorIndexVersion(impl.meta_.version_)) {
     AD_THROW("Vector index \"" + name + "\" has on-disk version " +
              std::to_string(impl.meta_.version_) +
              ", but this binary expects version " +
              std::to_string(VECTOR_INDEX_VERSION) +
-             ". Please rebuild the vector index.");
+             " (or the still-supported version 4). Please rebuild the vector "
+             "index.");
   }
 
   // 2. Flat store + entity mappings (memory-mapped).
@@ -227,7 +256,16 @@ void VectorIndex::open(const std::string& basename, const std::string& name) {
   if (impl.meta_.config_.dimensions_ == 0) {
     complainInterrupted("the dimension");
   }
-  if (impl.data_.size() != impl.meta_.numVectors_ * impl.rowBytes()) {
+  // Row stride: explicit for a v5 index, derived (== raw row byte length) for a
+  // v4 index (`rowStrideBytes_ == 0`). It must be at least the raw row length
+  // (the metric reads `rowBytes()` per row), or the mapped reads could go out
+  // of bounds; the padded tail beyond it is never read.
+  impl.stride_ = impl.meta_.rowStrideBytes_ != 0 ? impl.meta_.rowStrideBytes_
+                                                 : impl.rowBytes();
+  if (impl.stride_ < impl.rowBytes()) {
+    complainInterrupted("the row stride");
+  }
+  if (impl.data_.size() != impl.meta_.numVectors_ * impl.stride_) {
     complainInterrupted("the data size on disk");
   }
   // Validate the VALUES in the mapping (not just the counts): `.rowmap` must be
@@ -287,6 +325,84 @@ void VectorIndex::open(const std::string& basename, const std::string& name) {
                name + "\".");
     }
     impl.searchSlots_ = std::make_unique<SearchSlotPool>(numSlots);
+  }
+
+  // 5. Optionally make the flat store resident / SIMD-aligned in RAM. Purely a
+  //    paging/throughput optimisation applied after a successful open.
+  makeResident(residency);
+}
+
+// ____________________________________________________________________________
+void VectorIndex::makeResident(Residency residency) {
+  auto& impl = *impl_;
+  const size_t matrixBytes = impl.data_.size();
+  if (residency == Residency::None || matrixBytes == 0) {
+    return;
+  }
+  // Fits-in-RAM gate: never drive the machine into OOM/thrash. If we cannot
+  // determine the physical memory, be conservative and skip. `AlignedCopy`
+  // additionally holds a SECOND full copy, so require it to fit within ~45% of
+  // RAM (matrix + its aligned copy <= ~90% of RAM); the others only prefault /
+  // pin the single mapped copy, gated at ~90%.
+  const uint64_t ram = totalPhysicalMemoryBytes();
+  const uint64_t budget =
+      residency == Residency::AlignedCopy ? (ram / 100) * 45 : (ram / 100) * 90;
+  if (ram == 0 || matrixBytes > budget) {
+    AD_LOG_WARN << "Vector index \"" << impl.meta_.config_.name_ << "\": the "
+                << (matrixBytes >> 20)
+                << " MiB flat store does not comfortably fit in physical "
+                   "memory; skipping the requested RAM preload."
+                << std::endl;
+    return;
+  }
+
+  switch (residency) {
+    case Residency::None:
+      break;
+    case Residency::Advise:
+      impl.data_.prefault();
+      break;
+    case Residency::Lock:
+      impl.data_.prefault();
+      if (!impl.data_.lockInMemory()) {
+        AD_LOG_WARN << "Vector index \"" << impl.meta_.config_.name_
+                    << "\": could not mlock the flat store (RLIMIT_MEMLOCK?); "
+                       "continuing with an unlocked mapping."
+                    << std::endl;
+      }
+      break;
+    case Residency::AlignedCopy: {
+      // Copy the matrix into a 64-byte aligned buffer with a padded stride so
+      // every row starts on a SIMD boundary (also fixes alignment for legacy
+      // v4 files whose on-disk stride is unpadded).
+      const size_t rowBytes = impl.rowBytes();
+      const size_t stride64 = alignUp(rowBytes);
+      const size_t n = impl.meta_.numVectors_;
+      void* buf = nullptr;
+      if (posix_memalign(&buf, SIMD_ALIGNMENT, n * stride64) != 0 ||
+          buf == nullptr) {
+        AD_LOG_WARN << "Vector index \"" << impl.meta_.config_.name_
+                    << "\": could not allocate the aligned RAM copy; falling "
+                       "back to a prefault."
+                    << std::endl;
+        impl.data_.prefault();
+        return;
+      }
+      std::unique_ptr<char, AlignedFree> owned{static_cast<char*>(buf)};
+      // Zero the pad tails, then copy each row's `rowBytes` payload.
+      std::memset(owned.get(), 0, n * stride64);
+      for (size_t i = 0; i < n; ++i) {
+        std::memcpy(owned.get() + i * stride64, impl.rowPtr(i), rowBytes);
+      }
+#if defined(MADV_HUGEPAGE)
+      madvise(owned.get(), n * stride64, MADV_HUGEPAGE);
+#endif
+      // Repoint the read path at the aligned copy (rowPtr()/graphMetric() read
+      // `base()` + `stride_`).
+      impl.alignedBuf_ = std::move(owned);
+      impl.stride_ = stride64;
+      break;
+    }
   }
 }
 

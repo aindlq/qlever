@@ -49,6 +49,21 @@ using CheckInterruptCallback = std::function<void()>;
 // remap) are skipped by all searches.
 class VectorIndex {
  public:
+  // How eagerly to make the flat `.data` store resident in RAM. The default
+  // relies on the page cache; the stronger levels trade memory for lower and
+  // more predictable query latency. Each level gracefully degrades (with a
+  // warning) if it cannot be satisfied -- e.g. the store does not fit in RAM,
+  // `mlock` is denied, or the aligned copy cannot be allocated -- and it never
+  // changes results, only paging/throughput.
+  //   None        - rely on the OS page cache (madvise stays Random).
+  //   Advise      - `madvise(MADV_WILLNEED)` prefault (advisory read-ahead).
+  //   Lock        - additionally `mlock` the mapping so it is never paged out.
+  //   AlignedCopy - copy the matrix into a 64-byte SIMD-aligned, huge-page
+  //                 advised RAM buffer (also fixes alignment for legacy v4
+  //                 files); holds a second full copy, so only for stores that
+  //                 comfortably fit in RAM.
+  enum class Residency { None, Advise, Lock, AlignedCopy };
+
   VectorIndex();
   ~VectorIndex();
   VectorIndex(VectorIndex&&) noexcept;
@@ -57,8 +72,17 @@ class VectorIndex {
   VectorIndex& operator=(const VectorIndex&) = delete;
 
   // Open `<basename>.vec.<name>.*` read-only (everything is mmaped).
-  // Throws if the files are missing or inconsistent.
-  void open(const std::string& basename, const std::string& name);
+  // Throws if the files are missing or inconsistent. `residency` optionally
+  // preloads/pins the flat store (see `Residency`); it is applied after a
+  // successful open and never affects correctness.
+  void open(const std::string& basename, const std::string& name,
+            Residency residency = Residency::None);
+
+  // Apply (or re-apply) a RAM-residency strategy to the already-opened flat
+  // store. Idempotent and best-effort: gated on the store fitting in physical
+  // memory (skipped with a warning otherwise) so it can never drive the
+  // machine into OOM. Never changes search results.
+  void makeResident(Residency residency);
 
   // Metadata accessors.
   const VectorIndexMetadata& metadata() const;

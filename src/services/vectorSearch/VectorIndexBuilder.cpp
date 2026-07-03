@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <numeric>
@@ -17,6 +18,7 @@
 
 #include "backports/algorithm.h"
 #include "services/vectorSearch/UsearchGraph.h"
+#include "services/vectorSearch/VectorMemory.h"
 #include "util/Exception.h"
 #include "util/File.h"
 #include "util/Log.h"
@@ -26,18 +28,6 @@
 namespace qlever::vector {
 
 namespace {
-
-// Total physical RAM in bytes, or 0 if it cannot be determined.
-uint64_t totalPhysicalMemoryBytes() {
-#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGE_SIZE)
-  long pages = sysconf(_SC_PHYS_PAGES);
-  long pageSize = sysconf(_SC_PAGE_SIZE);
-  if (pages > 0 && pageSize > 0) {
-    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(pageSize);
-  }
-#endif
-  return 0;
-}
 
 // Removes the given files on destruction unless `dismiss()` was called.
 // Used so that a failed build does not leave temporary files behind.
@@ -237,6 +227,15 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   perm.shrink_to_fit();
   const size_t n = rows.size();
 
+  // Byte stride between consecutive rows in the flat store. With `alignRows_`
+  // every row starts at a 64-byte boundary (the mmap base is page-aligned, so
+  // `base + i*stride` is 64-byte aligned when `stride % 64 == 0`), which the
+  // SIMD distance kernels prefer. The pad tail `[rowBytes_, stride)` is never
+  // read by the metric (it reads only `dimensions` scalars); it is zero-filled
+  // for determinism. Without `alignRows_` the stride equals the raw row length,
+  // so the output is byte-identical to an unpadded (v4-style) build.
+  const size_t stride = config_.alignRows_ ? alignUp(rowBytes_) : rowBytes_;
+
   const size_t numThreads =
       config_.buildThreads_ > 0
           ? config_.buildThreads_
@@ -260,14 +259,19 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   {
     outputsCleanup.track(tmp(dataPath));
     ad_utility::MmapVector<char> data;
-    data.open(n * rowBytes_, tmp(dataPath));
+    data.open(n * stride, tmp(dataPath));
     ad_utility::File spill{vecSpillPath_.c_str(), "r"};
     char* dataBegin = n > 0 ? &data[0] : nullptr;
+    // Zero the pad tails once up front (only when padding is present); the
+    // per-row reads below overwrite the leading `rowBytes_` of every stride.
+    if (stride != rowBytes_ && dataBegin != nullptr) {
+      std::memset(dataBegin, 0, n * stride);
+    }
     parallelOverRows(
         n, numThreads, [&](size_t, size_t first, size_t last, auto& stop) {
           for (size_t i = first; i < last; ++i) {
             if (stop.load(std::memory_order_relaxed)) return;
-            ssize_t read = spill.read(dataBegin + i * rowBytes_, rowBytes_,
+            ssize_t read = spill.read(dataBegin + i * stride, rowBytes_,
                                       static_cast<off_t>(rows[i] * rowBytes_));
             if (read != static_cast<ssize_t>(rowBytes_)) {
               throw std::runtime_error{
@@ -338,10 +342,9 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     // construction random-accesses it, so once it exceeds RAM the build
     // becomes disk-bound.
     if (uint64_t ram = totalPhysicalMemoryBytes();
-        ram != 0 && n * rowBytes_ > ram) {
+        ram != 0 && n * stride > ram) {
       AD_LOG_WARN << "Vector index \"" << config_.name_ << "\": the "
-                  << (n * rowBytes_ >> 30)
-                  << " GiB flat store exceeds physical "
+                  << (n * stride >> 30) << " GiB flat store exceeds physical "
                   << "memory (" << (ram >> 30)
                   << " GiB); the HNSW build will be disk-bound. Consider a "
                      "smaller scalar type (f16/i8) or more RAM."
@@ -350,7 +353,7 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     uu::metric_punned_t metric{config_.dimensions_,
                                toUsearchMetric(config_.metric_),
                                toUsearchScalar(config_.scalar_)};
-    FlatStoreMetric graphMetric{data.data(), rowBytes_, n, metric};
+    FlatStoreMetric graphMetric{data.data(), stride, n, metric};
     GraphIndex graph{uu::index_config_t{config_.hnswConnectivity_,
                                         config_.hnswConnectivity_ * 2}};
     uu::index_limits_t limits;
@@ -404,6 +407,7 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   meta.hasHnsw_ = hasHnsw;
   meta.version_ = VECTOR_INDEX_VERSION;
   meta.vocabSize_ = vocabSize_;
+  meta.rowStrideBytes_ = stride;
   {
     outputsCleanup.track(tmp(metaPath));
     std::ofstream metaOut{tmp(metaPath)};

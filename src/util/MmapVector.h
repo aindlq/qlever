@@ -272,6 +272,23 @@ class MmapVector {
     advise(_pattern);
   }
 
+  // Ask the kernel to eagerly read the whole mapping into the page cache
+  // (`madvise(MADV_WILLNEED)`). This is only advisory (asynchronous read-ahead,
+  // not a residency guarantee) and a no-op in the reduced feature set / on
+  // platforms without `madvise`.
+  void prefault();
+
+  // Pin the whole mapping into physical memory with `mlock`, so that it is
+  // never paged out. Returns whether the lock succeeded; it may legitimately
+  // fail (e.g. `RLIMIT_MEMLOCK` without privilege), in which case the caller
+  // should warn and continue with an unlocked (still correct) mapping. A no-op
+  // returning `false` in the reduced feature set. The lock is released
+  // automatically on `unmap()`/`close()`/destruction.
+  bool lockInMemory();
+
+  // Release a previous `lockInMemory()` (idempotent; safe if not locked).
+  void unlockMemory();
+
  protected:
   // _________________________________________________________________________
   inline void throwIfUninitialized() const {
@@ -326,6 +343,9 @@ class MmapVector {
   ResetWhenMoved<size_t, 0> _bytesize;
   std::string _filename = "";
   AccessPattern _pattern = AccessPattern::None;
+  // Whether the mapping is currently `mlock`ed (so that `unmap()` knows to
+  // `munlock` it before unmapping). Reset to `false` when moved from.
+  ResetWhenMoved<bool, false> _locked;
   static constexpr float ResizeFactor = 1.5;
 };
 
@@ -350,6 +370,13 @@ class MmapVectorView : private MmapVector<T> {
 
   // ____________________________________________________
   size_t size() const { return MmapVector<T>::size(); }
+
+  // Residency helpers (see `MmapVector`). Read-only views are exactly the
+  // consumers that want to pin/prefault a large immutable mapping.
+  void prefault() { MmapVector<T>::prefault(); }
+  bool lockInMemory() { return MmapVector<T>::lockInMemory(); }
+  void unlockMemory() { MmapVector<T>::unlockMemory(); }
+  using MmapVector<T>::setAccessPattern;
 
   // default constructor, leaves an uninitialized vector that will throw until a
   // valid call to open()

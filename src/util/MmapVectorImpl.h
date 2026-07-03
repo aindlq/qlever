@@ -259,9 +259,52 @@ MmapVector<T>::~MmapVector() {
 template <class T>
 void MmapVector<T>::unmap() {
   if (_ptr != nullptr) {
+    // Release an `mlock` (if any) BEFORE unmapping the pages it refers to.
+    unlockMemory();
     munmap(static_cast<void*>(_ptr), _bytesize);
     _ptr = nullptr;
   }
+}
+
+// ________________________________________________________________
+// Residency helpers. Like `advise()`, `madvise`/`mlock` are not available in
+// the reduced feature set (QNX), where these degrade to no-ops. They only
+// affect performance / paging, never program semantics.
+template <class T>
+void MmapVector<T>::prefault() {
+#ifndef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
+  if (_ptr != nullptr) {
+    madvise(static_cast<void*>(_ptr), _bytesize, MADV_WILLNEED);
+  }
+#endif
+}
+
+// ________________________________________________________________
+template <class T>
+bool MmapVector<T>::lockInMemory() {
+#ifndef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
+  if (_ptr == nullptr) {
+    return false;
+  }
+  if (mlock(static_cast<void*>(_ptr), _bytesize) == 0) {
+    _locked = true;
+    return true;
+  }
+  return false;
+#else
+  return false;
+#endif
+}
+
+// ________________________________________________________________
+template <class T>
+void MmapVector<T>::unlockMemory() {
+#ifndef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
+  if (_ptr != nullptr && _locked) {
+    munlock(static_cast<void*>(_ptr), _bytesize);
+  }
+#endif
+  _locked = false;
 }
 
 // ________________________________________________________________
@@ -282,6 +325,7 @@ MmapVector<T>& MmapVector<T>::operator=(MmapVector<T>&& other) noexcept {
   _bytesize = std::move(other._bytesize);
   _filename = std::move(other._filename);
   _pattern = std::move(other._pattern);
+  _locked = std::move(other._locked);
   return *this;
 }
 
@@ -329,6 +373,7 @@ MmapVectorView<T>& MmapVectorView<T>::operator=(
   this->_bytesize = std::move(other._bytesize);
   this->_filename = std::move(other._filename);
   this->_pattern = std::move(other._pattern);
+  this->_locked = std::move(other._locked);
   return *this;
 }
 

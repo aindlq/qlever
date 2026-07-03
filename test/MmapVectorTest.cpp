@@ -3,6 +3,7 @@
 // Author: Johannes Kalmbach (joka921) <johannes.kalmbach@gmail.com>
 //
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <stdexcept>
@@ -330,6 +331,58 @@ TEST(MmapVectorTest, Reuse) {
   for (int i = 0; i < 5000; ++i) {
     ASSERT_EQ(v3[i], i);
   }
+}
+
+// ____________________________________________________________________
+// The residency helpers (`prefault`/`lockInMemory`/`unlockMemory`) must not
+// change the array's size or contents, must not corrupt anything, and must
+// release the `mlock` cleanly on close.
+TEST(MmapVectorTest, PrefaultAndLock) {
+  const size_t s = 5000;
+  {
+    MmapVector<int> v(s, "_testResidency.mmap");
+    for (size_t i = 0; i < s; ++i) {
+      v[i] = static_cast<int>(i);
+    }
+    v.close();
+  }
+  MmapVectorView<int> v("_testResidency.mmap");
+  ASSERT_EQ(s, v.size());
+
+  // Prefault is advisory read-ahead: contents unchanged.
+  v.prefault();
+  for (size_t i = 0; i < s; ++i) {
+    ASSERT_EQ(v[i], static_cast<int>(i));
+  }
+
+  // Locking may legitimately fail (RLIMIT_MEMLOCK without privilege). Either
+  // way the data stays intact and, on success, every page must be resident.
+  bool locked = v.lockInMemory();
+  for (size_t i = 0; i < s; ++i) {
+    ASSERT_EQ(v[i], static_cast<int>(i));
+  }
+  if (locked) {
+    const size_t pageSize = static_cast<size_t>(getpagesize());
+    const size_t bytes = s * sizeof(int);
+    const size_t numPages = (bytes + pageSize - 1) / pageSize;
+    std::vector<unsigned char> resident(numPages, 0);
+    // `mincore` reports which pages are resident; after a successful mlock they
+    // all must be.
+    const void* base = static_cast<const void*>(v.data());
+    ASSERT_EQ(0, mincore(const_cast<void*>(base), bytes, resident.data()));
+    for (size_t p = 0; p < numPages; ++p) {
+      EXPECT_TRUE(resident[p] & 1u) << "page " << p << " not resident";
+    }
+  }
+
+  // Idempotent unlock, then a clean close (which must also munlock if we did
+  // not unlock explicitly) -- no crash, no leak.
+  v.unlockMemory();
+  v.unlockMemory();
+  bool relocked = v.lockInMemory();
+  (void)relocked;
+  v.close();  // must release any surviving mlock before munmap
+  ASSERT_EQ(nullptr, v.data());
 }
 
 // ____________________________________________________________________

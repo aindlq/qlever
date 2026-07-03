@@ -22,6 +22,7 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexBuilder.h"
 #include "services/vectorSearch/VectorInputReader.h"
+#include "util/json.h"
 
 using namespace qlever::vector;
 
@@ -556,6 +557,224 @@ TEST(VectorIndex, hugeKIsClamped) {
   EXPECT_LE(hnsw.size(), NUM_VECTORS);
   EXPECT_GT(hnsw.size(), 0u);
   cleanup(b);
+}
+
+// _____________________________________________________________________________
+// Helper: build an index with an arbitrary dimension and the `alignRows_` flag,
+// returning the basename. Uses `dim` deliberately chosen so that the raw row
+// byte length is NOT already a multiple of 64 (so padding is observable).
+namespace {
+struct AlignBuilt {
+  std::string basename;
+  std::string name = "al";
+  std::vector<std::vector<float>> vecs;
+  std::vector<Id> ids;
+};
+
+AlignBuilt buildAligned(size_t dim, bool alignRows, bool withHnsw,
+                        const std::string& tag) {
+  AlignBuilt b;
+  b.basename = uniqueTmpBasename() + "-" + tag;
+  std::mt19937 rng{9876};
+  std::normal_distribution<float> g{0.f, 1.f};
+  VectorIndexConfig cfg;
+  cfg.name_ = b.name;
+  cfg.dimensions_ = static_cast<uint32_t>(dim);
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.buildHnsw_ = withHnsw;
+  cfg.hnswExpansionSearch_ = 200;
+  cfg.alignRows_ = alignRows;
+  VectorIndexBuilder builder{b.basename, cfg};
+  for (size_t i = 0; i < NUM_VECTORS; ++i) {
+    std::vector<float> v(dim);
+    float norm = 0;
+    for (auto& x : v) {
+      x = g(rng);
+      norm += x * x;
+    }
+    norm = std::sqrt(norm);
+    for (auto& x : v) x /= norm;
+    Id id = mkId(1000 + i * 7);
+    builder.add(id, "<http://ex/" + std::to_string(1000 + i * 7) + ">", v);
+    b.vecs.push_back(std::move(v));
+    b.ids.push_back(id);
+  }
+  builder.build();
+  return b;
+}
+
+void cleanupBase(const std::string& basename, const std::string& name) {
+  for (auto* suffix :
+       {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + ".vec." + name + suffix, ec);
+  }
+}
+}  // namespace
+
+// _____________________________________________________________________________
+// `alignRows_` pads every row up to a 64-byte SIMD boundary (persisted as
+// `rowStrideBytes_`), while leaving results bit-identical to an unpadded build.
+TEST(VectorIndex, alignedRowsStridePaddingAndParity) {
+  constexpr size_t dim = 10;  // raw row bytes = 40, not a multiple of 64
+  constexpr size_t rawRowBytes = dim * sizeof(float);
+  auto unaligned = buildAligned(dim, /*alignRows=*/false, false, "unal");
+  auto aligned = buildAligned(dim, /*alignRows=*/true, false, "al");
+
+  VectorIndex idxU;
+  idxU.open(unaligned.basename, unaligned.name);
+  VectorIndex idxA;
+  idxA.open(aligned.basename, aligned.name);
+
+  // Unpadded stride == raw row length; padded stride is the next multiple
+  // of 64.
+  EXPECT_EQ(idxU.metadata().rowStrideBytes_, rawRowBytes);
+  EXPECT_EQ(idxA.metadata().rowStrideBytes_, 64u);
+  EXPECT_EQ(idxA.metadata().rowStrideBytes_ % 64u, 0u);
+  // The padded `.data` file is correspondingly larger.
+  EXPECT_GE(std::filesystem::file_size(aligned.basename + ".vec.al.data"),
+            NUM_VECTORS * 64u);
+
+  // Bit-exact top-k parity between the aligned and unaligned stores (the pad
+  // tail is never read by the metric).
+  for (size_t q = 0; q < NUM_VECTORS; q += 17) {
+    auto ru = idxU.searchExact(unaligned.vecs[q], 10);
+    auto ra = idxA.searchExact(aligned.vecs[q], 10);
+    ASSERT_EQ(ru.size(), ra.size());
+    for (size_t i = 0; i < ru.size(); ++i) {
+      EXPECT_EQ(ru[i].entity_, ra[i].entity_);
+      EXPECT_EQ(ru[i].distance_, ra[i].distance_);  // bit-exact
+    }
+  }
+  cleanupBase(unaligned.basename, unaligned.name);
+  cleanupBase(aligned.basename, aligned.name);
+}
+
+// _____________________________________________________________________________
+// `makeResident(AlignedCopy)` builds a 64-byte-aligned RAM copy of an UNPADDED
+// (v4-style) store and serves searches from it with identical results. Also
+// exercises `Advise`/`Lock` (best-effort, must never change results).
+TEST(VectorIndex, makeResidentAlignedCopyMatches) {
+  constexpr size_t dim = 10;  // unpadded rows on disk
+  auto b = buildAligned(dim, /*alignRows=*/false, /*withHnsw=*/true, "res");
+
+  // Baseline results from the plain mmap path.
+  VectorIndex ref;
+  ref.open(b.basename, b.name);
+  std::vector<std::vector<ScoredEntity>> baseline;
+  for (size_t q = 0; q < NUM_VECTORS; q += 17) {
+    baseline.push_back(ref.searchExact(b.vecs[q], 10));
+  }
+
+  for (auto residency :
+       {VectorIndex::Residency::Advise, VectorIndex::Residency::Lock,
+        VectorIndex::Residency::AlignedCopy}) {
+    VectorIndex idx;
+    idx.open(b.basename, b.name, residency);
+    size_t bi = 0;
+    for (size_t q = 0; q < NUM_VECTORS; q += 17, ++bi) {
+      auto res = idx.searchExact(b.vecs[q], 10);
+      ASSERT_EQ(res.size(), baseline[bi].size());
+      for (size_t i = 0; i < res.size(); ++i) {
+        EXPECT_EQ(res[i].entity_, baseline[bi][i].entity_);
+        EXPECT_EQ(res[i].distance_, baseline[bi][i].distance_);
+      }
+    }
+    // The HNSW path must also still find each stored vector's nearest self
+    // after the store was possibly repointed at the aligned copy.
+    auto hnsw = idx.searchHnswByEntity(b.ids[20], 3);
+    ASSERT_FALSE(hnsw.empty());
+    EXPECT_EQ(hnsw.front().entity_, b.ids[20]);
+  }
+  cleanupBase(b.basename, b.name);
+}
+
+// _____________________________________________________________________________
+// Back-compat: a legacy v4 metadata (no `rowStrideBytes`, version 4) must still
+// load, deriving the stride as the raw row byte length, with unchanged results.
+TEST(VectorIndex, loadsLegacyV4Metadata) {
+  auto b = buildAligned(10, /*alignRows=*/false, /*withHnsw=*/false, "v4");
+  VectorIndex ref;
+  ref.open(b.basename, b.name);
+  auto expected = ref.searchExact(b.vecs[5], 10);
+
+  // Rewrite the metadata to look like a v4 index: version 4 and no
+  // `rowStrideBytes` key at all (the field a v4 build never wrote).
+  const std::string metaPath = b.basename + ".vec." + b.name + ".meta";
+  {
+    std::ifstream in{metaPath};
+    nlohmann::json j;
+    in >> j;
+    j["version"] = 4;
+    j.erase("rowStrideBytes");
+    std::ofstream out{metaPath};
+    out << j.dump(2);
+  }
+  VectorIndex idx;
+  idx.open(b.basename, b.name);  // must not throw
+  EXPECT_EQ(idx.metadata().version_, 4u);
+  EXPECT_EQ(idx.metadata().rowStrideBytes_, 0u);  // absent -> derived at load
+  auto got = idx.searchExact(b.vecs[5], 10);
+  ASSERT_EQ(got.size(), expected.size());
+  for (size_t i = 0; i < got.size(); ++i) {
+    EXPECT_EQ(got[i].entity_, expected[i].entity_);
+    EXPECT_EQ(got[i].distance_, expected[i].distance_);
+  }
+  cleanupBase(b.basename, b.name);
+}
+
+// _____________________________________________________________________________
+// Micro-benchmark (disabled by default): brute-force scan latency for
+// {unaligned-cold, unaligned-resident, aligned-resident}. Run with:
+//   --gtest_also_run_disabled_tests --gtest_filter='*scanResidencyBenchmark*'
+TEST(VectorIndex, DISABLED_scanResidencyBenchmark) {
+  const char* nEnv = std::getenv("QLEVER_BENCH_N");
+  const size_t n = nEnv ? std::stoull(nEnv) : 200'000;
+  constexpr size_t dim = 100;  // 400 raw bytes -> padded to 448
+  auto run = [&](bool alignRows, VectorIndex::Residency residency,
+                 const char* label) {
+    std::string basename = uniqueTmpBasename() + "-bench";
+    std::mt19937 rng{7};
+    std::normal_distribution<float> g{0.f, 1.f};
+    VectorIndexConfig cfg;
+    cfg.name_ = "bench";
+    cfg.dimensions_ = dim;
+    cfg.metric_ = VectorMetric::Cosine;
+    cfg.buildHnsw_ = false;
+    cfg.alignRows_ = alignRows;
+    VectorIndexBuilder builder{basename, cfg};
+    std::vector<float> v(dim);
+    for (size_t i = 0; i < n; ++i) {
+      for (auto& x : v) x = g(rng);
+      builder.add(mkId(1000 + i * 3), "<http://ex/" + std::to_string(i) + ">",
+                  v);
+    }
+    builder.build();
+    VectorIndex idx;
+    idx.open(basename, "bench", residency);
+    for (auto& x : v) x = g(rng);
+    auto t0 = std::chrono::steady_clock::now();
+    constexpr size_t reps = 20;
+    for (size_t r = 0; r < reps; ++r) {
+      auto res = idx.searchExact(v, 10);
+      EXPECT_EQ(res.size(), 10u);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double nsPerVec =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count() /
+        static_cast<double>(reps * n);
+    std::cout << "[scan-bench] " << label << ": " << nsPerVec << " ns/vector"
+              << std::endl;
+    cleanupBase(basename, "bench");
+    return nsPerVec;
+  };
+  double cold = run(false, VectorIndex::Residency::None, "unaligned-cold");
+  double resident =
+      run(false, VectorIndex::Residency::Advise, "unaligned-resident");
+  double aligned =
+      run(true, VectorIndex::Residency::AlignedCopy, "aligned-resident");
+  std::cout << "[scan-bench] cold=" << cold << " resident=" << resident
+            << " aligned=" << aligned << " ns/vector" << std::endl;
 }
 
 #ifdef QLEVER_WITH_PARQUET

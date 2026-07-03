@@ -52,8 +52,19 @@ namespace qlever::vector {
 // rebuild of the main index. Version history: 1 = initial; 2 = added the
 // `vocabSize` fingerprint; 3 = row-keyed graph-only `.hnsw`, `.iris` +
 // `.rowmap` sidecars, tombstones (cheap remapping after a KG re-index);
-// 4 = `.data` holds the configured scalar type (f32/f16/i8) as raw bytes.
-inline constexpr uint32_t VECTOR_INDEX_VERSION = 4;
+// 4 = `.data` holds the configured scalar type (f32/f16/i8) as raw bytes;
+// 5 = added an explicit per-row byte STRIDE (`rowStrideBytes_`) so that rows
+//     can be padded to a 64-byte SIMD-friendly boundary (opt-in; when unpadded
+//     the stride equals the row's raw byte length, so v5 is otherwise identical
+//     to v4). Version 4 indices still load unchanged (their stride is derived).
+inline constexpr uint32_t VECTOR_INDEX_VERSION = 5;
+
+// The set of on-disk versions this binary can still read. A v4 index (no
+// explicit stride) loads with `rowStrideBytes_` derived as `dimensions *
+// bytesPerScalar`, so it never needs a forced rebuild.
+inline bool isSupportedVectorIndexVersion(uint32_t version) {
+  return version == 4 || version == VECTOR_INDEX_VERSION;
+}
 
 // The `.keys` value of a row whose entity is not part of the current knowledge
 // graph. Real keys are `ValueId` bits, whose datatype (high) bits never have
@@ -150,6 +161,13 @@ struct VectorIndexConfig {
   // Build-time only (not persisted).
   uint32_t buildThreads_ = 0;
 
+  // If true, pad every stored row up to a 64-byte (AVX-512 / cache-line)
+  // boundary so that the SIMD distance kernels load each vector from an aligned
+  // address (avoids split-cache-line/-page penalties on the sequential scan).
+  // Off by default so unpadded builds stay byte-identical. Build-time only; the
+  // resulting per-row stride is persisted as `rowStrideBytes_`.
+  bool alignRows_ = false;
+
   // Optional embedding endpoint, bound to this index so that query-time
   // embedding always uses the SAME model that produced the index.
   // `embeddingUrl_` is an OpenAI-compatible base URL (the client appends
@@ -194,6 +212,12 @@ struct VectorIndexMetadata {
   // vocabulary and skips (with a warning suggesting a remap) any vector index
   // that does not match.
   uint64_t vocabSize_ = 0;
+  // Byte stride between consecutive rows in `.data` (>= the raw row byte
+  // length `dimensions * bytesPerScalar`). 0 means "not stored" (a v4 index),
+  // in which case the loader derives it as the raw row byte length. When rows
+  // are 64-byte aligned this is the padded stride; the distance kernels still
+  // read only `dimensions` scalars, so the pad tail is never touched.
+  uint64_t rowStrideBytes_ = 0;
 };
 
 // Path helpers. Centralised so the builder and the reader agree.
@@ -238,7 +262,8 @@ inline void to_json(nlohmann::json& j, const VectorIndexMetadata& m) {
                      {"embeddingUrl", m.config_.embeddingUrl_},
                      {"embeddingModel", m.config_.embeddingModel_},
                      {"version", m.version_},
-                     {"vocabSize", m.vocabSize_}};
+                     {"vocabSize", m.vocabSize_},
+                     {"rowStrideBytes", m.rowStrideBytes_}};
 }
 
 inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
@@ -256,6 +281,8 @@ inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
   m.config_.embeddingModel_ = j.value("embeddingModel", std::string{});
   j.at("version").get_to(m.version_);
   m.vocabSize_ = j.value("vocabSize", uint64_t{0});
+  // Absent in v4 (0 => the loader derives the raw row byte length).
+  m.rowStrideBytes_ = j.value("rowStrideBytes", uint64_t{0});
 }
 
 }  // namespace qlever::vector
