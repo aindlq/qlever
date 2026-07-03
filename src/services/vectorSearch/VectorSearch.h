@@ -54,12 +54,14 @@ class VectorSearch : public Operation {
  private:
   uint64_t getSizeEstimateBeforeLimit() override;
   std::string getCacheKeyImpl() const override;
-  // Text and image query points are embedded via an external endpoint at
-  // compute time; the endpoint's model can change (or be nondeterministic), so
-  // such results must not be served from the cache indefinitely.
-  bool canResultBeCachedImpl() const override {
-    return !config_.queryText_.has_value() && !config_.queryImage_.has_value();
-  }
+  // NOTE: results are cacheable for EVERY query form, including `queryText` and
+  // `queryImage`. Their embedding is the expensive part (a round-trip to an
+  // external endpoint), and the endpoint URL + model are fixed for the whole
+  // run (they come from the index metadata), so the exact query text/image --
+  // which is part of the cache key -- maps to a stable result within a run. The
+  // result cache is in-memory and cleared on restart, so a later model change
+  // cannot serve a stale result across it. (Hence no `canResultBeCachedImpl`
+  // override; the base default of `true` applies.)
   Result computeResult(bool requestLaziness) override;
   VariableToColumnMap computeVariableToColumnMap() const override;
   std::unique_ptr<Operation> cloneImpl() const override;

@@ -160,8 +160,11 @@ For the point-query forms, an optional nested `{ ... }` pattern that binds the
 result variable **restricts the search space** to exactly those candidate
 entities (always exact search — right for selective candidate sets); the
 pattern must bind only the result variable. An empty candidate set yields an
-empty result. Results computed through an external embedding endpoint
-(`queryText`/image) are never cached, since the endpoint's model can change.
+empty result. All query forms are cacheable, including `queryText`/image: the
+exact text/image is part of the cache key and the endpoint + model are fixed
+for the run, so an identical repeated query reuses the (expensive-to-embed)
+result instead of re-hitting the endpoint. The result cache is in-memory and
+cleared on restart.
 
 ## Design notes
 

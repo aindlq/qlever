@@ -385,9 +385,11 @@ TEST(VectorSearchService, cacheKeyIsBitExactInQueryVector) {
 }
 
 // _____________________________________________________________________________
-// Text and image query points depend on an external embedding endpoint at
-// compute time, so their results must not be cached.
-TEST(VectorSearchService, embeddingResultsAreNotCacheable) {
+// Every query form is cacheable, including the embedding-based ones: the query
+// text/image is part of the cache key, and the endpoint + model are fixed for
+// the run, so caching the (expensive-to-embed) result of an identical repeated
+// query is correct. The in-memory cache is cleared on restart.
+TEST(VectorSearchService, allQueryFormsAreCacheable) {
   auto* qec = qecWithVectorIndex();
   qlever::vector::VectorSearchConfiguration byVector;
   byVector.indexName_ = "clip";
@@ -398,7 +400,12 @@ TEST(VectorSearchService, embeddingResultsAreNotCacheable) {
   qlever::vector::VectorSearchConfiguration byText = byVector;
   byText.queryVector_ = std::nullopt;
   byText.queryText_ = "a green statue";
-  EXPECT_FALSE(VectorSearch(qec, byText).canResultBeCached());
+  EXPECT_TRUE(VectorSearch(qec, byText).canResultBeCached());
+  // The query text is part of the cache key, so distinct texts do not collide.
+  qlever::vector::VectorSearchConfiguration otherText = byText;
+  otherText.queryText_ = "a red painting";
+  EXPECT_NE(VectorSearch(qec, byText).getCacheKey(),
+            VectorSearch(qec, otherText).getCacheKey());
 }
 
 // _____________________________________________________________________________
