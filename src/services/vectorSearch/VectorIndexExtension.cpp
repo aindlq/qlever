@@ -29,6 +29,7 @@
 #include "index/Index.h"
 #include "index/IndexExtension.h"
 #include "index/IndexImpl.h"
+#include "index/StringSortComparator.h"
 #include "parser/TripleComponent.h"
 #include "rdfTypes/Iri.h"
 #include "services/vectorSearch/EmbeddingClient.h"
@@ -90,6 +91,15 @@ constexpr size_t EMBED_BATCH_SIZE = 64;
 // that binds a vector index to the main-index build it was created from.
 uint64_t vocabFingerprint(const IndexImpl& impl) {
   return static_cast<uint64_t>(impl.getVocab().size());
+}
+
+// The knowledge-graph vocabulary's collation fingerprint. The vector store's
+// rows are laid out in vocabulary (collation) order, so this is persisted at
+// build/remap time and re-checked at load: a mismatch means the collation
+// changed under the store (its id order is now stale). Only a warning -- the
+// merge-join gather stays correct, it just loses its sequential-read speedup.
+std::string collationFingerprint(const IndexImpl& impl) {
+  return impl.getVocab().getLocaleManager().getCollationIdentifier();
 }
 
 size_t effectiveThreads(uint32_t configured) {
@@ -282,6 +292,7 @@ VectorIndexMetadata buildFromReader(const Index& index,
   const size_t numThreads = effectiveThreads(config.buildThreads_);
   VectorIndexBuilder builder{basename, config};
   builder.setVocabSize(vocabFingerprint(index.getImpl()));
+  builder.setCollationLocale(collationFingerprint(index.getImpl()));
   const size_t dim = config.dimensions_;
   std::vector<std::string> iris;
   std::vector<float> vectors;  // batch, row-major
@@ -443,6 +454,7 @@ VectorIndexMetadata buildFromTexts(const Index& index,
         }
         builder.emplace(basename, config);
         builder->setVocabSize(vocabFingerprint(index.getImpl()));
+        builder->setCollationLocale(collationFingerprint(index.getImpl()));
       }
       builder->add(ids[i].value(), batchIris[i], vec);
       ++resolved;
@@ -575,6 +587,21 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
           << "the HNSW graph)." << std::endl;
       continue;
     }
+    // Collation guard: the store's rows are in vocabulary (collation) order. A
+    // changed collation leaves the id order stale, so the merge-join gather
+    // loses its sequential-read speedup (but stays correct). Warn, keep
+    // serving.
+    if (const std::string& built = idx.metadata().collationLocale_;
+        !built.empty() && built != collationFingerprint(impl)) {
+      AD_LOG_WARN
+          << "Vector index '" << name << "': it was built with collation \""
+          << built << "\", but the knowledge graph now uses \""
+          << collationFingerprint(impl)
+          << "\". Searches stay correct, but candidate gathers may be slower "
+             "(the id-sorted flat store no longer matches the current id "
+             "order). Consider rebuilding the vector index."
+          << std::endl;
+    }
     AD_LOG_INFO << "Loaded vector index '" << name << "' ("
                 << idx.numLiveVectors() << " vectors"
                 << (idx.numVectors() != idx.numLiveVectors()
@@ -705,6 +732,10 @@ std::pair<uint64_t, uint64_t> remapVectorIndex(const Index& index,
   }
   meta.numTombstones_ = tombstones;
   meta.vocabSize_ = vocabFingerprint(index.getImpl());
+  // Re-stamp the collation fingerprint against the (re-indexed) knowledge
+  // graph: the `.data` layout is unchanged, but the mapping now refers to the
+  // new vocabulary, so the guard should reflect its collation.
+  meta.collationLocale_ = collationFingerprint(index.getImpl());
   {
     std::ofstream metaOut{metaPath + ".tmp"};
     if (!metaOut.is_open()) {

@@ -59,6 +59,15 @@ class VectorIndexBuilder {
   // vector files are not silently applied to a rebuilt main index.
   void setVocabSize(uint64_t vocabSize) { vocabSize_ = vocabSize; }
 
+  // Record the knowledge-graph vocabulary's collation fingerprint
+  // (`LocaleManager::getCollationIdentifier()`). Stored in the metadata as a
+  // guard: the flat store is laid out in vocabulary (collation) order, so a
+  // later collation change is detectable at load time (a warning, never a
+  // correctness issue). Optional; if unset the metadata field stays empty.
+  void setCollationLocale(std::string collationLocale) {
+    collationLocale_ = std::move(collationLocale);
+  }
+
   // Add one entity's vector (always given as f32; it is converted to the
   // configured storage scalar). `vector.size()` must equal
   // `config.dimensions_`. The `iri` is persisted row-aligned so that the index
@@ -75,6 +84,7 @@ class VectorIndexBuilder {
   std::string basename_;
   VectorIndexConfig config_;
   uint64_t vocabSize_ = 0;
+  std::string collationLocale_;
   size_t rowBytes_ = 0;
   // f32 -> storage-scalar conversion (function-pointer type identical to
   // usearch's `cast_punned_t`; kept here so this header stays usearch-free).

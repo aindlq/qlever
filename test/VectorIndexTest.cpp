@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -300,6 +301,140 @@ TEST(VectorIndex, emptyCandidateListYieldsEmptyResult) {
   // `nullopt` (the default) searches the whole index.
   EXPECT_FALSE(idx.searchExact(b.data.vecs[0], 10).empty());
   cleanup(b);
+}
+
+// _____________________________________________________________________________
+// The merge-join gather helper: emits each matching candidate exactly once,
+// in NON-DECREASING row order (the "monotonic gather" property that makes the
+// `.data` reads sequential), and skips candidates with no row.
+TEST(VectorIndex, mergeJoinRowmapMonotonicAndSkips) {
+  // Ascending-by-id rowmap; `row_` is monotonic (identity in a fresh build).
+  std::vector<IdRowPair> rowmap{{10, 0}, {20, 1}, {30, 2}, {40, 3}, {50, 4}};
+  // Sorted candidates: 5/60 have no row, 20 is duplicated.
+  std::vector<uint64_t> cands{5, 20, 20, 40, 60};
+  std::vector<size_t> rows;
+  std::vector<uint64_t> ids;
+  mergeJoinRowmap(cands.begin(), cands.end(), rowmap.begin(), rowmap.end(),
+                  [&](size_t row, uint64_t id) {
+                    rows.push_back(row);
+                    ids.push_back(id);
+                  });
+  EXPECT_EQ(ids, (std::vector<uint64_t>{20, 40}));  // matched, dup collapsed
+  EXPECT_EQ(rows, (std::vector<size_t>{1, 3}));
+  EXPECT_TRUE(std::is_sorted(rows.begin(), rows.end()));
+
+  // Tombstone case: a remapped rowmap has monotonic-WITH-GAPS rows; the gather
+  // is still non-decreasing.
+  std::vector<IdRowPair> gapped{{11, 0}, {22, 3}, {33, 7}, {44, 9}};
+  std::vector<uint64_t> cands2{22, 33, 44};
+  std::vector<size_t> rows2;
+  mergeJoinRowmap(cands2.begin(), cands2.end(), gapped.begin(), gapped.end(),
+                  [&](size_t row, uint64_t) { rows2.push_back(row); });
+  EXPECT_EQ(rows2, (std::vector<size_t>{3, 7, 9}));
+  EXPECT_TRUE(std::is_sorted(rows2.begin(), rows2.end()));
+}
+
+// _____________________________________________________________________________
+// A DENSE candidate set (all live entities) via the merge-join must return the
+// exact same top-k as the unrestricted whole-index search.
+TEST(VectorIndex, exactSearchDenseCandidatesMatchesFull) {
+  auto b = buildTmp(/*withHnsw=*/false);
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+  std::vector<Id> all;
+  for (size_t i = 0; i < NUM_VECTORS; ++i) {
+    all.push_back(b.data.id(i));
+  }
+  auto res = idx.searchExact(b.data.vecs[3], 10, ql::span<const Id>{all});
+  auto full = idx.searchExact(b.data.vecs[3], 10);
+  ASSERT_EQ(res.size(), full.size());
+  for (size_t i = 0; i < res.size(); ++i) {
+    EXPECT_EQ(res[i].entity_, full[i].entity_);
+    EXPECT_EQ(res[i].distance_, full[i].distance_);
+  }
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
+// Candidates arriving UNSORTED (the merge sorts a local copy) yield exactly the
+// same result as the same set sorted, and duplicates do not double-count.
+TEST(VectorIndex, exactSearchUnsortedCandidatesStillCorrect) {
+  auto b = buildTmp(/*withHnsw=*/false);
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+  std::vector<Id> subset;
+  for (size_t i = 0; i < NUM_VECTORS; i += 3) {
+    subset.push_back(b.data.id(i));
+  }
+  auto sortedRes =
+      idx.searchExact(b.data.vecs[7], 8, ql::span<const Id>{subset});
+  // Shuffle and add duplicates; the result must be identical.
+  std::vector<Id> shuffled = subset;
+  shuffled.insert(shuffled.end(), subset.begin(), subset.begin() + 5);
+  std::mt19937 rng{999};
+  std::shuffle(shuffled.begin(), shuffled.end(), rng);
+  auto shuffledRes =
+      idx.searchExact(b.data.vecs[7], 8, ql::span<const Id>{shuffled});
+  ASSERT_EQ(shuffledRes.size(), sortedRes.size());
+  for (size_t i = 0; i < sortedRes.size(); ++i) {
+    EXPECT_EQ(shuffledRes[i].entity_, sortedRes[i].entity_);
+    EXPECT_EQ(shuffledRes[i].distance_, sortedRes[i].distance_);
+  }
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
+// A non-`VocabIndex` candidate id (here a double `Id`, whose bits are not a
+// stored entity) is simply skipped by the merge; the other candidates are
+// unaffected.
+TEST(VectorIndex, exactSearchNonVocabIndexCandidateSkipped) {
+  auto b = buildTmp(/*withHnsw=*/false);
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+  std::vector<Id> valid{b.data.id(1), b.data.id(2), b.data.id(3)};
+  std::vector<Id> mixed = valid;
+  mixed.push_back(Id::makeFromDouble(3.14));  // no vector, must be skipped
+  mixed.push_back(Id::makeFromBool(true));    // ditto
+  auto validRes = idx.searchExact(b.data.vecs[2], 5, ql::span<const Id>{valid});
+  auto mixedRes = idx.searchExact(b.data.vecs[2], 5, ql::span<const Id>{mixed});
+  ASSERT_EQ(mixedRes.size(), validRes.size());
+  for (size_t i = 0; i < validRes.size(); ++i) {
+    EXPECT_EQ(mixedRes[i].entity_, validRes[i].entity_);
+    EXPECT_EQ(mixedRes[i].distance_, validRes[i].distance_);
+  }
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
+// The collation fingerprint set on the builder is persisted in the metadata,
+// survives a JSON round-trip, and defaults to empty for a metadata that never
+// carried it (back-compat).
+TEST(VectorIndex, collationLocalePersistedInMetadata) {
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = "col";
+  cfg.dimensions_ = 4;
+  cfg.buildHnsw_ = false;
+  VectorIndexBuilder builder{basename, cfg};
+  builder.setCollationLocale("en_US|nonIgnorable");
+  builder.add(mkId(1), "<http://ex/1>", std::vector<float>{1, 0, 0, 0});
+  builder.add(mkId(2), "<http://ex/2>", std::vector<float>{0, 1, 0, 0});
+  auto meta = builder.build();
+  EXPECT_EQ(meta.collationLocale_, "en_US|nonIgnorable");
+  VectorIndex idx;
+  idx.open(basename, "col");
+  EXPECT_EQ(idx.metadata().collationLocale_, "en_US|nonIgnorable");
+  // JSON round-trip preserves it; an absent key defaults to empty.
+  nlohmann::json j = meta;
+  EXPECT_EQ(j.get<VectorIndexMetadata>().collationLocale_,
+            "en_US|nonIgnorable");
+  j.erase("collationLocale");
+  EXPECT_EQ(j.get<VectorIndexMetadata>().collationLocale_, std::string{});
+  for (auto* suffix :
+       {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + ".vec.col" + suffix, ec);
+  }
 }
 
 // _____________________________________________________________________________

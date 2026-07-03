@@ -9,6 +9,8 @@
 
 #include <sys/mman.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -134,6 +136,15 @@ struct VectorIndex::Impl {
   // `AlignedCopy`). When set, `base()` reads from it (with the padded
   // `stride_`) instead of the memory-mapped file.
   std::unique_ptr<char, AlignedFree> alignedBuf_;
+  // Sticky safety net for the sequential-read hint of the merge-join gather.
+  // The gather emits rows in non-decreasing order iff the store is genuinely
+  // id-sorted (the normal case). If a gather is ever observed to emit rows out
+  // of order (a changed KG collation, so the store's layout no longer matches
+  // the current ids), this latches and later gathers stop advising SEQUENTIAL
+  // (which would mislead the kernel's read-ahead). Correctness is unaffected
+  // either way; this only tunes the `madvise` hint. `mutable` so the const
+  // search methods can set it; `atomic` for concurrent searches.
+  mutable std::atomic<bool> gatherNonMonotonic_{false};
 
   size_t dim() const { return meta_.config_.dimensions_; }
   size_t rowBytes() const {
@@ -519,7 +530,7 @@ class TopK {
 // `VectorIndex::Impl` without naming it.)
 template <typename ImplT>
 std::vector<ScoredEntity> searchExactBytes(
-    const ImplT& impl, const char* queryBytes, size_t k,
+    ImplT& impl, const char* queryBytes, size_t k,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt) {
@@ -542,33 +553,81 @@ std::vector<ScoredEntity> searchExactBytes(
       top.offer(dist, id);
     }
   };
-  auto scanAll = [&](auto&& keepId) {
-    for (size_t row = 0; row < impl.meta_.numVectors_; ++row) {
-      uint64_t id = impl.keys_[row];
-      if (id != TOMBSTONE_KEY && keepId(id)) {
-        consider(row, id);
+
+  // RAII: advise the flat store for a SEQUENTIAL scan while the ordered scan
+  // below runs, restoring RANDOM (the gather default) on exit. This is a purely
+  // advisory `madvise` read-ahead hint on the memory-mapped store; it never
+  // affects results. Skipped when the store is a resident aligned RAM copy (no
+  // paging to advise). Concurrent searches may briefly toggle the shared hint
+  // -- harmless, it is only a hint.
+  struct SeqScanHint {
+    ImplT& impl_;
+    bool active_;
+    SeqScanHint(ImplT& impl, bool active) : impl_{impl}, active_{active} {
+      if (active_) {
+        impl_.data_.setAccessPattern(ad_utility::AccessPattern::Sequential);
+      }
+    }
+    ~SeqScanHint() {
+      if (active_) {
+        impl_.data_.setAccessPattern(ad_utility::AccessPattern::Random);
       }
     }
   };
+
   if (!candidates.has_value()) {
-    scanAll([](uint64_t) { return true; });
-  } else if (candidates->size() * 8 >= impl.numLive()) {
-    // A large candidate set: a sequential scan with a membership filter beats
-    // one random binary search + one random row access per candidate.
-    // NOTE: an empty candidate set deliberately yields an empty result -- the
-    // caller has already restricted the search space to nothing.
-    ad_utility::HashSet<uint64_t> wanted;
-    wanted.reserve(candidates->size());
-    for (Id c : candidates.value()) {
-      wanted.insert(c.getBits());
-    }
-    scanAll([&wanted](uint64_t id) { return wanted.contains(id); });
-  } else {
-    for (Id c : candidates.value()) {
-      if (auto row = impl.rowOf(c); row.has_value()) {
-        consider(row.value(), c.getBits());
+    // Whole-index brute force: rows are visited in order, so it is sequential.
+    SeqScanHint hint{impl, !impl.alignedBuf_};
+    for (size_t row = 0; row < impl.meta_.numVectors_; ++row) {
+      uint64_t id = impl.keys_[row];
+      if (id != TOMBSTONE_KEY) {
+        consider(row, id);
       }
     }
+    return top.sorted();
+  }
+
+  // Restricted search: merge-join the candidate id set against the id-sorted
+  // `.rowmap`. This replaces both the old per-candidate `lower_bound` gather
+  // (sparse sets) and the whole-index membership scan (dense sets) with a
+  // single O(#candidates + #rows) pass whose row reads are sequential (see
+  // `mergeJoinRowmap`). NOTE: an empty candidate set deliberately yields an
+  // empty result -- the caller has already restricted the search space to
+  // nothing.
+  std::vector<uint64_t> candBits;
+  candBits.reserve(candidates->size());
+  for (Id c : candidates.value()) {
+    candBits.push_back(c.getBits());
+  }
+  // The candidate column from an index scan already arrives ValueId-sorted; if
+  // it does not (e.g. a hand-built set, or one deduplicated in hit order), sort
+  // a local copy so the merge -- and its sequential `.data` access -- still
+  // applies. (This also collapses duplicate candidate ids.)
+  if (!std::is_sorted(candBits.begin(), candBits.end())) {
+    std::sort(candBits.begin(), candBits.end());
+  }
+  // The merge emits rows in non-decreasing order on a genuinely id-sorted
+  // store. Track it: if it is ever violated (a stale collation), latch the flag
+  // so later gathers skip the misleading SEQUENTIAL hint.
+  bool seqHint = !impl.alignedBuf_ &&
+                 !impl.gatherNonMonotonic_.load(std::memory_order_relaxed);
+  bool monotonic = true;
+  size_t prevRow = 0;
+  bool havePrev = false;
+  {
+    SeqScanHint hint{impl, seqHint};
+    mergeJoinRowmap(candBits.begin(), candBits.end(), impl.rowmap_.begin(),
+                    impl.rowmap_.end(), [&](size_t row, uint64_t id) {
+                      if (havePrev && row < prevRow) {
+                        monotonic = false;
+                      }
+                      prevRow = row;
+                      havePrev = true;
+                      consider(row, id);
+                    });
+  }
+  if (seqHint && !monotonic) {
+    impl.gatherNonMonotonic_.store(true, std::memory_order_relaxed);
   }
   return top.sorted();
 }
@@ -579,7 +638,9 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt) const {
-  const auto& impl = *impl_;
+  // Non-const so the gather can toggle the flat store's (advisory) access-
+  // pattern hint; all result-affecting state stays read-only.
+  auto& impl = *impl_;
   if (query.size() != impl.dim()) {
     AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
              ", but vector index \"" + impl.meta_.config_.name_ +
@@ -596,7 +657,9 @@ std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt) const {
-  const auto& impl = *impl_;
+  // Non-const so the gather can toggle the flat store's (advisory) access-
+  // pattern hint; all result-affecting state stays read-only.
+  auto& impl = *impl_;
   auto row = impl.rowOf(entity);
   if (!row.has_value()) {
     return {};

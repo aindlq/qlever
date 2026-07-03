@@ -83,6 +83,38 @@ struct IdRowPair {
   uint64_t row_;
 };
 
+// Two-pointer merge join of an ascending-by-id candidate id range against the
+// ascending-by-id `.rowmap`. Calls `emit(row, idBits)` once for every candidate
+// id that has a live row (duplicate candidate ids are collapsed). Both
+// `[candFirst, candLast)` and `[rmFirst, rmLast)` MUST be sorted ascending by
+// id bits. Runs in O(#candidates + #rows).
+//
+// Because the flat store is stored in id (== IRI-lex) order, the rowmap's
+// `row_` values are monotonically non-decreasing in id, so the rows this emits
+// come out non-decreasing too => sequential `.data` reads. IMPORTANT:
+// correctness does NOT depend on that invariant -- a merge over the same id key
+// is correct regardless; only the *sequentiality* of the emitted rows (and thus
+// the read-ahead win) relies on the store being id-sorted. A candidate id that
+// is not a stored entity (e.g. a local-vocab or non-`VocabIndex` id) simply
+// fails to match and is skipped.
+template <typename CandIt, typename RowmapIt, typename Emit>
+void mergeJoinRowmap(CandIt candFirst, CandIt candLast, RowmapIt rmFirst,
+                     RowmapIt rmLast, Emit&& emit) {
+  while (candFirst != candLast && rmFirst != rmLast) {
+    uint64_t candBits = *candFirst;
+    uint64_t rowBits = rmFirst->idBits_;
+    if (candBits < rowBits) {
+      ++candFirst;
+    } else if (rowBits < candBits) {
+      ++rmFirst;
+    } else {
+      emit(static_cast<size_t>(rmFirst->row_), candBits);
+      ++candFirst;
+      ++rmFirst;
+    }
+  }
+}
+
 // The similarity metric of an index. Maps 1:1 to a `usearch` metric kind.
 enum class VectorMetric : uint8_t { Cosine, L2Sq, InnerProduct };
 
@@ -218,6 +250,15 @@ struct VectorIndexMetadata {
   // are 64-byte aligned this is the padded stride; the distance kernels still
   // read only `dimensions` scalars, so the pad tail is never touched.
   uint64_t rowStrideBytes_ = 0;
+  // Fingerprint of the knowledge-graph vocabulary's collation
+  // (`LocaleManager::getCollationIdentifier()`) at (re)mapping time. The
+  // store's rows are laid out in vocabulary (collation) order; a changed
+  // collation would make that order stale relative to the current ids. Empty
+  // means "not stored" (a v4 index, or a build before this field existed).
+  // Purely a guard: the load hook WARNs on a mismatch but keeps serving
+  // (candidate gathers stay correct, they merely lose the sequential-read
+  // speedup). Never affects results.
+  std::string collationLocale_;
 };
 
 // Path helpers. Centralised so the builder and the reader agree.
@@ -263,7 +304,8 @@ inline void to_json(nlohmann::json& j, const VectorIndexMetadata& m) {
                      {"embeddingModel", m.config_.embeddingModel_},
                      {"version", m.version_},
                      {"vocabSize", m.vocabSize_},
-                     {"rowStrideBytes", m.rowStrideBytes_}};
+                     {"rowStrideBytes", m.rowStrideBytes_},
+                     {"collationLocale", m.collationLocale_}};
 }
 
 inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
@@ -283,6 +325,9 @@ inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
   m.vocabSize_ = j.value("vocabSize", uint64_t{0});
   // Absent in v4 (0 => the loader derives the raw row byte length).
   m.rowStrideBytes_ = j.value("rowStrideBytes", uint64_t{0});
+  // Absent before the collation guard existed ("" => the load hook skips the
+  // collation check for this index).
+  m.collationLocale_ = j.value("collationLocale", std::string{});
 }
 
 }  // namespace qlever::vector

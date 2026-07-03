@@ -408,6 +408,7 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   meta.version_ = VECTOR_INDEX_VERSION;
   meta.vocabSize_ = vocabSize_;
   meta.rowStrideBytes_ = stride;
+  meta.collationLocale_ = collationLocale_;
   {
     outputsCleanup.track(tmp(metaPath));
     std::ofstream metaOut{tmp(metaPath)};

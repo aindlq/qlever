@@ -295,6 +295,18 @@ class LocaleManager {
     return res;
   }
 
+  // A stable, human-readable identifier of this locale's collation settings
+  // (the ICU locale name plus the punctuation-handling mode). Two
+  // `LocaleManager`s that order strings identically share this string. It is
+  // used as a fingerprint so that a structure whose layout depends on the
+  // vocabulary's sort order (e.g. the vector index's id-sorted flat store) can
+  // detect -- and warn about -- a collation change under it.
+  [[nodiscard]] std::string getCollationIdentifier() const {
+    return std::string{_icuLocale.getName()} +
+           (_ignorePunctuationStatus == UCOL_SHIFTED ? "|shifted"
+                                                     : "|nonIgnorable");
+  }
+
  private:
   icu::Locale _icuLocale;  // the held locale
   /* One collator for each collation Level to make this class threadsafe.
