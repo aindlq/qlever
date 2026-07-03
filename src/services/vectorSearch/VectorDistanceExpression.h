@@ -23,13 +23,21 @@ namespace sparqlExpression {
 // `UNDEF`. Combined with QLever's own `BIND`, `ORDER BY`, and `LIMIT`, this IS
 // filtered top-k vector search -- no bespoke operator needed:
 //
-//   BIND(vec:distance("clip", ?e, "0.1,0.2,...") AS ?d) ... ORDER BY ?d LIMIT k
+//   BIND(vec:distance("clip", ?e, "0.1,0.2,...") AS ?d)
+//   FILTER(BOUND(?d)) ... ORDER BY ?d LIMIT k
+//
+// IMPORTANT: keep the `FILTER(BOUND(?d))` when the bound `?entity` set may
+// contain entities WITHOUT a vector. `UNDEF` sorts BEFORE every real value in
+// ascending `ORDER BY`, so without the filter a `LIMIT k` would return
+// vectorless entities (with an `UNDEF` distance) first instead of the k
+// nearest. The filter is unnecessary only when every candidate is known to
+// have a vector.
 //
 // The query point is a constant: either an explicit comma-separated float
 // literal, or a constant entity IRI whose stored vector is used as the query.
-// (The index name is likewise a constant string literal.) The lives entirely in
-// the vector-search service folder and is wired into the parser via the generic
-// `parsedQuery::SparqlFunctionRegistry`.
+// (The index name is likewise a constant string literal.) This lives entirely
+// in the vector-search service folder and is wired into the parser via the
+// generic `parsedQuery::SparqlFunctionRegistry`.
 class VectorDistanceExpression : public SparqlExpression {
  public:
   // The query point is given EITHER as an explicit vector OR as a constant

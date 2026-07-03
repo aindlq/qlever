@@ -200,6 +200,14 @@ struct VectorIndexConfig {
   // resulting per-row stride is persisted as `rowStrideBytes_`.
   bool alignRows_ = false;
 
+  // RAM-residency preference for the flat store, applied by the loader at
+  // `open()`: "none" (mmap, paged on demand), "advise" (MADV_WILLNEED
+  // prefault), "lock" (also mlock -- fault-free, non-evictable), or "aligned"
+  // (a huge-page-backed, 64-byte-aligned RAM copy). Persisted so the index
+  // author can pick a default; gated on fits-in-RAM at load time. An explicit
+  // `open(..., residency)` argument overrides this.
+  std::string preload_ = "none";
+
   // Optional embedding endpoint, bound to this index so that query-time
   // embedding always uses the SAME model that produced the index.
   // `embeddingUrl_` is an OpenAI-compatible base URL (the client appends
@@ -305,6 +313,7 @@ inline void to_json(nlohmann::json& j, const VectorIndexMetadata& m) {
                      {"version", m.version_},
                      {"vocabSize", m.vocabSize_},
                      {"rowStrideBytes", m.rowStrideBytes_},
+                     {"preload", m.config_.preload_},
                      {"collationLocale", m.collationLocale_}};
 }
 
@@ -325,6 +334,8 @@ inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
   m.vocabSize_ = j.value("vocabSize", uint64_t{0});
   // Absent in v4 (0 => the loader derives the raw row byte length).
   m.rowStrideBytes_ = j.value("rowStrideBytes", uint64_t{0});
+  // Load-time residency preference; absent => "none" (plain mmap).
+  m.config_.preload_ = j.value("preload", std::string{"none"});
   // Absent before the collation guard existed ("" => the load hook skips the
   // collation check for this index).
   m.collationLocale_ = j.value("collationLocale", std::string{});

@@ -93,11 +93,13 @@ uint64_t vocabFingerprint(const IndexImpl& impl) {
   return static_cast<uint64_t>(impl.getVocab().size());
 }
 
-// The knowledge-graph vocabulary's collation fingerprint. The vector store's
-// rows are laid out in vocabulary (collation) order, so this is persisted at
-// build/remap time and re-checked at load: a mismatch means the collation
-// changed under the store (its id order is now stale). Only a warning -- the
-// merge-join gather stays correct, it just loses its sequential-read speedup.
+// The knowledge-graph vocabulary's collation fingerprint. Entity ids are
+// `VocabIndex` positions in the collation-sorted vocabulary, so this is
+// persisted at build/remap time and re-checked at load: a mismatch means the
+// collation changed, which reassigns every id and invalidates the persisted
+// id->row mapping. The load hook therefore SKIPS such an index (forcing a
+// remap), like the vocab-size guard -- it is a correctness gate, not a
+// performance hint.
 std::string collationFingerprint(const IndexImpl& impl) {
   return impl.getVocab().getLocaleManager().getCollationIdentifier();
 }
@@ -158,6 +160,8 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
                                         "buildThreads",
                                         "embeddingUrl",
                                         "embeddingModel",
+                                        "alignRows",
+                                        "preload",
                                         "remap"};
   for (const auto& [key, value] : obj.items()) {
     if (ql::ranges::find(knownKeys, key) == knownKeys.end()) {
@@ -165,7 +169,8 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
                "\" in a vectorSearch build spec. Known keys: name, iris, npy, "
                "texts, parquet, dimensions, metric, scalar, hnsw, "
                "hnswConnectivity, hnswExpansionAdd, hnswExpansionSearch, "
-               "buildThreads, embeddingUrl, embeddingModel, remap.");
+               "buildThreads, embeddingUrl, embeddingModel, alignRows, "
+               "preload, remap.");
     }
   }
   try {
@@ -191,8 +196,19 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
     spec.config_.buildThreads_ = obj.value("buildThreads", uint32_t{0});
     spec.config_.embeddingUrl_ = obj.value("embeddingUrl", std::string{});
     spec.config_.embeddingModel_ = obj.value("embeddingModel", std::string{});
+    spec.config_.alignRows_ = obj.value("alignRows", false);
+    spec.config_.preload_ = obj.value("preload", std::string{"none"});
   } catch (const nlohmann::json::exception& e) {
     AD_THROW(std::string{"Malformed vectorSearch build spec: "} + e.what());
+  }
+  // Validate the residency preference now (rather than at load time, on a
+  // machine that may differ), so a typo is caught during `qlever index`.
+  if (spec.config_.preload_ != "none" && spec.config_.preload_ != "advise" &&
+      spec.config_.preload_ != "lock" && spec.config_.preload_ != "aligned") {
+    AD_THROW(
+        "`preload` must be one of \"none\", \"advise\", \"lock\", or "
+        "\"aligned\" (got \"" +
+        spec.config_.preload_ + "\").");
   }
   int numInputs = static_cast<int>(!spec.npyPath_.empty()) +
                   static_cast<int>(!spec.textsPath_.empty()) +
@@ -587,20 +603,27 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
           << "the HNSW graph)." << std::endl;
       continue;
     }
-    // Collation guard: the store's rows are in vocabulary (collation) order. A
-    // changed collation leaves the id order stale, so the merge-join gather
-    // loses its sequential-read speedup (but stays correct). Warn, keep
-    // serving.
+    // Collation guard: entity ids are `VocabIndex` positions in the
+    // collation-sorted vocabulary, so a changed collation re-sorts the vocab
+    // and reassigns every id -- WITHOUT changing the vocabulary size, so the
+    // size guard above does not catch it. The persisted `.keys`/`.rowmap` then
+    // map the new query-time ids to the wrong rows/entities. This is a
+    // correctness problem (not merely a slower gather), so skip the index and
+    // force a remap, exactly like the size mismatch above (a remap re-resolves
+    // the immutable `.iris` against the current vocabulary).
     if (const std::string& built = idx.metadata().collationLocale_;
         !built.empty() && built != collationFingerprint(impl)) {
-      AD_LOG_WARN
-          << "Vector index '" << name << "': it was built with collation \""
-          << built << "\", but the knowledge graph now uses \""
-          << collationFingerprint(impl)
-          << "\". Searches stay correct, but candidate gathers may be slower "
-             "(the id-sorted flat store no longer matches the current id "
-             "order). Consider rebuilding the vector index."
-          << std::endl;
+      AD_LOG_WARN << "Skipping vector index '" << name
+                  << "': it was built with "
+                  << "collation \"" << built
+                  << "\", but the knowledge graph now uses \""
+                  << collationFingerprint(impl)
+                  << "\", so its entity ids are no longer valid. Remap it with "
+                     "`--service-index '{\"vectorSearch\":[{\"name\":\""
+                  << name
+                  << "\",\"remap\":true}]}'` (cheap; reuses the vectors and "
+                  << "the HNSW graph)." << std::endl;
+      continue;
     }
     AD_LOG_INFO << "Loaded vector index '" << name << "' ("
                 << idx.numLiveVectors() << " vectors"
@@ -652,11 +675,15 @@ std::pair<uint64_t, uint64_t> remapVectorIndex(const Index& index,
       AD_THROW("Cannot remap vector index \"" + name +
                "\": its metadata is malformed: " + e.what());
     }
-    if (meta.version_ != VECTOR_INDEX_VERSION) {
+    // Remap only rewrites the small `.keys`/`.rowmap`/`.meta` files and never
+    // touches `.data`/`.iris`, so it is safe for any SUPPORTED on-disk version
+    // (a v4 index loads, so it must also be remappable). The rewritten metadata
+    // is re-stamped at the current version below.
+    if (!isSupportedVectorIndexVersion(meta.version_)) {
       AD_THROW("Cannot remap vector index \"" + name + "\": it has version " +
-               std::to_string(meta.version_) + ", but this binary expects " +
-               std::to_string(VECTOR_INDEX_VERSION) +
-               ". Please rebuild the vector index.");
+               std::to_string(meta.version_) +
+               ", which this binary does not support. Please rebuild the "
+               "vector index.");
     }
   }
 

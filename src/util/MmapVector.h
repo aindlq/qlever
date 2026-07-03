@@ -272,6 +272,13 @@ class MmapVector {
     advise(_pattern);
   }
 
+  // Issue the read-ahead `madvise` for `p` WITHOUT recording it as this
+  // vector's access pattern (unlike `setAccessPattern`, which writes the
+  // `_pattern` member). Use this for a short-lived, self-restoring hint on a
+  // mapping that is shared read-only across threads: it writes no member, only
+  // an advisory syscall, so concurrent callers do not race.
+  void adviseAccessPattern(AccessPattern p) { advise(p); }
+
   // Ask the kernel to eagerly read the whole mapping into the page cache
   // (`madvise(MADV_WILLNEED)`). This is only advisory (asynchronous read-ahead,
   // not a residency guarantee) and a no-op in the reduced feature set / on
@@ -377,6 +384,7 @@ class MmapVectorView : private MmapVector<T> {
   bool lockInMemory() { return MmapVector<T>::lockInMemory(); }
   void unlockMemory() { MmapVector<T>::unlockMemory(); }
   using MmapVector<T>::setAccessPattern;
+  using MmapVector<T>::adviseAccessPattern;
 
   // default constructor, leaves an uninitialized vector that will throw until a
   // valid call to open()

@@ -203,6 +203,17 @@ struct VectorIndex::Impl {
   }
 };
 
+namespace {
+// Map the persisted `preload` metadata string to a `Residency`. An unknown
+// value (should not happen -- validated at build time) falls back to `None`.
+VectorIndex::Residency residencyFromString(const std::string& s) {
+  if (s == "advise") return VectorIndex::Residency::Advise;
+  if (s == "lock") return VectorIndex::Residency::Lock;
+  if (s == "aligned") return VectorIndex::Residency::AlignedCopy;
+  return VectorIndex::Residency::None;
+}
+}  // namespace
+
 // ____________________________________________________________________________
 VectorIndex::VectorIndex() : impl_{std::make_unique<Impl>()} {}
 VectorIndex::~VectorIndex() = default;
@@ -340,8 +351,12 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
   }
 
   // 5. Optionally make the flat store resident / SIMD-aligned in RAM. Purely a
-  //    paging/throughput optimisation applied after a successful open.
-  makeResident(residency);
+  //    paging/throughput optimisation applied after a successful open. An
+  //    explicit `residency` argument overrides the per-index persisted
+  //    `preload` preference (the default `None` falls back to it).
+  makeResident(residency != Residency::None
+                   ? residency
+                   : residencyFromString(impl.meta_.config_.preload_));
 }
 
 // ____________________________________________________________________________
@@ -558,19 +573,23 @@ std::vector<ScoredEntity> searchExactBytes(
   // below runs, restoring RANDOM (the gather default) on exit. This is a purely
   // advisory `madvise` read-ahead hint on the memory-mapped store; it never
   // affects results. Skipped when the store is a resident aligned RAM copy (no
-  // paging to advise). Concurrent searches may briefly toggle the shared hint
-  // -- harmless, it is only a hint.
+  // paging to advise). We call `advise()` (a stateless `madvise`) rather than
+  // `setAccessPattern()` on purpose: the search methods are logically const but
+  // share one `Impl` across concurrent query threads, and `setAccessPattern`
+  // would write the vector's non-atomic `_pattern` member (a data race).
+  // Concurrent `advise()` calls only issue overlapping advisory hints, which is
+  // harmless.
   struct SeqScanHint {
     ImplT& impl_;
     bool active_;
     SeqScanHint(ImplT& impl, bool active) : impl_{impl}, active_{active} {
       if (active_) {
-        impl_.data_.setAccessPattern(ad_utility::AccessPattern::Sequential);
+        impl_.data_.adviseAccessPattern(ad_utility::AccessPattern::Sequential);
       }
     }
     ~SeqScanHint() {
       if (active_) {
-        impl_.data_.setAccessPattern(ad_utility::AccessPattern::Random);
+        impl_.data_.adviseAccessPattern(ad_utility::AccessPattern::Random);
       }
     }
   };
