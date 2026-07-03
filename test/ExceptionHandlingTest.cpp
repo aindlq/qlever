@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 
@@ -181,9 +182,11 @@ TEST(ExceptionCollector, isThreadSafe) {
     }
     // Wait for threads to complete.
   }
-  AD_EXPECT_THROW_WITH_MESSAGE_AND_TYPE(collector.rethrowIfException(),
-                                        ::testing::MatchesRegex("t[0-9]+"),
-                                        std::runtime_error);
+  AD_EXPECT_THROW_WITH_MESSAGE_AND_TYPE(
+      collector.rethrowIfException(), ::testing::Truly([](const char* msg) {
+        return std::regex_match(msg, std::regex{"t[0-9]+"});
+      }),
+      std::runtime_error);
 }
 
 // _____________________________________________________________________________
