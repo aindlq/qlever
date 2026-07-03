@@ -26,6 +26,7 @@
 #include "parser/SparqlFunctionRegistry.h"
 #include "services/vectorSearch/VectorDistanceExpression.h"
 #include "services/vectorSearch/VectorSearch.h"
+#include "services/vectorSearch/VectorSearchAmong.h"
 #include "services/vectorSearch/VectorSearchJoin.h"
 #include "services/vectorSearch/VectorSearchQuery.h"
 
@@ -51,8 +52,22 @@ void registerVectorSearchService() {
         auto config = vectorQuery.toVectorSearchConfiguration();
         QueryExecutionContext* qec = ctx.qec();
 
-        if (config.leftVariable_.has_value() &&
-            vectorQuery.childGraphPattern_.has_value()) {
+        if (config.amongVariable_.has_value()) {
+          // "the top-k of the ?s bound by the SURROUNDING query": an incomplete
+          // join leaf whose candidate/result variable is `<among>`; the join
+          // enumeration adds the subtree that binds it (see
+          // `IncompleteJoinOperation`). The candidates come from OUTSIDE the
+          // SERVICE, so a nested pattern is not allowed.
+          if (vectorQuery.childGraphPattern_.has_value()) {
+            throw std::runtime_error{
+                "`vec:among` takes its candidate set from the surrounding "
+                "query; do not also give a nested `{ ... }` pattern inside the "
+                "SERVICE clause."};
+          }
+          ctx.addLeafOperation(
+              std::make_shared<VectorSearchAmong>(qec, config));
+        } else if (config.leftVariable_.has_value() &&
+                   vectorQuery.childGraphPattern_.has_value()) {
           // "for each ?x in the nested pattern, find the k nearest."
           ctx.addOperationWithChildPattern(
               vectorQuery.childGraphPattern_.value(),

@@ -47,6 +47,13 @@ struct VectorSearchConfiguration {
                                                    // nested query pattern (the
   // "for each ?x" binary form).
 
+  // The "among" form: an outer-bound candidate restriction. When set, the
+  // candidate set (and the result) is this variable, bound by the SURROUNDING
+  // query; the search returns the top-k of those candidates by distance to the
+  // (fixed) query point. It always equals `resultVariable_` and is mutually
+  // exclusive with `leftVariable_`. Handled by `VectorSearchAmong`.
+  std::optional<Variable> amongVariable_;
+
   // The variable bound to each result entity.
   Variable resultVariable_{"?_qlever_internal_vec_result"};
 

@@ -12,34 +12,13 @@
 
 #include <cmath>
 
-#include "backports/StartsWithAndEndsWith.h"
 #include "index/IndexImpl.h"
-#include "parser/TripleComponent.h"
-#include "rdfTypes/Iri.h"
-#include "services/vectorSearch/EmbeddingClient.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
+#include "services/vectorSearch/VectorQueryPoint.h"
 #include "util/HashSet.h"
 
 namespace {
-// Turn an image query into the payload sent to the embedding endpoint: a URL is
-// passed through (the endpoint fetches it); raw base64 is wrapped into a data
-// URI (a `data:` value is passed through unchanged).
-std::string buildImagePayload(
-    const qlever::vector::VectorSearchConfiguration::ImageQuery& image) {
-  using ImageKind = qlever::vector::VectorSearchConfiguration::ImageKind;
-  switch (image.kind_) {
-    case ImageKind::Url:
-      return image.value_;
-    case ImageKind::Base64:
-      if (ql::starts_with(image.value_, "data:")) {
-        return image.value_;
-      }
-      return absl::StrCat("data:image/jpeg;base64,", image.value_);
-  }
-  return image.value_;
-}
-
 // Append a string to a cache key unambiguously (length-prefixed, so crafted
 // values cannot collide with other parts of the key).
 void appendToKey(std::string* key, std::string_view field,
@@ -206,50 +185,21 @@ Result VectorSearch::computeResult([[maybe_unused]] bool requestLaziness) {
 
   IdTable idTable{getResultWidth(), getExecutionContext()->getAllocator()};
 
-  // Resolve the query point: an explicit or embedded vector goes into
-  // `query`; a constant entity (`vec:query <iri>`) is searched by its STORED
-  // vector directly (no decode/re-encode through f32), tracked in
-  // `queryEntity`.
+  // Resolve the query point (shared with `VectorSearchAmong`): an explicit or
+  // embedded vector goes into `query`; a constant entity (`vec:query <iri>`) is
+  // searched by its STORED vector directly (no decode/re-encode through f32),
+  // tracked in `queryEntity`; an unknown/vectorless entity -> empty result.
+  qlever::vector::QueryPoint queryPoint = qlever::vector::resolveQueryPoint(
+      config_, *vidx, index.getImpl(), cancellationHandle_);
+  if (std::holds_alternative<std::monostate>(queryPoint)) {
+    return {std::move(idTable), resultSortedOn(), LocalVocab{}};
+  }
   std::vector<float> query;
   std::optional<Id> queryEntity;
-  if (config_.queryVector_.has_value()) {
-    query = config_.queryVector_.value();
-  } else if (config_.queryText_.has_value()) {
-    const auto& meta = vidx->metadata().config_;
-    if (meta.embeddingUrl_.empty()) {
-      throw std::runtime_error{absl::StrCat(
-          "Vector index '", config_.indexName_,
-          "' has no embedding endpoint configured, so `vec:queryText` cannot "
-          "be used.")};
-    }
-    query = qlever::vector::embedTextOpenAI(
-        meta.embeddingUrl_, meta.embeddingModel_, config_.queryText_.value(),
-        cancellationHandle_);
-  } else if (config_.queryImage_.has_value()) {
-    const auto& meta = vidx->metadata().config_;
-    if (meta.embeddingUrl_.empty()) {
-      throw std::runtime_error{absl::StrCat(
-          "Vector index '", config_.indexName_,
-          "' has no embedding endpoint configured, so image queries cannot be "
-          "used.")};
-    }
-    query = qlever::vector::embedImageOpenAI(
-        meta.embeddingUrl_, meta.embeddingModel_,
-        buildImagePayload(config_.queryImage_.value()), cancellationHandle_);
+  if (std::holds_alternative<Id>(queryPoint)) {
+    queryEntity = std::get<Id>(queryPoint);
   } else {
-    TripleComponent tc{ad_utility::triple_component::Iri::fromIriref(
-        config_.queryEntityIri_.value())};
-    std::optional<Id> id = tc.toValueId(index.getImpl());
-    if (!id.has_value() || !vidx->hasVector(id.value())) {
-      // The query entity is unknown or has no vector -> empty result.
-      return {std::move(idTable), resultSortedOn(), LocalVocab{}};
-    }
-    queryEntity = id;
-  }
-  if (!queryEntity.has_value() && query.size() != vidx->dimensions()) {
-    throw std::runtime_error{absl::StrCat(
-        "The query vector has dimension ", query.size(), ", but vector index '",
-        config_.indexName_, "' has dimension ", vidx->dimensions(), ".")};
+    query = std::move(std::get<std::vector<float>>(queryPoint));
   }
 
   using Algo = qlever::vector::VectorSearchConfiguration::Algorithm;

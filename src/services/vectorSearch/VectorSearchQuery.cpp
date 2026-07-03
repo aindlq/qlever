@@ -83,6 +83,8 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
     queryImage_ = {ImageKind::Base64, requireLiteral()};
   } else if (pred == "left") {
     setVariable("left", object, leftVar_);
+  } else if (pred == "among") {
+    setVariable("among", object, amongVar_);
   } else if (pred == "result" || pred == "right") {
     setVariable("result", object, resultVar_);
   } else if (pred == "bindScore") {
@@ -129,7 +131,8 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
         "Unsupported parameter `<", pred,
         ">` in vector search; supported: `<index>`, `<query>`, "
         "`<queryVector>`, `<queryText>`, `<imageUrl>`, `<imageBase64>`, "
-        "`<left>`, `<result>`/`<right>`, `<bindScore>`, `<k>` (alias "
+        "`<left>`, `<among>`, `<result>`/`<right>`, `<bindScore>`, `<k>` "
+        "(alias "
         "`<numNearestNeighbors>`), `<maxDistance>`, `<algorithm>`.")};
   }
 }
@@ -148,9 +151,23 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   };
   throwIf(!indexName_.has_value(),
           "Vector search requires the `<index>` parameter.");
-  throwIf(!resultVar_.has_value(),
-          "Vector search requires the `<result>` (alias `<right>`) parameter "
-          "(the variable bound to each result entity).");
+
+  // The `<among>` form: `<among> ?s` IS the result variable (a candidate set
+  // from the surrounding query, of which the top-k are returned). Reconcile it
+  // with an explicit `<result>` and forbid mixing it with `<left>`.
+  std::optional<Variable> effectiveResult = resultVar_;
+  if (amongVar_.has_value()) {
+    throwIf(leftVar_.has_value(),
+            "`<among>` (rank a candidate set from the surrounding query) and "
+            "`<left>` (per-entity neighbour search) are mutually exclusive.");
+    throwIf(resultVar_.has_value() && resultVar_ != amongVar_,
+            "`<among>` already names the result variable; do not also give a "
+            "different `<result>`.");
+    effectiveResult = amongVar_;
+  }
+  throwIf(!effectiveResult.has_value(),
+          "Vector search requires the `<result>` (alias `<right>`) or "
+          "`<among>` parameter (the variable bound to each result entity).");
 
   int numQuerySpecs = static_cast<int>(queryVector_.has_value()) +
                       static_cast<int>(queryEntityIri_.has_value()) +
@@ -160,7 +177,9 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   throwIf(numQuerySpecs != 1,
           "Vector search requires exactly one of `<queryVector>`, `<query>` (a "
           "constant entity IRI), `<queryText>`, `<imageUrl>`/`<imageBase64>`, "
-          "or `<left>` (a variable bound by a nested pattern).");
+          "or `<left>` (a variable bound by a nested pattern). The `<among>` "
+          "form additionally takes one of the query-point forms (not "
+          "`<left>`).");
   throwIf(queryVector_.has_value() && queryVector_->empty(),
           "The `<queryVector>` parameter must contain at least one number.");
 
@@ -169,13 +188,13 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
     // pattern that binds `<left>`, or -- without a nested pattern -- from the
     // SURROUNDING query (the planner then joins the vector search with the
     // subtree that binds the variable).
-    throwIf(leftVar_ == resultVar_,
+    throwIf(leftVar_ == effectiveResult,
             "The `<left>` and `<result>` variables of a vector search must be "
             "different.");
   }
-  throwIf(scoreVar_.has_value() && scoreVar_ == resultVar_,
-          "The `<bindScore>` and `<result>` variables of a vector search must "
-          "be different.");
+  throwIf(scoreVar_.has_value() && scoreVar_ == effectiveResult,
+          "The `<bindScore>` and `<result>`/`<among>` variables of a vector "
+          "search must be different.");
   throwIf(
       scoreVar_.has_value() && leftVar_.has_value() && scoreVar_ == leftVar_,
       "The `<bindScore>` and `<left>` variables of a vector search must be "
@@ -193,7 +212,8 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   config.queryText_ = queryText_;
   config.queryImage_ = queryImage_;
   config.leftVariable_ = leftVar_;
-  config.resultVariable_ = resultVar_.value();
+  config.amongVariable_ = amongVar_;
+  config.resultVariable_ = effectiveResult.value();
   config.scoreVariable_ = scoreVar_;
   config.k_ = k_.value_or(10);
   config.maxDistance_ = maxDistance_;

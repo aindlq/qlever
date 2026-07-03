@@ -698,6 +698,110 @@ TEST(VectorSearchService, unjoinedOuterLeftThrows) {
 }
 
 // _____________________________________________________________________________
+// The `<among>` form: rank a candidate set bound by the SURROUNDING query (no
+// nesting) by distance to a fixed query point, returning the top-k of them.
+// Output is sorted nearest-first by the operation itself.
+TEST(VectorSearchService, amongOverSurroundingQuery) {
+  auto* qec = qecWithVectorIndex();
+  auto [result, col] =
+      runQuery(qec,
+               std::string{PREFIX} +
+                   "SELECT ?s WHERE { ?s <is-a> <Statue> . "
+                   "SERVICE vec: { _:c vec:index \"clip\" ; vec:queryVector "
+                   "\"1,0,0,0\" ; "
+                   "vec:among ?s ; vec:bindScore ?d ; vec:k 2 . } }",
+               Variable{"?s"});
+  auto getId = makeGetId(qec->getIndex());
+  const IdTable& table = result->idTable();
+  // Statues {e0,e1,e3}; nearest to [1,0,0,0] is e0, then e1 (e3 orthogonal).
+  ASSERT_EQ(table.numRows(), 2u);
+  EXPECT_EQ(table(0, col), getId("<e0>"));
+  EXPECT_EQ(table(1, col), getId("<e1>"));
+}
+
+// _____________________________________________________________________________
+// The completing subtree may bind more than the candidate variable; those extra
+// columns must be carried through for the surviving (top-k) rows.
+TEST(VectorSearchService, amongCarriesChildColumns) {
+  auto* qec = qecWithVectorIndex();
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?s ?t WHERE { ?s <is-a> ?t . "
+               "SERVICE vec: { _:c vec:index \"clip\" ; vec:queryVector "
+               "\"1,0,0,0\" ; vec:among ?s ; vec:k 1 . } }");
+  auto result = qet.getResult();
+  size_t sCol = qet.getVariableColumn(Variable{"?s"});
+  size_t tCol = qet.getVariableColumn(Variable{"?t"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+  // Nearest to [1,0,0,0] among all entities that have a vector is e0; its type
+  // (<Statue>) must survive in the carried-through `?t` column.
+  ASSERT_EQ(table.numRows(), 1u);
+  EXPECT_EQ(table(0, sCol), getId("<e0>"));
+  EXPECT_EQ(table(0, tCol), getId("<Statue>"));
+}
+
+// _____________________________________________________________________________
+// A candidate without a vector is silently dropped (not returned with a bogus
+// distance), even when k would leave room for it.
+TEST(VectorSearchService, amongDropsVectorlessCandidate) {
+  auto* qec = qecWithVectorIndex();
+  auto [result, col] = runQuery(qec,
+                                std::string{PREFIX} +
+                                    "SELECT ?s WHERE { ?s <is-a> <Painting> . "
+                                    "SERVICE vec: { _:c vec:index \"clip\" ; "
+                                    "vec:queryVector \"0,1,0,0\" ; "
+                                    "vec:among ?s ; vec:k 5 . } }",
+                                Variable{"?s"});
+  auto getId = makeGetId(qec->getIndex());
+  const IdTable& table = result->idTable();
+  // Paintings {e2,e4}; e4 has no vector, so only e2 is returned.
+  ASSERT_EQ(table.numRows(), 1u);
+  EXPECT_EQ(table(0, col), getId("<e2>"));
+}
+
+// _____________________________________________________________________________
+// `<among>` takes its candidate set from the surrounding query, so a nested
+// pattern inside the SERVICE is rejected.
+TEST(VectorSearchService, amongRejectsNestedPattern) {
+  auto* qec = qecWithVectorIndex();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                std::string{PREFIX} +
+                    "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
+                    "vec:queryVector \"1,0,0,0\" ; vec:among ?s ; vec:k 1 . "
+                    "{ ?s <is-a> <Statue> } } }"),
+      HasSubstr("nested"));
+}
+
+// _____________________________________________________________________________
+// `<among>` and `<left>` are mutually exclusive.
+TEST(VectorSearchService, amongAndLeftMutuallyExclusive) {
+  auto* qec = qecWithVectorIndex();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                std::string{PREFIX} +
+                    "SELECT * WHERE { ?x <is-a> <Statue> . "
+                    "SERVICE vec: { _:c vec:index \"clip\" ; vec:queryVector "
+                    "\"1,0,0,0\" ; vec:among ?s ; vec:left ?x ; vec:k 1 . } }"),
+      HasSubstr("mutually exclusive"));
+}
+
+// _____________________________________________________________________________
+// An `<among>` variable not bound anywhere leaves the operation incomplete and
+// fails at execution with an actionable message (mirrors the `<left>` case).
+TEST(VectorSearchService, unjoinedAmongThrows) {
+  auto* qec = qecWithVectorIndex();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      runQuery(qec,
+               std::string{PREFIX} +
+                   "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
+                   "vec:queryVector \"1,0,0,0\" ; vec:among ?s ; vec:k 1 . } }",
+               Variable{"?s"}),
+      HasSubstr("is not bound anywhere"));
+}
+
+// _____________________________________________________________________________
 // After the RDF data is re-indexed, the vector index is REMAPPED instead of
 // rebuilt: `.iris` is re-resolved against the new vocabulary and only the two
 // small mapping files are rewritten; the vectors and the HNSW graph (which is

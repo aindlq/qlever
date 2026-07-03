@@ -44,9 +44,11 @@ struct VectorSearchQuery : MagicServiceQuery {
   std::optional<std::string> queryEntityIri_;
   std::optional<std::string> queryText_;  // free text -> embedded at query time
   std::optional<qlever::vector::VectorSearchConfiguration::ImageQuery>
-      queryImage_;                   // image -> embedded at query time
-  std::optional<Variable> leftVar_;  // binary form: query entity from the
-                                     // nested pattern ("for each ?x")
+      queryImage_;                    // image -> embedded at query time
+  std::optional<Variable> leftVar_;   // binary form: query entity from the
+                                      // nested pattern ("for each ?x")
+  std::optional<Variable> amongVar_;  // "among" form: candidate/result set from
+                                      // the surrounding query (top-k of them)
   std::optional<Variable> resultVar_;
   std::optional<Variable> scoreVar_;
   std::optional<size_t> k_;
