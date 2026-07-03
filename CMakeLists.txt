@@ -378,7 +378,7 @@ set(ABSL_PROPAGATE_CXX_STD ON)
 FetchContent_Declare(
         abseil
         GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
-        GIT_TAG 93ac3a4f9ee7792af399cebd873ee99ce15aed08  # 2024-05-16
+        GIT_TAG 20260107.1  # LTS 2026-01-07, includes cctz MinGW fixes (cctz #297, #316, #329)
         EXCLUDE_FROM_ALL
 )
 
@@ -389,7 +389,7 @@ set(BUILD_TESTS OFF CACHE BOOL "no tests for s2")
 FetchContent_Declare(
         s2
         GIT_REPOSITORY https://github.com/google/s2geometry.git
-        GIT_TAG 5b5eccd54a08ae03b4467e79ffbb076d0b5f221e  #version 0.11.1
+        GIT_TAG v0.14.0  # pairs with abseil >= 2026 LTS (absl::Nonnull removal); >= v0.12.0 removed the htonll/ntohll macros colliding with mingw winsock2.h
         SYSTEM
         EXCLUDE_FROM_ALL
 )
@@ -452,7 +452,7 @@ set(RE2_BUILD_TESTING OFF CACHE BOOL "enable testing for RE2" FORCE)
 FetchContent_Declare(
         re2
         GIT_REPOSITORY https://github.com/google/re2.git
-        GIT_TAG bc0faab533e2b27b85b8ad312abf061e33ed6b5d # v.2023-11-01
+        GIT_TAG 2025-11-05  # paired with abseil LTS 20260107 (cf. vcpkg)
         GIT_SHALLOW TRUE
         OVERRIDE_FIND_PACKAGE
         SYSTEM
