@@ -52,7 +52,7 @@ std::optional<size_t> ParallelBufferWithEndRegex::findRegexNearEnd(
     const BufferType& vec, const re2::RE2& regex) {
   size_t inputSize = vec.size();
   AD_CORRECTNESS_CHECK(inputSize > 0);
-  size_t chunkSize = std::min(1000UL, inputSize);
+  size_t chunkSize = std::min<size_t>(size_t{1000}, inputSize);
   re2::StringPiece regexResult;
   bool match = false;
   while (true) {
