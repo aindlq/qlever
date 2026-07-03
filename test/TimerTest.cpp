@@ -5,6 +5,7 @@
 #include <absl/strings/str_cat.h>
 #include <gmock/gmock.h>
 
+#include <regex>
 #include <thread>
 
 #include "util/Timer.h"
@@ -115,7 +116,7 @@ TEST(TimeBlockAndLog, TimeBlockAndLog) {
     ad_utility::TimeBlockAndLog t{"message", callback};
     std::this_thread::sleep_for(25ms);
   }
-  ASSERT_THAT(s, ::testing::MatchesRegex("message: (2[5-9]|3[0-9])"));
+  ASSERT_TRUE(std::regex_match(s, std::regex{"message: (2[5-9]|3[0-9])"})) << s;
 }
 
 // ____________________________________________________________________________
