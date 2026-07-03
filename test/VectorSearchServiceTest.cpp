@@ -250,6 +250,148 @@ TEST(VectorSearchService, maxDistanceFilters) {
 }
 
 // _____________________________________________________________________________
+// The `vec:distance(...)` SPARQL function: BIND it over a bound `?entity` and
+// the per-row distance must equal what a `DistanceComputer` (and hence
+// `searchExact`) reports for that entity + query point.
+TEST(VectorSearchService, vecDistanceBindMatchesComputer) {
+  auto* qec = qecWithVectorIndex();
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <is-a> <Statue> . "
+               "BIND(vec:distance(\"clip\", ?e, \"1,0,0,0\") AS ?d) }");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  // The three statues <e0>, <e1>, <e3> all have vectors.
+  ASSERT_EQ(table.numRows(), 3u);
+
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "clip");
+  ASSERT_TRUE(vidx != nullptr);
+  auto computer =
+      vidx->makeDistanceComputer(std::vector<float>{1.f, 0.f, 0.f, 0.f});
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    Id entity = table(r, eCol);
+    Id distance = table(r, dCol);
+    ASSERT_EQ(distance.getDatatype(), Datatype::Double);
+    EXPECT_FLOAT_EQ(static_cast<float>(distance.getDouble()), computer(entity))
+        << "row " << r;
+  }
+}
+
+// _____________________________________________________________________________
+// BIND(vec:distance) + ORDER BY + LIMIT IS a filtered top-k search using
+// QLever's own operators. For the (positive) cosine distances the order must be
+// <e0> (self, distance 0) then <e1>.
+TEST(VectorSearchService, vecDistanceOrderByLimitIsFilteredSearch) {
+  auto* qec = qecWithVectorIndex();
+  // ORDER BY the (positive) cosine distances ascending: <e0> (self, 0), then
+  // <e1>, then <e3>. (`LIMIT` is applied lazily during result export, so the
+  // materialised table keeps all rows; the ordering is what matters here.)
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <is-a> <Statue> . "
+               "BIND(vec:distance(\"clip\", ?e, \"1,0,0,0\") AS ?d) } "
+               "ORDER BY ?d");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+  ASSERT_EQ(table.numRows(), 3u);
+  EXPECT_EQ(table(0, eCol), getId("<e0>"));
+  EXPECT_EQ(table(1, eCol), getId("<e1>"));
+  EXPECT_EQ(table(2, eCol), getId("<e3>"));
+  EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+  EXPECT_LT(table(0, dCol).getDouble(), table(1, dCol).getDouble());
+  EXPECT_LT(table(1, dCol).getDouble(), table(2, dCol).getDouble());
+}
+
+// _____________________________________________________________________________
+// The query point may be a constant entity IRI whose stored vector is used.
+TEST(VectorSearchService, vecDistanceQueryByEntityIri) {
+  auto* qec = qecWithVectorIndex();
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <is-a> <Statue> . "
+               "BIND(vec:distance(\"clip\", ?e, <e0>) AS ?d) } ORDER BY ?d");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+  ASSERT_EQ(table.numRows(), 3u);
+  // <e0> is its own nearest neighbour (distance 0).
+  EXPECT_EQ(table(0, eCol), getId("<e0>"));
+  EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+}
+
+// _____________________________________________________________________________
+// An entity without a vector evaluates to UNDEF (and is dropped by ORDER BY /
+// comparisons), rather than erroring.
+TEST(VectorSearchService, vecDistanceMissingVectorIsUndef) {
+  auto* qec = qecWithVectorIndex();
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <is-a> <Painting> . "
+               "BIND(vec:distance(\"clip\", ?e, \"1,0,0,0\") AS ?d) }");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+  // <e2> (has a vector) and <e4> (no vector).
+  ASSERT_EQ(table.numRows(), 2u);
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    if (table(r, eCol) == getId("<e2>")) {
+      EXPECT_EQ(table(r, dCol).getDatatype(), Datatype::Double);
+    } else {
+      EXPECT_EQ(table(r, eCol), getId("<e4>"));
+      EXPECT_TRUE(table(r, dCol).isUndefined());
+    }
+  }
+}
+
+// _____________________________________________________________________________
+// Configuration/usage errors of `vec:distance` surface clearly: parse-time for
+// a wrong arity or argument kind, evaluation-time for an unknown index or a
+// dimension mismatch.
+TEST(VectorSearchService, vecDistanceErrors) {
+  auto* qec = qecWithVectorIndex();
+  auto selectBind = [](std::string_view call) {
+    return std::string{PREFIX} +
+           "SELECT ?e ?d WHERE { ?e <is-a> <Statue> . "
+           "BIND(" +
+           std::string{call} + " AS ?d) }";
+  };
+  // Wrong arity (parse time).
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, selectBind("vec:distance(\"clip\", ?e)")),
+      HasSubstr("three arguments"));
+  // First argument not a string literal (parse time).
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, selectBind("vec:distance(?e, ?e, \"1,0,0,0\")")),
+      HasSubstr("string literal naming the vector index"));
+  // Third argument neither a float-list literal nor an IRI (parse time).
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, selectBind("vec:distance(\"clip\", ?e, ?e)")),
+      HasSubstr("third argument"));
+  // Unknown index (evaluation time).
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, selectBind("vec:distance(\"nope\", ?e, \"1,0,0,0\")"));
+    AD_EXPECT_THROW_WITH_MESSAGE(qet.getResult(),
+                                 HasSubstr("no vector index named"));
+  }
+  // Dimension mismatch (evaluation time).
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, selectBind("vec:distance(\"clip\", ?e, \"1,0\")"));
+    AD_EXPECT_THROW_WITH_MESSAGE(qet.getResult(), HasSubstr("dimension"));
+  }
+}
+
+// _____________________________________________________________________________
 TEST(VectorSearchService, parseErrors) {
   auto* qec = qecWithVectorIndex();
   auto query = [](std::string_view body) {

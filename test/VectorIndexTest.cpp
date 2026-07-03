@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <random>
 #include <set>
 #include <vector>
@@ -182,6 +183,71 @@ TEST(VectorIndex, exactSearchNearestIsSelf) {
   // k larger than the index size gracefully returns everything.
   auto all = idx.searchExact(b.data.vecs[10], NUM_VECTORS + 50);
   EXPECT_EQ(all.size(), NUM_VECTORS);
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
+// The `DistanceComputer` (the primitive behind `vec:distance`) must return, for
+// every entity, exactly the distance that a brute-force `searchExact` reports
+// (same punned metric), `NaN` for an entity with no vector, and throw on a
+// dimension mismatch.
+TEST(VectorIndex, distanceComputerMatchesSearchExact) {
+  auto b = buildTmp(/*withHnsw=*/false);
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+
+  const auto& query = b.data.vecs[10];
+  // Ground truth: the distance of every entity to `query`.
+  auto scored = idx.searchExact(query, NUM_VECTORS);
+  ASSERT_EQ(scored.size(), NUM_VECTORS);
+  std::map<uint64_t, float> expected;
+  for (const auto& s : scored) {
+    expected[s.entity_.getBits()] = s.distance_;
+  }
+
+  auto computer = idx.makeDistanceComputer(query);
+  for (size_t i = 0; i < NUM_VECTORS; ++i) {
+    Id e = b.data.id(i);
+    ASSERT_TRUE(expected.count(e.getBits()));
+    EXPECT_FLOAT_EQ(computer(e), expected[e.getBits()]) << "entity " << i;
+  }
+  // Self-distance is (near) zero for cosine.
+  EXPECT_NEAR(computer(b.data.id(10)), 0.f, 1e-4);
+  // An entity with no vector in the index -> NaN.
+  EXPECT_TRUE(std::isnan(computer(mkId(999999))));
+
+  // A dimension mismatch throws (query too short).
+  std::vector<float> tooShort(DIM - 1, 0.f);
+  EXPECT_ANY_THROW(idx.makeDistanceComputer(tooShort));
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
+// The by-entity `DistanceComputer` uses a stored vector as the query point and
+// must agree with `searchExactByEntity`; a missing entity yields `nullopt`.
+TEST(VectorIndex, distanceComputerByEntity) {
+  auto b = buildTmp(/*withHnsw=*/false);
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+
+  auto scored = idx.searchExactByEntity(b.data.id(42), NUM_VECTORS);
+  ASSERT_EQ(scored.size(), NUM_VECTORS);
+  std::map<uint64_t, float> expected;
+  for (const auto& s : scored) {
+    expected[s.entity_.getBits()] = s.distance_;
+  }
+
+  auto computer = idx.makeDistanceComputerByEntity(b.data.id(42));
+  ASSERT_TRUE(computer.has_value());
+  for (size_t i = 0; i < NUM_VECTORS; ++i) {
+    Id e = b.data.id(i);
+    EXPECT_FLOAT_EQ((*computer)(e), expected[e.getBits()]) << "entity " << i;
+  }
+  EXPECT_NEAR((*computer)(b.data.id(42)), 0.f, 1e-4);
+  EXPECT_TRUE(std::isnan((*computer)(mkId(999999))));
+
+  // No vector for this entity -> no computer.
+  EXPECT_FALSE(idx.makeDistanceComputerByEntity(mkId(999999)).has_value());
   cleanup(b);
 }
 

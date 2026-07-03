@@ -24,6 +24,13 @@ namespace parsedQuery {
 inline constexpr std::string_view VECTOR_SEARCH_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/>";
 
+// The IRI of the `vec:distance("index", ?entity, <query>|"v0,v1,...")` SPARQL
+// function: a per-row distance from a query point to `?entity`'s stored vector.
+// BIND it and ORDER BY + LIMIT to run a filtered top-k search using QLever's
+// own operators. Registered with the `SparqlFunctionRegistry` by the service.
+inline constexpr std::string_view VECTOR_DISTANCE_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/distance>";
+
 class VectorSearchException : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };

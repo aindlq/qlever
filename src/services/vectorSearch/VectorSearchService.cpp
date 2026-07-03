@@ -23,6 +23,8 @@
 #include "engine/QueryExecutionTree.h"
 #include "parser/MagicServiceQuery.h"
 #include "parser/MagicServiceRegistry.h"
+#include "parser/SparqlFunctionRegistry.h"
+#include "services/vectorSearch/VectorDistanceExpression.h"
 #include "services/vectorSearch/VectorSearch.h"
 #include "services/vectorSearch/VectorSearchJoin.h"
 #include "services/vectorSearch/VectorSearchQuery.h"
@@ -79,6 +81,14 @@ void registerVectorSearchService() {
           ctx.addLeafOperation(std::make_shared<VectorSearch>(qec, config));
         }
       });
+
+  // 3. Parser: register the `vec:distance(...)` SPARQL function so that
+  //    `BIND(vec:distance(...) AS ?d) ... ORDER BY ?d LIMIT k` performs a
+  //    filtered top-k search using QLever's own operators. The factory lives in
+  //    this folder; the parser only sees the generic registry.
+  parsedQuery::SparqlFunctionRegistry::get().addExact(
+      std::string{parsedQuery::VECTOR_DISTANCE_IRI},
+      &sparqlExpression::makeVectorDistanceExpression);
 }
 
 // Run the registration at static-initialization time. The folder is linked as

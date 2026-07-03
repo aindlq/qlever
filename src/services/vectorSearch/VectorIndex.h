@@ -64,6 +64,12 @@ class VectorIndex {
   //                 comfortably fit in RAM.
   enum class Residency { None, Advise, Lock, AlignedCopy };
 
+ private:
+  // Forward declaration so the public `DistanceComputer` below can hold an
+  // opaque pointer to it; the definition lives in `VectorIndex.cpp`.
+  struct Impl;
+
+ public:
   VectorIndex();
   ~VectorIndex();
   VectorIndex(VectorIndex&&) noexcept;
@@ -138,8 +144,42 @@ class VectorIndex {
       Id entity, size_t k, std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
 
+  // A reusable per-query distance functor. It encodes the query point ONCE
+  // (into the index's storage scalar) and owns those bytes, then computes the
+  // metric distance from that point to any entity's stored vector via a single
+  // `.rowmap` lookup + one SIMD kernel call. `operator()` returns `NaN` for an
+  // entity that has no live vector in this index. This is the primitive behind
+  // the `vec:distance` SPARQL expression: BIND it over a bound `?entity`, then
+  // ORDER BY + LIMIT to get a filtered top-k search using QLever's own
+  // machinery. Cheap to copy; only valid while the `VectorIndex` it was made
+  // from is alive (it borrows the index's metric/mapping).
+  class DistanceComputer {
+   public:
+    // The distance from the query point to `entity`'s stored vector, or `NaN`
+    // if `entity` has no (live) vector in this index.
+    float operator()(Id entity) const;
+
+   private:
+    friend class VectorIndex;
+    DistanceComputer(const Impl* impl, std::vector<char> queryBytes)
+        : impl_{impl}, queryBytes_{std::move(queryBytes)} {}
+    const Impl* impl_;
+    // The query point, already encoded into the storage scalar (length
+    // `rowBytes`), owned so the functor does not depend on the caller's buffer.
+    std::vector<char> queryBytes_;
+  };
+
+  // Make a `DistanceComputer` for an explicit f32 `query` (encoded once into
+  // the storage scalar). Throws if `query`'s dimension does not match the
+  // index.
+  DistanceComputer makeDistanceComputer(ql::span<const float> query) const;
+
+  // Make a `DistanceComputer` whose query point is the stored vector of
+  // `entity` (used directly, no f32 round trip). Returns `nullopt` if `entity`
+  // has no (live) vector in this index.
+  std::optional<DistanceComputer> makeDistanceComputerByEntity(Id entity) const;
+
  private:
-  struct Impl;
   std::unique_ptr<Impl> impl_;
 };
 

@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -438,6 +439,46 @@ std::optional<std::vector<float>> VectorIndex::getVector(Id entity) const {
     std::memcpy(out.data(), impl.rowPtr(row.value()), impl.rowBytes());
   }
   return out;
+}
+
+// ____________________________________________________________________________
+float VectorIndex::DistanceComputer::operator()(Id entity) const {
+  auto row = impl_->rowOf(entity);
+  if (!row.has_value()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  return impl_->distanceToRow(queryBytes_.data(), row.value());
+}
+
+// ____________________________________________________________________________
+VectorIndex::DistanceComputer VectorIndex::makeDistanceComputer(
+    ql::span<const float> query) const {
+  const auto& impl = *impl_;
+  if (query.size() != impl.dim()) {
+    AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
+             ", but vector index \"" + impl.meta_.config_.name_ +
+             "\" has dimension " + std::to_string(impl.dim()) + ".");
+  }
+  // Encode the query into the storage scalar and OWN the resulting bytes
+  // (`encodeQuery` may return a pointer into the raw f32 input when no
+  // conversion is needed, so always copy `rowBytes` out of it).
+  std::vector<char> buffer;
+  const char* encoded = impl.encodeQuery(query, buffer);
+  std::vector<char> owned(encoded, encoded + impl.rowBytes());
+  return DistanceComputer{&impl, std::move(owned)};
+}
+
+// ____________________________________________________________________________
+std::optional<VectorIndex::DistanceComputer>
+VectorIndex::makeDistanceComputerByEntity(Id entity) const {
+  const auto& impl = *impl_;
+  auto row = impl.rowOf(entity);
+  if (!row.has_value()) {
+    return std::nullopt;
+  }
+  const char* stored = impl.rowPtr(row.value());
+  std::vector<char> owned(stored, stored + impl.rowBytes());
+  return DistanceComputer{&impl, std::move(owned)};
 }
 
 namespace {

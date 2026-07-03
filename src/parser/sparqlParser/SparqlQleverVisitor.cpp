@@ -47,6 +47,7 @@
 #include "parser/PathQuery.h"
 #include "parser/Quads.h"
 #include "parser/RdfParser.h"
+#include "parser/SparqlFunctionRegistry.h"
 #include "parser/SparqlParser.h"
 #include "parser/SpatialQuery.h"
 #include "parser/TextSearchQuery.h"
@@ -308,6 +309,15 @@ ExpressionPtr Visitor::processIriFunctionCall(
     } else if (functionName == "prefix-match") {
       return createBinary(&makePrefixMatchExpression);
     }
+  }
+
+  // Extensible SPARQL functions registered by drop-in services under
+  // `src/services/` (e.g. the vector-search `vec:distance(...)` function), so
+  // adding one needs no change to the dispatch above. Consulted after the
+  // built-in tables and before the unknown-function error.
+  if (const auto* factory = parsedQuery::SparqlFunctionRegistry::get().lookup(
+          iri.toStringRepresentation())) {
+    return (*factory)(std::move(argList));
   }
 
   if (getRuntimeParameter<&RuntimeParameters::syntaxTestMode_>()) {
