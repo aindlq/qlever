@@ -198,6 +198,11 @@ class File {
   // Best-effort: on a mapping failure the read path is kept. Intended for
   // read-only files that fit in RAM; call after `open(..., "r")`.
   void enableMemoryMappedReads() {
+    // Benchmark toggle: QLEVER_NO_VOCAB_MMAP=1 forces the plain pread/ReadFile
+    // path so the mmap vocabulary fast path can be A/B-tested at runtime.
+    if (std::getenv("QLEVER_NO_VOCAB_MMAP") != nullptr) {
+      return;
+    }
     positionedReader_.enableMemoryMappedReads(name_);
   }
 
