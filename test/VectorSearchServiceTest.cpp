@@ -180,56 +180,17 @@ TEST(VectorSearchService, queryEntityWithoutVectorYieldsEmptyResult) {
 }
 
 // _____________________________________________________________________________
-TEST(VectorSearchService, candidateRestrictedForm) {
+// The search SERVICE is a pure "search" surface: a nested `{ ... }` pattern is
+// no longer supported (rank an existing set with `vec:distance` instead).
+TEST(VectorSearchService, nestedPatternRejected) {
   auto* qec = qecWithVectorIndex();
-  // Restrict the search space to the paintings <e2> (has a vector) and <e4>
-  // (has none): only <e2> can be returned, regardless of better matches
-  // elsewhere in the index.
-  auto [result, col] =
-      runQuery(qec,
-               std::string{PREFIX} +
-                   "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
-                   "vec:queryVector \"1,0,0,0\" ; vec:result ?p ; vec:k 5 . "
-                   "{ ?p <is-a> <Painting> } } }",
-               Variable{"?p"});
-  auto getId = makeGetId(qec->getIndex());
-  const IdTable& table = result->idTable();
-  ASSERT_EQ(table.numRows(), 1u);
-  EXPECT_EQ(table(0, col), getId("<e2>"));
-}
-
-// _____________________________________________________________________________
-// Regression test: a candidate pattern that matches NOTHING must produce an
-// empty result -- not fall back to searching the whole index.
-TEST(VectorSearchService, emptyCandidateSetYieldsEmptyResult) {
-  auto* qec = qecWithVectorIndex();
-  auto [result, col] =
-      runQuery(qec,
-               std::string{PREFIX} +
-                   "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
-                   "vec:queryVector \"1,0,0,0\" ; vec:result ?p ; vec:k 5 . "
-                   "{ ?p <is-a> <Vase> } } }",
-               Variable{"?p"});
-  EXPECT_EQ(result->idTable().numRows(), 0u);
-}
-
-// _____________________________________________________________________________
-TEST(VectorSearchService, joinForEachForm) {
-  auto* qec = qecWithVectorIndex();
-  // For each painting ?x, the 2 nearest entities. <e2> has a vector (self +
-  // <e1> as its neighbours); <e4> has none and contributes no rows.
-  auto [result, col] = runQuery(
-      qec,
-      std::string{PREFIX} +
-          "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
-          "vec:left ?x ; vec:result ?nn ; vec:bindScore ?d ; vec:k 2 . "
-          "{ ?x <is-a> <Painting> } } }",
-      Variable{"?nn"});
-  auto getId = makeGetId(qec->getIndex());
-  const IdTable& table = result->idTable();
-  ASSERT_EQ(table.numRows(), 2u);
-  EXPECT_EQ(table(0, col), getId("<e2>"));  // self
-  EXPECT_EQ(table(1, col), getId("<e1>"));  // nearest other
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                std::string{PREFIX} +
+                    "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
+                    "vec:queryVector \"1,0,0,0\" ; vec:result ?p ; vec:k 5 . "
+                    "{ ?p <is-a> <Painting> } } }"),
+      HasSubstr("nested"));
 }
 
 // _____________________________________________________________________________
@@ -460,14 +421,13 @@ TEST(VectorSearchService, parseErrors) {
       HasSubstr("positive integer"));
   // `<left>` and `<result>` must differ.
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec, query("_:c vec:index \"clip\" ; vec:left ?x ; "
-                           "vec:result ?x . { ?x <is-a> <Statue> }")),
+      planQuery(
+          qec, query("_:c vec:index \"clip\" ; vec:left ?x ; vec:result ?x .")),
       HasSubstr("must be different"));
   // `<left>` and `<bindScore>` must differ.
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"clip\" ; vec:left ?x ; "
-                           "vec:result ?nn ; vec:bindScore ?x . "
-                           "{ ?x <is-a> <Statue> }")),
+                           "vec:result ?nn ; vec:bindScore ?x .")),
       HasSubstr("must be different"));
 }
 
@@ -478,17 +438,6 @@ TEST(VectorSearchService, planAndExecutionErrors) {
     return std::string{PREFIX} + "SELECT * WHERE { SERVICE vec: { " +
            std::string{body} + " } }";
   };
-  // The join form rejects a nested pattern that also binds the result
-  // variable (silently relabeling a child column would be wrong results).
-  AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec, query("_:c vec:index \"clip\" ; vec:left ?x ; "
-                           "vec:result ?y . { ?x <is-a> ?y }")),
-      HasSubstr("must not be bound by the nested query pattern"));
-  // The candidate form rejects extra visible variables in the nested pattern.
-  AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec, query("_:c vec:index \"clip\" ; vec:queryVector "
-                           "\"1,0,0,0\" ; vec:result ?p . { ?p <is-a> ?t }")),
-      HasSubstr("must bind only"));
   // Unknown index name: fails at execution time with a clear message.
   AD_EXPECT_THROW_WITH_MESSAGE(
       runQuery(qec,
@@ -510,29 +459,6 @@ TEST(VectorSearchService, planAndExecutionErrors) {
                      "vec:result ?x ; vec:algorithm vec:hnsw ."),
                Variable{"?x"}),
       HasSubstr("no HNSW structure"));
-}
-
-// _____________________________________________________________________________
-// Regression test: the cache key of the candidate-restricted form must include
-// the COLUMN the result variable is bound to -- two children with identical
-// cache keys can bind it to different columns.
-TEST(VectorSearchService, cacheKeyIncludesCandidateColumn) {
-  auto* qec = qecWithVectorIndex();
-  auto getId = makeGetId(qec->getIndex());
-  Id e0 = getId("<e0>");
-  Id e2 = getId("<e2>");
-  qlever::vector::VectorSearchConfiguration config;
-  config.indexName_ = "clip";
-  config.queryVector_ = std::vector<float>{1.f, 0.f, 0.f, 0.f};
-  config.resultVariable_ = Variable{"?p"};
-  // Same table content; the result variable ?p sits in column 0 vs. column 1.
-  auto childCol0 = makeChild(qec, {Variable{"?p"}, std::nullopt}, {{e2, e0}});
-  auto childCol1 = makeChild(qec, {std::nullopt, Variable{"?p"}}, {{e2, e0}});
-  VectorSearch opCol0{qec, config, childCol0};
-  VectorSearch opCol1{qec, config, childCol1};
-  EXPECT_NE(opCol0.getCacheKey(), opCol1.getCacheKey());
-  // Clones share the cache key.
-  EXPECT_EQ(opCol0.getCacheKey(), opCol0.clone()->getCacheKey());
 }
 
 // _____________________________________________________________________________
@@ -698,107 +624,34 @@ TEST(VectorSearchService, unjoinedOuterLeftThrows) {
 }
 
 // _____________________________________________________________________________
-// The `<among>` form: rank a candidate set bound by the SURROUNDING query (no
-// nesting) by distance to a fixed query point, returning the top-k of them.
-// Output is sorted nearest-first by the operation itself.
-TEST(VectorSearchService, amongOverSurroundingQuery) {
-  auto* qec = qecWithVectorIndex();
-  auto [result, col] =
-      runQuery(qec,
-               std::string{PREFIX} +
-                   "SELECT ?s WHERE { ?s <is-a> <Statue> . "
-                   "SERVICE vec: { _:c vec:index \"clip\" ; vec:queryVector "
-                   "\"1,0,0,0\" ; "
-                   "vec:among ?s ; vec:bindScore ?d ; vec:k 2 . } }",
-               Variable{"?s"});
-  auto getId = makeGetId(qec->getIndex());
-  const IdTable& table = result->idTable();
-  // Statues {e0,e1,e3}; nearest to [1,0,0,0] is e0, then e1 (e3 orthogonal).
-  ASSERT_EQ(table.numRows(), 2u);
-  EXPECT_EQ(table(0, col), getId("<e0>"));
-  EXPECT_EQ(table(1, col), getId("<e1>"));
-}
-
-// _____________________________________________________________________________
-// The completing subtree may bind more than the candidate variable; those extra
-// columns must be carried through for the surviving (top-k) rows.
-TEST(VectorSearchService, amongCarriesChildColumns) {
-  auto* qec = qecWithVectorIndex();
-  QueryExecutionTree qet = planQuery(
-      qec, std::string{PREFIX} +
-               "SELECT ?s ?t WHERE { ?s <is-a> ?t . "
-               "SERVICE vec: { _:c vec:index \"clip\" ; vec:queryVector "
-               "\"1,0,0,0\" ; vec:among ?s ; vec:k 1 . } }");
-  auto result = qet.getResult();
-  size_t sCol = qet.getVariableColumn(Variable{"?s"});
-  size_t tCol = qet.getVariableColumn(Variable{"?t"});
-  const IdTable& table = result->idTable();
-  auto getId = makeGetId(qec->getIndex());
-  // Nearest to [1,0,0,0] among all entities that have a vector is e0; its type
-  // (<Statue>) must survive in the carried-through `?t` column.
-  ASSERT_EQ(table.numRows(), 1u);
-  EXPECT_EQ(table(0, sCol), getId("<e0>"));
-  EXPECT_EQ(table(0, tCol), getId("<Statue>"));
-}
-
-// _____________________________________________________________________________
-// A candidate without a vector is silently dropped (not returned with a bogus
-// distance), even when k would leave room for it.
-TEST(VectorSearchService, amongDropsVectorlessCandidate) {
-  auto* qec = qecWithVectorIndex();
-  auto [result, col] = runQuery(qec,
-                                std::string{PREFIX} +
-                                    "SELECT ?s WHERE { ?s <is-a> <Painting> . "
-                                    "SERVICE vec: { _:c vec:index \"clip\" ; "
-                                    "vec:queryVector \"0,1,0,0\" ; "
-                                    "vec:among ?s ; vec:k 5 . } }",
-                                Variable{"?s"});
-  auto getId = makeGetId(qec->getIndex());
-  const IdTable& table = result->idTable();
-  // Paintings {e2,e4}; e4 has no vector, so only e2 is returned.
-  ASSERT_EQ(table.numRows(), 1u);
-  EXPECT_EQ(table(0, col), getId("<e2>"));
-}
-
-// _____________________________________________________________________________
-// `<among>` takes its candidate set from the surrounding query, so a nested
-// pattern inside the SERVICE is rejected.
-TEST(VectorSearchService, amongRejectsNestedPattern) {
-  auto* qec = qecWithVectorIndex();
-  AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                std::string{PREFIX} +
-                    "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
-                    "vec:queryVector \"1,0,0,0\" ; vec:among ?s ; vec:k 1 . "
-                    "{ ?s <is-a> <Statue> } } }"),
-      HasSubstr("nested"));
-}
-
-// _____________________________________________________________________________
-// `<among>` and `<left>` are mutually exclusive.
-TEST(VectorSearchService, amongAndLeftMutuallyExclusive) {
-  auto* qec = qecWithVectorIndex();
-  AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                std::string{PREFIX} +
-                    "SELECT * WHERE { ?x <is-a> <Statue> . "
-                    "SERVICE vec: { _:c vec:index \"clip\" ; vec:queryVector "
-                    "\"1,0,0,0\" ; vec:among ?s ; vec:left ?x ; vec:k 1 . } }"),
-      HasSubstr("mutually exclusive"));
-}
-
-// _____________________________________________________________________________
-// An `<among>` variable not bound anywhere leaves the operation incomplete and
-// fails at execution with an actionable message (mirrors the `<left>` case).
-TEST(VectorSearchService, unjoinedAmongThrows) {
+// `vec:distanceText` embeds the query text at query time via the index's OWN
+// endpoint (looked up by the index name). The test "clip" index has no endpoint
+// configured, so it fails with the clear "no embedding endpoint" error -- which
+// exercises the index-keyed embed path of the function.
+TEST(VectorSearchService, vecDistanceTextEmbedsViaIndexEndpoint) {
   auto* qec = qecWithVectorIndex();
   AD_EXPECT_THROW_WITH_MESSAGE(
       runQuery(qec,
                std::string{PREFIX} +
-                   "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
-                   "vec:queryVector \"1,0,0,0\" ; vec:among ?s ; vec:k 1 . } }",
+                   "SELECT ?s ?d WHERE { ?s <is-a> <Statue> . "
+                   "BIND(vec:distanceText(\"clip\", ?s, \"a green statue\") AS "
+                   "?d) } ORDER BY ?d",
                Variable{"?s"}),
-      HasSubstr("is not bound anywhere"));
+      HasSubstr("embedding endpoint"));
+}
+
+// _____________________________________________________________________________
+// `vec:distanceImage` likewise embeds an image URL via the index's endpoint.
+TEST(VectorSearchService, vecDistanceImageEmbedsViaIndexEndpoint) {
+  auto* qec = qecWithVectorIndex();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      runQuery(qec,
+               std::string{PREFIX} +
+                   "SELECT ?s ?d WHERE { ?s <is-a> <Statue> . "
+                   "BIND(vec:distanceImage(\"clip\", ?s, "
+                   "<https://example.org/cat.jpg>) AS ?d) } ORDER BY ?d",
+               Variable{"?s"}),
+      HasSubstr("embedding endpoint"));
 }
 
 // _____________________________________________________________________________

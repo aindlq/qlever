@@ -26,7 +26,6 @@
 #include "parser/SparqlFunctionRegistry.h"
 #include "services/vectorSearch/VectorDistanceExpression.h"
 #include "services/vectorSearch/VectorSearch.h"
-#include "services/vectorSearch/VectorSearchAmong.h"
 #include "services/vectorSearch/VectorSearchJoin.h"
 #include "services/vectorSearch/VectorSearchQuery.h"
 
@@ -52,58 +51,40 @@ void registerVectorSearchService() {
         auto config = vectorQuery.toVectorSearchConfiguration();
         QueryExecutionContext* qec = ctx.qec();
 
-        if (config.amongVariable_.has_value()) {
-          // "the top-k of the ?s bound by the SURROUNDING query": an incomplete
-          // join leaf whose candidate/result variable is `<among>`; the join
-          // enumeration adds the subtree that binds it (see
-          // `IncompleteJoinOperation`). The candidates come from OUTSIDE the
-          // SERVICE, so a nested pattern is not allowed.
-          if (vectorQuery.childGraphPattern_.has_value()) {
-            throw std::runtime_error{
-                "`vec:among` takes its candidate set from the surrounding "
-                "query; do not also give a nested `{ ... }` pattern inside the "
-                "SERVICE clause."};
-          }
-          ctx.addLeafOperation(
-              std::make_shared<VectorSearchAmong>(qec, config));
-        } else if (config.leftVariable_.has_value() &&
-                   vectorQuery.childGraphPattern_.has_value()) {
-          // "for each ?x in the nested pattern, find the k nearest."
-          ctx.addOperationWithChildPattern(
-              vectorQuery.childGraphPattern_.value(),
-              [config, qec](std::shared_ptr<QueryExecutionTree> child)
-                  -> std::shared_ptr<Operation> {
-                return std::make_shared<VectorSearchJoin>(qec, config,
-                                                          std::move(child));
-              });
-        } else if (config.leftVariable_.has_value()) {
-          // "for each ?x bound by the SURROUNDING query": an incomplete join
-          // leaf; the planner's join enumeration adds the subtree that binds
-          // `<left>` (see `IncompleteJoinOperation`).
+        // The vector-search SERVICE is a pure "search" surface: config triples
+        // on the blank node, no nested `{ ... }` pattern. Ranking an existing
+        // candidate set is the `vec:distance` function (see below).
+        if (vectorQuery.childGraphPattern_.has_value()) {
+          throw std::runtime_error{
+              "The vector-search SERVICE does not take a nested `{ ... }` "
+              "pattern. Bind the query entity in the surrounding query "
+              "(`vec:left ?x`), or rank an existing candidate set with the "
+              "`vec:distance` function + `ORDER BY` + `LIMIT`."};
+        }
+        if (config.leftVariable_.has_value()) {
+          // "for each ?x bound by the SURROUNDING query, find the k nearest":
+          // an incomplete join leaf; the planner's join enumeration adds the
+          // subtree that binds `<left>` (see `IncompleteJoinOperation`).
           ctx.addLeafOperation(std::make_shared<VectorSearchJoin>(qec, config));
-        } else if (vectorQuery.childGraphPattern_.has_value()) {
-          // Query point restricted to the candidate entities the nested pattern
-          // binds (exact search over that set).
-          ctx.addOperationWithChildPattern(
-              vectorQuery.childGraphPattern_.value(),
-              [config, qec](std::shared_ptr<QueryExecutionTree> child)
-                  -> std::shared_ptr<Operation> {
-                return std::make_shared<VectorSearch>(qec, config,
-                                                      std::move(child));
-              });
         } else {
           // Whole-index query point -> top-k table.
           ctx.addLeafOperation(std::make_shared<VectorSearch>(qec, config));
         }
       });
 
-  // 3. Parser: register the `vec:distance(...)` SPARQL function so that
-  //    `BIND(vec:distance(...) AS ?d) ... ORDER BY ?d LIMIT k` performs a
-  //    filtered top-k search using QLever's own operators. The factory lives in
-  //    this folder; the parser only sees the generic registry.
-  parsedQuery::SparqlFunctionRegistry::get().addExact(
-      std::string{parsedQuery::VECTOR_DISTANCE_IRI},
-      &sparqlExpression::makeVectorDistanceExpression);
+  // 3. Parser: register the `vec:distance*` SPARQL functions so that
+  //    `BIND(vec:distance(...) AS ?d) ... ORDER BY ?d LIMIT k` ranks an
+  //    existing set with QLever's own operators. `vec:distanceText`/`Image`
+  //    embed the query point at query time via the index's own endpoint. The
+  //    factories live in this folder; the parser only sees the generic
+  //    registry.
+  auto& functions = parsedQuery::SparqlFunctionRegistry::get();
+  functions.addExact(std::string{parsedQuery::VECTOR_DISTANCE_IRI},
+                     &sparqlExpression::makeVectorDistanceExpression);
+  functions.addExact(std::string{parsedQuery::VECTOR_DISTANCE_TEXT_IRI},
+                     &sparqlExpression::makeVectorDistanceTextExpression);
+  functions.addExact(std::string{parsedQuery::VECTOR_DISTANCE_IMAGE_IRI},
+                     &sparqlExpression::makeVectorDistanceImageExpression);
 }
 
 // Run the registration at static-initialization time. The folder is linked as

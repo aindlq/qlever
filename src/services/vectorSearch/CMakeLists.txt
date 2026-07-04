@@ -116,7 +116,6 @@ endif ()
 
 add_library(service_vectorSearch OBJECT
         VectorSearch.cpp
-        VectorSearchAmong.cpp
         VectorSearchJoin.cpp
         VectorSearchQuery.cpp
         VectorSearchService.cpp

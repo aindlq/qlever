@@ -109,6 +109,16 @@ entities with vectors has changed substantially.
 
 ## Querying
 
+There are exactly **two** surfaces: a **search SERVICE** (find the k nearest
+entities of the index) and a **`vec:distance` function** (rank a set of
+entities you already have). There is no nested `{ ... }` pattern inside the
+SERVICE.
+
+### 1. Search — `SERVICE vec:`
+
+Find the k nearest entities of the *whole index* to a query point (produces
+fresh entities):
+
 ```sparql
 PREFIX vec: <https://qlever.cs.uni-freiburg.de/vectorSearch/>
 SELECT ?painting ?score WHERE {
@@ -119,7 +129,7 @@ SELECT ?painting ?score WHERE {
           vec:bindScore ?score ;
           vec:k 10 .
   }
-  ?painting <is-a> <Painting> .
+  ?painting <is-a> <Painting> .   # further constrain the found entities
 }
 ```
 
@@ -136,9 +146,8 @@ Exactly one **query point** must be given:
   `vec:queryText` are forwarded to the operator-configured embedding endpoint,
   which then fetches/embeds them — if that endpoint sits on a trusted network,
   treat `imageUrl` as a request-forgery vector and restrict it accordingly;
-- `vec:left ?x` — the **join form**: for each `?x`, emit the k nearest
-  entities. `?x` is bound either by a nested `{ ... }` pattern inside the
-  SERVICE, or — like the spatial join — by the **surrounding query**:
+- `vec:left ?x` — the **per-entity join form**: for each `?x` (bound by the
+  **surrounding query**, like the spatial join), emit the k nearest entities:
 
   ```sparql
   ?x <is-a> <Painting> .
@@ -146,9 +155,8 @@ Exactly one **query point** must be given:
                  vec:result ?nn ; vec:k 10 . }
   ```
 
-  (The `<left>` variable must then be the only variable shared with the
-  service clause, and the nested pattern must not bind
-  `vec:result`/`vec:bindScore`.)
+  (The `<left>` variable must be the only variable shared with the service
+  clause.)
 
 Further parameters: `vec:result`/`vec:right` (required; the result entity
 variable), `vec:bindScore` (optional distance variable, smaller = more
@@ -156,15 +164,37 @@ similar), `vec:k`/`vec:numNearestNeighbors` (default 10),
 `vec:maxDistance` (optional distance cutoff), and `vec:algorithm`
 (`vec:exact`, `vec:hnsw`, or `vec:auto` = HNSW if available).
 
-For the point-query forms, an optional nested `{ ... }` pattern that binds the
-result variable **restricts the search space** to exactly those candidate
-entities (always exact search — right for selective candidate sets); the
-pattern must bind only the result variable. An empty candidate set yields an
-empty result. All query forms are cacheable, including `queryText`/image: the
-exact text/image is part of the cache key and the endpoint + model are fixed
-for the run, so an identical repeated query reuses the (expensive-to-embed)
-result instead of re-hitting the endpoint. The result cache is in-memory and
-cleared on restart.
+### 2. Rank a set — the `vec:distance` function
+
+To rank entities you *already have* (a candidate set from ordinary SPARQL),
+score each with `vec:distance` and use `ORDER BY` + `LIMIT` — no SERVICE, no
+nesting, and `k` is just the `LIMIT`:
+
+```sparql
+SELECT ?s ?d WHERE {
+  ?s <is-a> <Statue> ; <located-in> <London> .              # the set you have
+  BIND(vec:distance("clip", ?s, <http://.../artwork/123>) AS ?d)
+  FILTER(BOUND(?d))                                          # drop vectorless ?s
+} ORDER BY ?d LIMIT 10
+```
+
+`vec:distance("index", ?entity, <query>)` returns the distance from a constant
+query point to `?entity`'s stored vector (`UNDEF` if it has none — keep the
+`FILTER(BOUND(?d))` for a correct top-k, since `UNDEF` sorts first). The query
+point is a float-list literal or a constant entity IRI. Two variants embed the
+query point at query time, **via the index's own endpoint** (looked up by the
+index name, so the query is embedded with the model that produced the stored
+vectors — no endpoint URL ever appears in the query):
+
+- `vec:distanceText("index", ?e, "a green statue")` — embed free text;
+- `vec:distanceImage("index", ?e, <url>)` — embed an image URL (or a base64
+  literal).
+
+The text/image is embedded **once** per query. All search results and function
+evaluations are cacheable, including the embedding-based ones: the exact
+text/image is part of the cache key and the endpoint + model are fixed for the
+run, so an identical repeated query reuses the (expensive-to-embed) result. The
+result cache is in-memory and cleared on restart.
 
 ## Design notes
 
@@ -185,12 +215,16 @@ cleared on restart.
   CPU at run time -- no `-march` change, the binary stays portable. Beware
   when integrating usearch/NumKong elsewhere: without the probe-driven
   `NK_TARGET_*` defines it silently compiles serial-only kernels.
-- **Operations**: `VectorSearch` (point query, optional candidate restriction)
-  and `VectorSearchJoin` (per-row form, memoizes repeated query entities)
-  follow the `SpatialJoin` conventions — allocator-backed `IdTable`s,
-  cancellation checks inside the scan loops, cache keys covering every
-  semantic ingredient (including the candidate column and bit-exact query
-  vectors), cost estimates that reflect exact-scan vs. HNSW-probe cost.
+- **Operations**: `VectorSearch` (whole-index point query) and
+  `VectorSearchJoin` (per-row `vec:left` form, memoizes repeated query
+  entities) follow the `SpatialJoin` conventions — allocator-backed
+  `IdTable`s, cancellation checks inside the scan loops, cache keys covering
+  every semantic ingredient (bit-exact query vectors and text/image query
+  points), cost estimates that reflect exact-scan vs. HNSW-probe cost. Ranking
+  an existing set is the `vec:distance*` function family (a `SparqlExpression`
+  registered with the generic `SparqlFunctionRegistry`), which reads the same
+  loaded index; `VectorIndex::searchExact` still offers a candidate-restricted
+  merge-join gather primitive for a future index-accelerated ranking path.
 - **Extensibility**: the registries make a magic service a self-contained
   folder; services are OBJECT libraries linked into `qlever-server`,
   `qlever-index`, `LibQLeverExample`, and the test binary, so the
@@ -206,9 +240,10 @@ cleared on restart.
   (memory-bandwidth-bound workload with FP16/VNNI kernels): at 500k x 128 on
   a 48-core AVX-512 Xeon, queries took 1.6 s (f32) / 1.0 s (f16) / 0.5 s (i8)
   at recall@10 0.98–1.0. The graph itself always stays small.
-- The outer-bound `vec:left` form searches the whole index per row; combining
-  it with a candidate restriction (an additional nested pattern) is a
-  follow-up.
+- The `vec:left` form searches the whole index per row. Ranking a *bound*
+  candidate set is `vec:distance` + `ORDER BY` + `LIMIT` (brute force today);
+  pushing the `LIMIT` into an index-accelerated candidate search (usearch's
+  predicate filter) for very large candidate sets is a follow-up.
 - Tombstones accumulate over repeated remaps; rebuild when a large fraction of
   the indexed entities has disappeared (searches over-fetch past tombstones).
 - Four of the six built-in magic services (path search, text search, external

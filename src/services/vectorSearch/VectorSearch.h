@@ -14,41 +14,28 @@
 #include "engine/QueryExecutionTree.h"
 #include "services/vectorSearch/VectorSearchConfig.h"
 
-// A vector similarity search for a single query point (an explicit vector, the
-// vector of a constant entity, or an embedded text/image), producing a
-// `(?result[, ?score])` table of the k nearest entities.
+// A WHOLE-INDEX vector similarity search for a single query point (an explicit
+// vector, the vector of a constant entity, or an embedded text/image),
+// producing a `(?result[, ?score])` table of the k nearest entities of the
+// index (HNSW if available, else exact). This is the "search" surface.
 //
-// If a nested query pattern is given (the optional `candidates_` child that
-// binds `?result`), the search is restricted to exactly those candidate
-// entities via *exact* search -- the "small candidate set" optimisation (e.g.
-// "among these 5000 green statues, the 10 most similar to <image>"). Without
-// it, the whole index is searched (HNSW if available, else exact).
-//
-// (The "for each ?x, find similar" form is `VectorSearchJoin`.)
+// (The "for each ?x, find similar" form is `VectorSearchJoin`; ranking an
+// existing candidate set is the `vec:distance` function + `ORDER BY`/`LIMIT`.)
 class VectorSearch : public Operation {
  private:
   qlever::vector::VectorSearchConfiguration config_;
-  // Optional candidate-restriction child (binds `config_.resultVariable_`).
-  std::shared_ptr<QueryExecutionTree> candidates_;
-  ColumnIndex candidateCol_ = 0;  // column of resultVariable_ in `candidates_`
   VariableToColumnMap variableColumns_;
 
  public:
   VectorSearch(QueryExecutionContext* qec,
-               qlever::vector::VectorSearchConfiguration config,
-               std::shared_ptr<QueryExecutionTree> candidates = nullptr);
+               qlever::vector::VectorSearchConfiguration config);
 
   std::string getDescriptor() const override;
   size_t getResultWidth() const override;
   std::vector<ColumnIndex> resultSortedOn() const override { return {}; }
-  bool knownEmptyResult() override {
-    return config_.k_ == 0 || (candidates_ && candidates_->knownEmptyResult());
-  }
+  bool knownEmptyResult() override { return config_.k_ == 0; }
   float getMultiplicity(size_t col) override;
-  std::vector<QueryExecutionTree*> getChildren() override {
-    return candidates_ ? std::vector{candidates_.get()}
-                       : std::vector<QueryExecutionTree*>{};
-  }
+  std::vector<QueryExecutionTree*> getChildren() override { return {}; }
   size_t getCostEstimate() override;
 
  private:

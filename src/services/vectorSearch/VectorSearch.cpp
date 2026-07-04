@@ -16,7 +16,6 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "services/vectorSearch/VectorQueryPoint.h"
-#include "util/HashSet.h"
 
 namespace {
 // Append a string to a cache key unambiguously (length-prefixed, so crafted
@@ -29,41 +28,8 @@ void appendToKey(std::string* key, std::string_view field,
 
 // ____________________________________________________________________________
 VectorSearch::VectorSearch(QueryExecutionContext* qec,
-                           qlever::vector::VectorSearchConfiguration config,
-                           std::shared_ptr<QueryExecutionTree> candidates)
-    : Operation{qec},
-      config_{std::move(config)},
-      candidates_{std::move(candidates)} {
-  if (candidates_) {
-    const auto& cols = candidates_->getVariableColumns();
-    auto it = cols.find(config_.resultVariable_);
-    if (it == cols.end()) {
-      throw std::runtime_error{absl::StrCat(
-          "The nested pattern of a vector search must bind the `<result>` "
-          "variable ",
-          config_.resultVariable_.name(),
-          " (the candidate entities to search among).")};
-    }
-    candidateCol_ = it->second.columnIndex_;
-    // The candidate pattern's other variables are NOT part of this operation's
-    // result (each output row is a search hit, not a candidate row), so
-    // exposing or silently dropping them would both be wrong. Reject them.
-    if (cols.size() != 1) {
-      std::string others;
-      for (const auto& [var, _] : cols) {
-        if (var != config_.resultVariable_) {
-          absl::StrAppend(&others, others.empty() ? "" : ", ", var.name());
-        }
-      }
-      throw std::runtime_error{absl::StrCat(
-          "The nested candidate pattern of a vector search must bind only the "
-          "`<result>` variable ",
-          config_.resultVariable_.name(), "; it additionally binds ", others,
-          ". Select the extra values in a separate pattern outside the "
-          "SERVICE and join on ",
-          config_.resultVariable_.name(), ".")};
-    }
-  }
+                           qlever::vector::VectorSearchConfiguration config)
+    : Operation{qec}, config_{std::move(config)} {
   variableColumns_[config_.resultVariable_] =
       makeAlwaysDefinedColumn(ColumnIndex{0});
   if (config_.scoreVariable_.has_value()) {
@@ -87,20 +53,10 @@ size_t VectorSearch::getResultWidth() const {
 float VectorSearch::getMultiplicity(size_t) { return 1.0f; }
 
 // ____________________________________________________________________________
-uint64_t VectorSearch::getSizeEstimateBeforeLimit() {
-  // At most k results; with a candidate set, at most its size.
-  if (candidates_) {
-    return std::min<uint64_t>(config_.k_, candidates_->getSizeEstimate());
-  }
-  return config_.k_;
-}
+uint64_t VectorSearch::getSizeEstimateBeforeLimit() { return config_.k_; }
 
 // ____________________________________________________________________________
 size_t VectorSearch::getCostEstimate() {
-  if (candidates_) {
-    // Exact scan over the candidate set + the child's own cost.
-    return candidates_->getCostEstimate() + candidates_->getSizeEstimate();
-  }
   // Whole-index search: a brute-force scan touches every vector, an HNSW probe
   // roughly log(N) of them. The index may not be loaded while planning (e.g.
   // in tests); fall back to a small constant then.
@@ -156,20 +112,12 @@ std::string VectorSearch::getCacheKeyImpl() const {
                     static_cast<int>(config_.queryImage_.value().kind_));
     appendToKey(&key, "image", config_.queryImage_.value().value_);
   }
-  if (candidates_) {
-    // `candidateCol_` is essential: two children with identical cache keys can
-    // still bind the result variable to different columns.
-    absl::StrAppend(&key, " candidateCol=", candidateCol_, " candidates={",
-                    candidates_->getCacheKey(), "}");
-  }
   return key;
 }
 
 // ____________________________________________________________________________
 std::unique_ptr<Operation> VectorSearch::cloneImpl() const {
-  return std::make_unique<VectorSearch>(
-      getExecutionContext(), config_,
-      candidates_ ? candidates_->clone() : nullptr);
+  return std::make_unique<VectorSearch>(getExecutionContext(), config_);
 }
 
 // ____________________________________________________________________________
@@ -185,10 +133,11 @@ Result VectorSearch::computeResult([[maybe_unused]] bool requestLaziness) {
 
   IdTable idTable{getResultWidth(), getExecutionContext()->getAllocator()};
 
-  // Resolve the query point (shared with `VectorSearchAmong`): an explicit or
-  // embedded vector goes into `query`; a constant entity (`vec:query <iri>`) is
-  // searched by its STORED vector directly (no decode/re-encode through f32),
-  // tracked in `queryEntity`; an unknown/vectorless entity -> empty result.
+  // Resolve the query point (shared with the `vec:distance` function): an
+  // explicit or embedded vector goes into `query`; a constant entity
+  // (`vec:query <iri>`) is searched by its STORED vector directly (no
+  // decode/re-encode through f32), tracked in `queryEntity`; an
+  // unknown/vectorless entity -> empty result.
   qlever::vector::QueryPoint queryPoint = qlever::vector::resolveQueryPoint(
       config_, *vidx, index.getImpl(), cancellationHandle_);
   if (std::holds_alternative<std::monostate>(queryPoint)) {
@@ -210,55 +159,22 @@ Result VectorSearch::computeResult([[maybe_unused]] bool requestLaziness) {
   }
   auto checkInterrupt = [this]() { checkCancellation(); };
 
+  // Whole-index search (by the stored vector for the entity form -- no
+  // decode/re-encode through f32).
   std::vector<qlever::vector::ScoredEntity> results;
-  if (candidates_) {
-    // Restricted search space: gather the candidate entities the nested pattern
-    // binds and run EXACT search over just those (correct and -- for a small,
-    // selective set -- faster than filtering the whole HNSW index).
-    // `<algorithm>` is ignored here: over an explicit candidate set, exact is
-    // the right choice.
-    std::shared_ptr<const Result> candRes = candidates_->getResult();
-    const IdTable& candTable = candRes->idTable();
-    std::vector<Id> candidateIds;
-    candidateIds.reserve(candTable.numRows());
-    ad_utility::HashSet<uint64_t> seen;
-    for (size_t row = 0; row < candTable.numRows(); ++row) {
-      if (row % 1024 == 0) {
-        checkCancellation();
-      }
-      Id id = candTable(row, candidateCol_);
-      if (seen.insert(id.getBits()).second) {
-        candidateIds.push_back(id);
-      }
-    }
-    // NOTE: an empty candidate set correctly yields an empty result here (the
-    // restriction pattern matched nothing).
-    ql::span<const Id> candidateSpan{candidateIds};
-    results = queryEntity.has_value()
-                  ? vidx->searchExactByEntity(
-                        queryEntity.value(), config_.k_, candidateSpan,
-                        config_.maxDistance_, checkInterrupt)
-                  : vidx->searchExact(query, config_.k_, candidateSpan,
-                                      config_.maxDistance_, checkInterrupt);
+  bool useHnsw = vidx->hasHnsw() && config_.algorithm_ != Algo::Exact;
+  if (queryEntity.has_value()) {
+    results =
+        useHnsw ? vidx->searchHnswByEntity(queryEntity.value(), config_.k_,
+                                           config_.maxDistance_, checkInterrupt)
+                : vidx->searchExactByEntity(queryEntity.value(), config_.k_,
+                                            std::nullopt, config_.maxDistance_,
+                                            checkInterrupt);
   } else {
-    // Whole-index search (by the stored vector for the entity form -- no
-    // decode/re-encode through f32).
-    bool useHnsw = vidx->hasHnsw() && config_.algorithm_ != Algo::Exact;
-    if (queryEntity.has_value()) {
-      results =
-          useHnsw
-              ? vidx->searchHnswByEntity(queryEntity.value(), config_.k_,
+    results = useHnsw ? vidx->searchHnsw(query, config_.k_,
                                          config_.maxDistance_, checkInterrupt)
-              : vidx->searchExactByEntity(queryEntity.value(), config_.k_,
-                                          std::nullopt, config_.maxDistance_,
-                                          checkInterrupt);
-    } else {
-      results = useHnsw
-                    ? vidx->searchHnsw(query, config_.k_, config_.maxDistance_,
-                                       checkInterrupt)
-                    : vidx->searchExact(query, config_.k_, std::nullopt,
-                                        config_.maxDistance_, checkInterrupt);
-    }
+                      : vidx->searchExact(query, config_.k_, std::nullopt,
+                                          config_.maxDistance_, checkInterrupt);
   }
 
   idTable.resize(results.size());

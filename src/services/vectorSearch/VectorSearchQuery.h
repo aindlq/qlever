@@ -24,12 +24,18 @@ namespace parsedQuery {
 inline constexpr std::string_view VECTOR_SEARCH_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/>";
 
-// The IRI of the `vec:distance("index", ?entity, <query>|"v0,v1,...")` SPARQL
-// function: a per-row distance from a query point to `?entity`'s stored vector.
-// BIND it and ORDER BY + LIMIT to run a filtered top-k search using QLever's
-// own operators. Registered with the `SparqlFunctionRegistry` by the service.
+// The IRIs of the `vec:distance*` SPARQL function family: a per-row distance
+// from a query point to `?entity`'s stored vector. BIND one and ORDER BY +
+// LIMIT to run a filtered top-k search using QLever's own operators. The query
+// point is a constant vector/entity (`vec:distance`), or free text / an image
+// embedded at query time via the index's own endpoint (`vec:distanceText` /
+// `vec:distanceImage`). Registered with the `SparqlFunctionRegistry`.
 inline constexpr std::string_view VECTOR_DISTANCE_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/distance>";
+inline constexpr std::string_view VECTOR_DISTANCE_TEXT_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/distanceText>";
+inline constexpr std::string_view VECTOR_DISTANCE_IMAGE_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/distanceImage>";
 
 class VectorSearchException : public std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -44,11 +50,9 @@ struct VectorSearchQuery : MagicServiceQuery {
   std::optional<std::string> queryEntityIri_;
   std::optional<std::string> queryText_;  // free text -> embedded at query time
   std::optional<qlever::vector::VectorSearchConfiguration::ImageQuery>
-      queryImage_;                    // image -> embedded at query time
-  std::optional<Variable> leftVar_;   // binary form: query entity from the
-                                      // nested pattern ("for each ?x")
-  std::optional<Variable> amongVar_;  // "among" form: candidate/result set from
-                                      // the surrounding query (top-k of them)
+      queryImage_;                   // image -> embedded at query time
+  std::optional<Variable> leftVar_;  // binary "for each ?x" form: query entity
+                                     // bound by the surrounding query
   std::optional<Variable> resultVar_;
   std::optional<Variable> scoreVar_;
   std::optional<size_t> k_;
