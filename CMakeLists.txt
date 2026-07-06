@@ -498,7 +498,7 @@ set(BUILD_TESTS OFF CACHE BOOL "no tests for s2")
 FetchContent_Declare(
         s2
         GIT_REPOSITORY https://github.com/google/s2geometry.git
-        GIT_TAG v0.14.0  # pairs with abseil >= 2026 LTS (absl::Nonnull removal); >= v0.12.0 removed the htonll/ntohll macros colliding with mingw winsock2.h
+        GIT_TAG v0.13.1  # abseil-2026 compat (absl::Nonnull removed in v0.13.0) + htonll/ntohll macros removed (v0.12.0), but before v0.14.0's OpenSSL-free bignum.cc whose _addcarry_u64/_subborrow_u64 break gcc-8 (s2 #568). Uses OpenSSL for exactfloat, which QLever already requires.
         SYSTEM
         EXCLUDE_FROM_ALL
 )
