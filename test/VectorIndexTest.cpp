@@ -133,11 +133,18 @@ void writeNpy(const std::string& path, size_t n, size_t d,
   out.write(reinterpret_cast<const char*>(data.data()), n * d * sizeof(float));
 }
 
-// Write `iris` (one per line) to `path`.
+// Write `iris` (one per line) to `path`. Alternates between the iriref form
+// `<...>` and a bare IRI with surrounding whitespace -- the reader accepts
+// both and yields the trimmed bare form.
 void writeIris(const std::string& path, const TestData& data, size_t count) {
   std::ofstream out{path};
   for (size_t i = 0; i < count; ++i) {
-    out << "<http://ex/" << data.rawIds[i % data.rawIds.size()] << ">\n";
+    uint64_t id = data.rawIds[i % data.rawIds.size()];
+    if (i % 2 == 0) {
+      out << "<http://ex/" << id << ">\n";
+    } else {
+      out << "  http://ex/" << id << " \t\n";
+    }
   }
 }
 }  // namespace
@@ -555,7 +562,9 @@ TEST(VectorIndex, npyInputReader) {
   size_t count = 0;
   while (reader.next(iri, v)) {
     ASSERT_EQ(v.size(), DIM);
-    EXPECT_EQ(iri, "<http://ex/" + std::to_string(data.rawIds[count]) + ">");
+    // Both the `<...>` lines and the whitespace-padded bare lines come out
+    // as the trimmed bare IRI.
+    EXPECT_EQ(iri, "http://ex/" + std::to_string(data.rawIds[count]));
     for (size_t j = 0; j < DIM; ++j) EXPECT_FLOAT_EQ(v[j], data.vecs[count][j]);
     ++count;
   }

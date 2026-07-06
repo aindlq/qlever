@@ -9,6 +9,7 @@
 
 #include <array>
 #include <charconv>
+#include <cstring>
 
 #include "services/vectorSearch/VectorIndexFormat.h"
 #include "util/Exception.h"
@@ -133,21 +134,36 @@ NpyVectorInputReader::NpyVectorInputReader(const std::string& npyPath,
     AD_THROW("Unexpected end of file in the .npy header of " + npyPath);
   }
 
-  // We only support little-endian float32, C-order. Match the `descr` VALUE
-  // exactly (a substring check would accept a structured dtype that merely
-  // contains a `<f4` field and then silently misread the row stride).
-  auto descrIsF4 = [&header](std::string_view quote) {
+  // We only support little-endian C-order matrices of float32 ('<f4') or --
+  // for bfloat16 matrices written via `ml_dtypes` (numpy has no native bf16
+  // type code) -- the opaque 2-byte void '<V2', whose value bytes are the
+  // little-endian bf16 bit pattern (the top 16 bits of the fp32). Match the
+  // `descr` VALUE exactly (a substring check would accept a structured dtype
+  // that merely contains such a field and then silently misread the row
+  // stride).
+  auto descrIs = [&header](std::string_view value) {
     size_t pos = header.find("'descr'");
     if (pos == std::string::npos) return false;
     pos = header.find(':', pos);
     if (pos == std::string::npos) return false;
     pos = header.find_first_not_of(" ", pos + 1);
-    return pos != std::string::npos &&
-           header.compare(pos, quote.size(), quote) == 0;
+    if (pos == std::string::npos) return false;
+    for (std::string_view quote : {"'", "\""}) {
+      std::string quoted =
+          std::string{quote} + std::string{value} + std::string{quote};
+      if (header.compare(pos, quoted.size(), quoted) == 0) return true;
+    }
+    return false;
   };
-  if (!descrIsF4("'<f4'") && !descrIsF4("\"<f4\"")) {
-    AD_THROW(".npy input must be little-endian float32 ('<f4'). Header: " +
-             header.substr(0, 200));
+  if (descrIs("<f4")) {
+    bytesPerScalar_ = sizeof(float);
+  } else if (descrIs("<V2")) {
+    bytesPerScalar_ = 2;
+  } else {
+    AD_THROW(
+        ".npy input must be little-endian float32 ('<f4') or bfloat16 "
+        "('<V2', as written by ml_dtypes.bfloat16). Header: " +
+        header.substr(0, 200));
   }
   if (header.find("'fortran_order': False") == std::string::npos) {
     AD_THROW(".npy input must be C-order (fortran_order: False).");
@@ -189,20 +205,49 @@ bool NpyVectorInputReader::next(std::string& iri, std::vector<float>& vector) {
              ") than the .npy input has rows (" + std::to_string(numRows_) +
              ").");
   }
-  // Trim a trailing '\r' (CRLF inputs) and surrounding whitespace.
-  while (!iri.empty() && (iri.back() == '\r' || iri.back() == ' ' ||
-                          iri.back() == '\t' || iri.back() == '\n')) {
-    iri.pop_back();
+  // Trim surrounding whitespace (also handles the '\r' of CRLF inputs). The
+  // line is either a bare IRI or an iriref `<...>`; yield the bare form, the
+  // build pass re-brackets it for resolution against the vocabulary.
+  constexpr std::string_view whitespace = " \t\r\n";
+  size_t first = iri.find_first_not_of(whitespace);
+  if (first == std::string::npos) {
+    AD_THROW("Line " + std::to_string(rowsRead_ + 1) +
+             " of the IRI list is empty, but the .npy input has a row for "
+             "it.");
   }
-  // The D float32 values of this row.
+  size_t last = iri.find_last_not_of(whitespace);
+  iri = iri.substr(first, last - first + 1);
+  if (iri.size() >= 2 && iri.front() == '<' && iri.back() == '>') {
+    iri = iri.substr(1, iri.size() - 2);
+  }
+  // The D scalars of this row (`bytesPerScalar_` bytes each).
+  const auto rowBytes =
+      static_cast<std::streamsize>(dimensions_) * bytesPerScalar_;
   vector.resize(dimensions_);
-  npy_.read(reinterpret_cast<char*>(vector.data()),
-            static_cast<std::streamsize>(dimensions_ * sizeof(float)));
-  if (npy_.gcount() !=
-      static_cast<std::streamsize>(dimensions_ * sizeof(float))) {
+  const bool isF32 = bytesPerScalar_ == sizeof(float);
+  if (isF32) {
+    npy_.read(reinterpret_cast<char*>(vector.data()), rowBytes);
+  } else {
+    rawRow_.resize(static_cast<size_t>(rowBytes));
+    npy_.read(rawRow_.data(), rowBytes);
+  }
+  if (npy_.gcount() != rowBytes) {
     AD_THROW("Unexpected end of data in the .npy input at row " +
              std::to_string(rowsRead_) + " of " + std::to_string(numRows_) +
              ".");
+  }
+  if (!isF32) {
+    // Decode each little-endian bf16 bit pattern: a bf16 is exactly the top
+    // 16 bits of the corresponding fp32, so widening is lossless.
+    for (uint32_t j = 0; j < dimensions_; ++j) {
+      const auto bits = static_cast<uint16_t>(
+          static_cast<uint8_t>(rawRow_[2 * j]) |
+          (static_cast<uint8_t>(rawRow_[2 * j + 1]) << 8));
+      const uint32_t widened = static_cast<uint32_t>(bits) << 16;
+      float value;
+      std::memcpy(&value, &widened, sizeof(value));
+      vector[j] = value;
+    }
   }
   ++rowsRead_;
   return true;

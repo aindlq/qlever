@@ -18,7 +18,9 @@ namespace qlever::vector {
 
 // Streams `(iri, vector)` rows from a bulk input file for index building. The
 // concrete format is an implementation detail; the build pass resolves each
-// `iri` to a `VocabIndex` against the knowledge graph's vocabulary.
+// `iri` to a `VocabIndex` against the knowledge graph's vocabulary. The
+// yielded `iri` may be bare (`http://...`) or an iriref (`<http://...>`);
+// the build pass brackets bare IRIs before resolving them.
 //
 // `next` fills `iri` and `vector` and returns true, or returns false at EOF.
 class VectorInputReader {
@@ -29,12 +31,14 @@ class VectorInputReader {
   virtual bool next(std::string& iri, std::vector<float>& vector) = 0;
 };
 
-// Reads a 2-D little-endian float32 NumPy `.npy` matrix (shape `(N, D)`,
-// C-order) together with a sidecar text file of `N` IRIs, one per line, where
-// line `i` labels row `i` of the matrix. This is the dependency-free default
-// ingest format (`ParquetVectorInputReader` below is the alternative for large
-// production inputs). `np.save("vectors.npy", arr)` plus writing the IRIs to a
-// text file is all it takes to produce.
+// Reads a 2-D little-endian NumPy `.npy` matrix (shape `(N, D)`, C-order) of
+// float32 (`<f4`) or bfloat16 (`<V2`, the opaque 2-byte dtype that
+// `ml_dtypes.bfloat16` serializes as) together with a sidecar text file of
+// `N` IRIs, one per line (bare or wrapped in angle brackets; `next` yields
+// the bare form), where line `i` labels row `i` of the matrix. This is the
+// dependency-free default ingest format (`ParquetVectorInputReader` below is
+// the alternative for large production inputs). `np.save("vectors.npy", arr)`
+// plus writing the IRIs to a text file is all it takes to produce.
 class NpyVectorInputReader : public VectorInputReader {
  public:
   NpyVectorInputReader(const std::string& npyPath, const std::string& irisPath);
@@ -47,7 +51,10 @@ class NpyVectorInputReader : public VectorInputReader {
   uint32_t dimensions_ = 0;
   uint64_t numRows_ = 0;
   uint64_t rowsRead_ = 0;
-  uint64_t dataOffset_ = 0;  // byte offset of the float data in the .npy file
+  uint64_t dataOffset_ = 0;  // byte offset of the matrix data in the .npy file
+  // Bytes per matrix scalar: 4 for float32 (`<f4`), 2 for bfloat16 (`<V2`).
+  uint32_t bytesPerScalar_ = sizeof(float);
+  std::vector<char> rawRow_;  // decode buffer for the bf16 path
   std::ifstream npy_;
   std::ifstream iris_;
 };

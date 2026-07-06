@@ -43,20 +43,23 @@ embeddings to must appear in it. Example `kg.ttl`:
 
 Per index you provide two row-aligned files:
 
-- `<name>.npy` — an `N × D` **float32, C-order** matrix (row *i* = the vector for
-  entity *i*). Real embedding dims (384, 512, 768, 1024, 1536, …) are all ×64, so
-  the store is SIMD-aligned for free.
-- `<name>.iris` — `N` lines, **one entity IRI per line**, aligned with the matrix
-  rows. Each IRI must exist in the KG (it is resolved against the vocabulary).
+- `<name>.npy` — an `N × D` **C-order** matrix (row *i* = the vector for
+  entity *i*), either **float32** or **bfloat16** (the `ml_dtypes` dtype; see
+  the bf16 note below). Real embedding dims (384, 512, 768, 1024, 1536, …) are
+  all ×64, so the store is SIMD-aligned for free.
+- `<name>.iris` — `N` lines, **one entity IRI per line** (bare, e.g.
+  `http://example.org/doc1`; the `<...>` iriref form is also accepted), aligned
+  with the matrix rows. Each IRI must exist in the KG (it is resolved against
+  the vocabulary).
 
 Produce them from any embedding pipeline, e.g. in Python:
 
 ```python
 import numpy as np
 
-iris    = ["<http://example.org/doc1>",
-           "<http://example.org/doc2>",
-           "<http://example.org/doc3>"]
+iris    = ["http://example.org/doc1",
+           "http://example.org/doc2",
+           "http://example.org/doc3"]
 vectors = np.asarray(model.encode(titles), dtype=np.float32)   # shape (N, D)
 
 np.save("emb.npy", vectors)                                    # -> emb.npy
@@ -94,7 +97,7 @@ array (e.g. one for image embeddings, one for text).
 | key       | meaning                                                        |
 |-----------|----------------------------------------------------------------|
 | `name`    | index name; the index IRI is `<…/vectorSearch/index/name>` (used in `vec:distance`/`vec:embed` and carrying the metadata triples) |
-| `npy`     | path to the `N × D` float32 `.npy` matrix                      |
+| `npy`     | path to the `N × D` `.npy` matrix (float32 or `ml_dtypes` bfloat16) |
 | `iris`    | path to the row-aligned IRI list                               |
 | `metric`  | `cosine` \| `dot` \| `l2` (distance; smaller = closer)         |
 | `hnsw`    | `true` builds the ANN graph; `false` = exact/flat store only   |
@@ -102,9 +105,12 @@ array (e.g. one for image embeddings, one for text).
 | `embeddingUrl`   | *(optional)* embedding endpoint bound to this index (see below) |
 | `embeddingModel` | *(optional)* model name sent to that endpoint            |
 
-- bf16 — for bf16 embeddings: save the `.npy` as fp32 (numpy has no bf16) and
-  set `scalar: bf16`; qlever stores 2-byte bf16, lossless since the fp32 is an
-  upscaled bf16.
+- bf16 — for bf16 embeddings save a **native 2-byte bf16 `.npy`** via
+  [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes):
+  `import ml_dtypes; np.save("emb.npy", vectors.astype(ml_dtypes.bfloat16))`,
+  and set `"scalar": "bf16"` — a straight 2-byte store with no fp32 round-trip
+  in the file, at half the file size. (An fp32 `.npy` plus `"scalar": "bf16"`
+  also works; the values are truncated to bf16 at store time.)
 
 ### Embedding endpoint (`embeddingUrl` + `embeddingModel`)
 

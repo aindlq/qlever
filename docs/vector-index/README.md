@@ -19,7 +19,7 @@ entirely at configure time with `-DQLEVER_WITH_VECTOR_SEARCH=OFF`.
 ## Building a vector index
 
 Vector indices are built by `qlever index` **after** the main index, from a
-`.npy` float32 matrix plus a row-aligned IRI list (or from raw texts embedded
+`.npy` matrix (float32 or bfloat16) plus a row-aligned IRI list (or from raw texts embedded
 at build time):
 
 ```bash
@@ -41,8 +41,8 @@ Per-index keys (unknown keys are rejected):
 | key | meaning | default |
 |---|---|---|
 | `name` | index name (letters, digits, `-`, `_`) | required |
-| `iris` | text file, one `<IRI>` per line, aligned with the vector rows | required except for `parquet` |
-| `npy` | 2-D little-endian float32 `.npy` matrix (v1/v2/v3 header) | one of `npy`/`texts`/`parquet` |
+| `iris` | text file, one IRI per line (bare or `<...>`), aligned with the vector rows | required except for `parquet` |
+| `npy` | 2-D little-endian `.npy` matrix (v1/v2/v3 header), float32 or `ml_dtypes` bfloat16 | one of `npy`/`texts`/`parquet` |
 | `texts` | text file whose lines are embedded via `embeddingUrl` at build time | |
 | `parquet` | Parquet file with `uri` (string) + `embedding` (list of float32/float64) columns; carries the URIs itself, so `iris` is not needed. Requires `-DQLEVER_VECTOR_SEARCH_PARQUET=ON` (external Apache Arrow) | |
 | `dimensions` | vector dimension (inferred if omitted) | inferred |

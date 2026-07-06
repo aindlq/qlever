@@ -17,8 +17,10 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -51,27 +53,45 @@ constexpr std::string_view KG =
     "<d> <is-a> <Item> . <nomember> <is-a> <Item> .";
 
 // The dimension-3 vectors, row i of the `.npy` matrix belonging to line i of
-// the IRI sidecar. With the cosine metric and the query point [1,0,0]:
-// `<a>` and `<c>` are exact matches (distance ~0), `<b>` is at 1-0.6 = 0.4,
-// and `<d>` is orthogonal (distance 1) -- an unambiguous ranking.
+// the IRI sidecar. The sidecar deliberately MIXES bare IRIs and `<...>`
+// irirefs -- both forms are accepted, so every test on this fixture also
+// asserts that bare-IRI rows resolve. With the cosine metric and the query
+// point [1,0,0]: `<a>` and `<c>` are exact matches (distance ~0), `<b>` is at
+// 1-0.6 = 0.4, and `<d>` is orthogonal (distance 1) -- an unambiguous
+// ranking.
 const std::vector<std::pair<std::string, std::vector<float>>>& testVectors() {
   static const std::vector<std::pair<std::string, std::vector<float>>> vecs{
-      {"<a>", {1.f, 0.f, 0.f}},
+      {"a", {1.f, 0.f, 0.f}},
       {"<b>", {0.6f, 0.8f, 0.f}},
-      {"<c>", {1.f, 0.f, 0.f}},
+      {"c", {1.f, 0.f, 0.f}},
       {"<d>", {0.f, 0.f, 1.f}},
   };
   return vecs;
 }
 
-// Write `rows` as a NumPy v1.0 `.npy` file (little-endian float32, C-order)
-// plus the row-aligned IRI sidecar -- the exact input bundle of the design.
+// Encode `value` as the little-endian bf16 bit pattern that
+// `ml_dtypes.bfloat16` puts into a `.npy` file: the top 16 bits of the fp32.
+// Exact for the bf16-representable test values (0, 0.25, 0.5, 1) --
+// truncation only ever drops zero bits there.
+std::array<char, 2> bf16LittleEndian(float value) {
+  uint32_t asUint = 0;
+  std::memcpy(&asUint, &value, sizeof(asUint));
+  const auto bits = static_cast<uint16_t>(asUint >> 16);
+  return {static_cast<char>(bits & 0xff), static_cast<char>(bits >> 8)};
+}
+
+// Write `rows` as a NumPy v1.0 `.npy` file (C-order; little-endian float32
+// `<f4`, or -- with `bf16` -- the 2-byte `<V2` void dtype that
+// `ml_dtypes.bfloat16` serializes as) plus the row-aligned IRI sidecar -- the
+// exact input bundle of the design.
 void writeNpyBundle(
     const std::string& npyPath, const std::string& irisPath,
-    const std::vector<std::pair<std::string, std::vector<float>>>& rows) {
+    const std::vector<std::pair<std::string, std::vector<float>>>& rows,
+    bool bf16 = false) {
   const size_t numRows = rows.size();
   const size_t dim = rows.front().second.size();
-  std::string dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
+  std::string dict = std::string{"{'descr': '"} + (bf16 ? "<V2" : "<f4") +
+                     "', 'fortran_order': False, 'shape': (" +
                      std::to_string(numRows) + ", " + std::to_string(dim) +
                      "), }";
   size_t pad = (64 - ((10 + dict.size() + 1) % 64)) % 64;
@@ -88,8 +108,15 @@ void writeNpyBundle(
   out.write(dict.data(), dict.size());
   std::ofstream irisOut{irisPath};
   for (const auto& [iri, vec] : rows) {
-    out.write(reinterpret_cast<const char*>(vec.data()),
-              vec.size() * sizeof(float));
+    if (bf16) {
+      for (float value : vec) {
+        auto bytes = bf16LittleEndian(value);
+        out.write(bytes.data(), bytes.size());
+      }
+    } else {
+      out.write(reinterpret_cast<const char*>(vec.data()),
+                vec.size() * sizeof(float));
+    }
     irisOut << iri << "\n";
   }
 }
@@ -149,9 +176,10 @@ QueryExecutionTree planQuery(QueryExecutionContext* qec, std::string query) {
 }
 
 // ===========================================================================
-// The bf16 fixture: a SEPARATE knowledge graph (a distinct `getQec` cache
-// entry) whose vector index is built with `"scalar": "bf16"` from the same
-// fp32 `.npy` bundle format. Every vector component is exactly
+// The bf16-STORAGE fixture: a SEPARATE knowledge graph (a distinct `getQec`
+// cache entry) whose vector index is built with `"scalar": "bf16"` from an
+// fp32 `.npy` bundle (the fp32-input path; the native `<V2` bf16 INPUT is the
+// fixture further below). Every vector component is exactly
 // bf16-representable (0, 0.25, 0.5, 1), so truncating the fp32 input to the
 // 2-byte bf16 store is lossless and the cosine distances are exact.
 constexpr std::string_view KG_BF16 =
@@ -216,6 +244,63 @@ std::pair<QueryExecutionContext*, std::uintmax_t> qecWithBf16Index() {
     std::filesystem::remove(basename + suffix, ec);
   }
   return {qec, dataFileSize};
+}
+
+// ===========================================================================
+// The NATIVE-bf16-INPUT fixture: the `.npy` matrix itself is bf16 -- dtype
+// `<V2`, the opaque 2-byte void that `ml_dtypes.bfloat16` serializes as
+// (numpy has no native bf16 type code); each scalar is the little-endian
+// bf16 bit pattern. Combined with `"scalar": "bf16"` the values go into the
+// 2-byte store with no fp32 round-trip in the file. The sidecar uses BARE
+// IRIs throughout. All components (0, 0.25, 0.5, 1) are exactly
+// bf16-representable, so the ranking is exact.
+constexpr std::string_view KG_NATIVE_BF16 =
+    "<a> <is-a> <NativeBf16Item> . <b> <is-a> <NativeBf16Item> . "
+    "<c> <is-a> <NativeBf16Item> . <d> <is-a> <NativeBf16Item> .";
+
+// `<a>`/`<c>` = e0 (distance ~0 to an e0 query), `<b>` at 45 degrees in the
+// e0/e1 plane (cosine distance 1 - 1/sqrt(2)), `<d>` orthogonal (distance 1).
+std::vector<std::pair<std::string, std::vector<float>>> nativeBf16Vectors() {
+  return {{"a", {1.f, 0.f, 0.f, 0.f}},
+          {"b", {0.25f, 0.25f, 0.f, 0.f}},
+          {"c", {1.f, 0.f, 0.f, 0.f}},
+          {"d", {0.f, 0.f, 0.5f, 0.f}}};
+}
+
+QueryExecutionContext* qecWithNativeBf16Index() {
+  QueryExecutionContext* qec = getQec(std::string{KG_NATIVE_BF16});
+  auto& impl = const_cast<Index&>(qec->getIndex()).getImpl();
+  if (impl.getExtension(std::string{qlever::vector::VECTOR_EXTENSION_NAME}) !=
+      nullptr) {
+    return qec;
+  }
+  std::string basename =
+      (std::filesystem::temp_directory_path() /
+       ("qlever-vecpayloade2e-nbf16-" + std::to_string(::getpid())))
+          .string();
+  std::string npy = basename + ".input.npy";
+  std::string iris = basename + ".input.iris";
+  writeNpyBundle(npy, iris, nativeBf16Vectors(), /*bf16=*/true);
+  nlohmann::json spec = nlohmann::json::parse(
+      R"({"vectorSearch":[{"name":"embnative","npy":")" + npy +
+      R"(","iris":")" + iris +
+      R"(","metric":"cosine","scalar":"bf16","hnsw":false}]})");
+  for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
+    hook(qec->getIndex(), basename, spec);
+  }
+  for (const auto& hook : IndexExtensionRegistry::get().loadHooks()) {
+    hook(impl, basename);
+  }
+  qec->setLocatedTriplesForEvaluation(
+      impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
+  for (auto* suffix :
+       {".vec.embnative.meta", ".vec.embnative.keys", ".vec.embnative.rowmap",
+        ".vec.embnative.data", ".vec.embnative.iris", ".vec.embnative.hnsw",
+        ".input.npy", ".input.iris"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + suffix, ec);
+  }
+  return qec;
 }
 }  // namespace
 
@@ -438,11 +523,12 @@ TEST(VectorIndexPayloadE2E, embedWithoutEndpointThrows) {
 }
 
 // _____________________________________________________________________________
-// The bf16 storage scalar: the `.npy` input stays fp32 (numpy has no portable
-// bf16), but `"scalar": "bf16"` stores every vector as 2-byte bf16. The
-// fixture's components are exactly bf16-representable, so the f32 -> bf16
-// truncation is lossless and `vec:distance` ranks exactly like an fp32 store:
-// identical vectors at distance ~0, orthogonal at cosine distance ~1.
+// The bf16 storage scalar with an fp32 INPUT: the `.npy` matrix is fp32, but
+// `"scalar": "bf16"` stores every vector as 2-byte bf16 (the native `<V2`
+// bf16 input is `nativeBf16NpyInputResolvesAndRanks` below). The fixture's
+// components are exactly bf16-representable, so the f32 -> bf16 truncation is
+// lossless and `vec:distance` ranks exactly like an fp32 store: identical
+// vectors at distance ~0, orthogonal at cosine distance ~1.
 TEST(VectorIndexPayloadE2E, bf16ScalarStoresTwoBytesAndRanksCorrectly) {
   auto [qec, dataFileSize] = qecWithBf16Index();
 
@@ -503,6 +589,44 @@ TEST(VectorIndexPayloadE2E, bf16ScalarStoresTwoBytesAndRanksCorrectly) {
   EXPECT_NEAR(table(1, dCol).getDouble(), 0.0, 1e-4);
   // Then <b> at 45 degrees (cosine distance 1 - 1/sqrt(2)), then the
   // orthogonal <d> at distance 1 (small tolerance for the bf16 kernel).
+  EXPECT_EQ(table(2, eCol), getId("<b>"));
+  EXPECT_NEAR(table(2, dCol).getDouble(), 1.0 - 1.0 / std::sqrt(2.0), 1e-2);
+  EXPECT_EQ(table(3, eCol), getId("<d>"));
+  EXPECT_NEAR(table(3, dCol).getDouble(), 1.0, 1e-3);
+}
+
+// _____________________________________________________________________________
+// A NATIVE bf16 `.npy` input: the matrix dtype is `<V2` (ml_dtypes.bfloat16),
+// 2 bytes per scalar, so the reader must use the 2-byte row stride and decode
+// each little-endian bf16 bit pattern -- a wrong stride would mis-slice every
+// row after the first. The sidecar uses bare IRIs, and all four rows resolve
+// (FILTER(BOUND) keeps 4 rows). With `"scalar": "bf16"` and exactly
+// bf16-representable components the ranking is exact: the identical vectors
+// <a>/<c> at distance ~0, <b> at 45 degrees (1 - 1/sqrt(2)), <d> orthogonal
+// (~1).
+TEST(VectorIndexPayloadE2E, nativeBf16NpyInputResolvesAndRanks) {
+  auto* qec = qecWithNativeBf16Index();
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <is-a> <NativeBf16Item> . "
+               "BIND(vec:distance(vidx:embnative, ?e, \"1,0,0,0\") AS ?d) "
+               "FILTER(BOUND(?d)) } ORDER BY ?d");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+
+  // All four bare-IRI rows of the `<V2` bundle resolved to entities.
+  ASSERT_EQ(table.numRows(), 4u);
+  // The two rows identical to the query point rank first, in either order.
+  std::set<uint64_t> nearest{table(0, eCol).getBits(),
+                             table(1, eCol).getBits()};
+  EXPECT_TRUE(nearest.contains(getId("<a>").getBits()));
+  EXPECT_TRUE(nearest.contains(getId("<c>").getBits()));
+  EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+  EXPECT_NEAR(table(1, dCol).getDouble(), 0.0, 1e-4);
+  // Then <b> at 45 degrees, then the orthogonal <d>.
   EXPECT_EQ(table(2, eCol), getId("<b>"));
   EXPECT_NEAR(table(2, dCol).getDouble(), 1.0 - 1.0 / std::sqrt(2.0), 1e-2);
   EXPECT_EQ(table(3, eCol), getId("<d>"));

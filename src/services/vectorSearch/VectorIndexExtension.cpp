@@ -308,13 +308,15 @@ std::vector<std::optional<Id>> resolveBatch(
 }
 
 // Shared by the .npy and Parquet inputs: stream `(iri, vector)` rows from
-// `reader` into a builder, resolving the IRIs in parallel batches.
+// `reader` into a builder, resolving the IRIs in parallel batches. Readers
+// may yield IRIs bare or as `<...>` irirefs; bare ones are bracketed here, so
+// the builder always stores (and `resolveBatch` always sees) the `<...>`
+// form.
 VectorIndexMetadata buildFromReader(const Index& index,
                                     const std::string& basename,
                                     VectorIndexConfig config,
                                     VectorInputReader& reader,
-                                    bool normalizeIris, uint64_t& resolved,
-                                    uint64_t& skipped) {
+                                    uint64_t& resolved, uint64_t& skipped) {
   const size_t numThreads = effectiveThreads(config.buildThreads_);
   VectorIndexBuilder builder{basename, config};
   builder.setVocabSize(vocabFingerprint(index.getImpl()));
@@ -344,7 +346,7 @@ VectorIndexMetadata buildFromReader(const Index& index,
                  ", but the index is configured with dimension " +
                  std::to_string(dim) + ".");
       }
-      if (normalizeIris && !ql::starts_with(iri, "<")) {
+      if (!ql::starts_with(iri, "<")) {
         iri = "<" + iri + ">";
       }
       iris.push_back(iri);
@@ -391,8 +393,7 @@ VectorIndexMetadata buildFromParquet(const Index& index,
              ") does not match the Parquet file (" +
              std::to_string(reader.dimensions()) + ").");
   }
-  return buildFromReader(index, basename, config, reader,
-                         /*normalizeIris=*/true, resolved, skipped);
+  return buildFromReader(index, basename, config, reader, resolved, skipped);
 }
 #endif  // QLEVER_WITH_PARQUET
 
@@ -410,8 +411,7 @@ VectorIndexMetadata buildFromNpy(const Index& index,
              ") does not match the .npy file (" +
              std::to_string(reader.dimensions()) + ").");
   }
-  return buildFromReader(index, basename, config, reader,
-                         /*normalizeIris=*/false, resolved, skipped);
+  return buildFromReader(index, basename, config, reader, resolved, skipped);
 }
 
 VectorIndexMetadata buildFromTexts(const Index& index,
