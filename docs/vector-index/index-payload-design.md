@@ -56,9 +56,27 @@ images.meta.json  # {"name":"images","model":"clip","metric":"cosine","precision
 
 `.npy` is zero-dependency (a 6-byte magic + one-line ASCII header + raw bytes; ~30 lines
 to parse), native to any ML pipeline (`np.save`), and its C-order matrix *is* our
-per-space array — so ingest is near-zero-copy. Parquet (Arrow) is dropped; a base64
+per-space array — so for real (×64) dimensions ingest is near-zero-copy (an odd
+dimension re-lays each row into the padded store). Parquet (Arrow) is dropped; a base64
 vector literal in Turtle stays available for the "just give me a `.ttl`" path but is
 not the bulk route.
+
+## Alignment & residency (SIMD scans)
+
+The flat store is a contiguous fixed-stride matrix, `mmap`'d and scanned by NumKong's
+per-precision SIMD kernels. Both things that keep those scans fast are free in practice:
+
+- **Alignment.** `mmap` returns a page-aligned base, and real embedding dimensions are
+  multiples of 64 (384, 512, 768, 1024, 1536, …), so the natural row stride
+  (`dim × precision-width`) is already a multiple of 64 at every precision — every row
+  starts 64-byte aligned and no SIMD load straddles a cache line, for free. NumKong
+  kernels use unaligned loads + masked tails, so *any* dimension is correct regardless;
+  alignment is just the bonus real data hands us. (Format v5 carries an explicit per-row
+  stride that can pad an odd dimension as a safety net — real vectors never need it.)
+- **Residency.** Because the store is `mmap`'d, a cold whole-index scan page-faults. For
+  a query-hot index that fits in RAM, pin it (`mlock`, or a huge-page-backed aligned RAM
+  copy — `Residency` in `VectorIndex.h`); leave it on the OS page cache otherwise. A
+  per-index build-spec knob, off by default.
 
 The builder reads `(uri, row)`, resolves the IRI to an entity id, and stores the vector
 in the index array keyed by that entity — **no triples are created for the vectors.**
@@ -155,3 +173,5 @@ the `SERVICE` (`VectorSearch`, `vec:algorithm exact|hnsw`), the embed client.
 - A query-less `SERVICE` mode to enumerate an index's member entities, *if* a real need
   appears (YAGNI: `qv:count` covers the common form).
 - Uniform-distance polish for `vec:distance` if any metric still returns similarity.
+- Expose `residency` (mlock / aligned huge-page copy) as a per-index build-spec key so
+  hot indices can be pinned; the mechanism already exists (`VectorIndex.h`).
