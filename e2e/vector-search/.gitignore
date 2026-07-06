@@ -1,0 +1,10 @@
+# generated at runtime (root-owned, large, downloaded)
+data/images/
+data/queries/
+data/text/
+data/*.npy
+data/*.iris
+data/index*/
+data/*.ttl
+data/hf-cache/
+sockets/

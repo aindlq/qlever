@@ -1,0 +1,104 @@
+# End-to-end cross-modal vector-search stack: vLLM (CPU, SigLIP) + QLever.
+#
+# - vllm:   serves a SigLIP dual (text+image) embedding model over a UNIX
+#           domain socket in the shared `sockets` volume. CPU ONLY.
+# - qlever: builds a vector index from precomputed image embeddings and answers
+#           cross-modal SPARQL queries, calling the vLLM socket via `vec:embed`.
+#
+# The model, and any model-specific extra args, come from the environment
+# (see .env / run.sh). `$$VAR` is passed through to the container shell so the
+# container's OWN environment is expanded at runtime (not by docker compose).
+name: qvec
+
+services:
+  vllm:
+    image: vllm/vllm-openai-cpu:latest-x86_64
+    container_name: qvec_vllm
+    environment:
+      VLLM_MODEL: ${VLLM_MODEL:-google/siglip2-base-patch16-224}
+      VLLM_EXTRA_ARGS: ${VLLM_EXTRA_ARGS-}
+      HF_HOME: /hf
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-16}
+      # Pin worker OpenMP threads to a small core set so this shares the host
+      # nicely with the other running containers (default would grab all cores).
+      VLLM_CPU_OMP_THREADS_BIND: ${VLLM_CPU_OMP_THREADS_BIND:-0-15}
+    entrypoint: ["/bin/bash", "-c"]
+    # Remove any stale socket from a previous run, then serve. With `--uds` the
+    # host/port are ignored; SigLIP embeds BOTH text and images into one space.
+    # On the CPU backend `--gpu-memory-utilization` sets the fraction of *CPU*
+    # RAM reserved -- keep it modest so startup doesn't demand ~all of host RAM.
+    command:
+      - >
+        rm -f /sockets/vllm.sock;
+        exec vllm serve --model "$$VLLM_MODEL" $$VLLM_EXTRA_ARGS
+        --runner pooling --dtype bfloat16 --served-model-name siglip
+        --gpu-memory-utilization 0.3 --uds /sockets/vllm.sock
+    volumes:
+      - sockets:/sockets      # shared UNIX socket with qlever
+      - hfcache:/hf           # HF model cache (download once)
+      - ./data:/work          # corpus + precompute output
+    shm_size: "4gb"
+    restart: "no"
+    stop_grace_period: 30s
+
+  qlever:
+    image: artresearch/qlever:vector
+    container_name: qvec_qlever
+    # Run as root so the server can connect to the root-owned vLLM socket
+    # regardless of its file mode, and bypass the image's uid-remap entrypoint.
+    user: "0:0"
+    working_dir: /data
+    entrypoint: ["/qlever/qlever-server"]
+    command: ["-i", "/data/index/vec", "-p", "7001"]
+    volumes:
+      - sockets:/sockets
+      - ./data:/data
+    ports:
+      - "127.0.0.1:7001:7001"
+    restart: "no"
+
+  # ---- Text-only fallback demo (profile: text) ----------------------------
+  # Proves the SAME vec:embed-over-unix-socket wiring yields CORRECT semantic
+  # rankings for TEXT queries, using a real text-embedding model (BGE). This is
+  # the fallback the task calls for, since SigLIP text->image is not correctly
+  # served by vLLM CPU (see diagnose_siglip.py).
+  vllm-text:
+    image: vllm/vllm-openai-cpu:latest-x86_64
+    container_name: qvec_vllm_text
+    profiles: ["text"]
+    environment:
+      HF_HOME: /hf
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-16}
+      VLLM_CPU_OMP_THREADS_BIND: ${VLLM_CPU_OMP_THREADS_BIND:-16-31}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        rm -f /sockets/vllm-text.sock;
+        exec vllm serve --model BAAI/bge-small-en-v1.5
+        --runner pooling --served-model-name bge
+        --gpu-memory-utilization 0.3 --uds /sockets/vllm-text.sock
+    volumes:
+      - sockets:/sockets
+      - hfcache:/hf
+      - ./data:/work
+    shm_size: "2gb"
+    restart: "no"
+
+  qlever-text:
+    image: artresearch/qlever:vector
+    container_name: qvec_qlever_text
+    profiles: ["text"]
+    user: "0:0"
+    working_dir: /data
+    entrypoint: ["/qlever/qlever-server"]
+    command: ["-i", "/data/index-text/docs", "-p", "7002"]
+    volumes:
+      - sockets:/sockets
+      - ./data:/data
+    ports:
+      - "127.0.0.1:7002:7002"
+    restart: "no"
+
+volumes:
+  sockets:
+  hfcache:
