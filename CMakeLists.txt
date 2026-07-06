@@ -604,7 +604,12 @@ if (WIN32)
 endif ()
 # Disable some warnings in RE2 and GTEST
 target_compile_options(s2 PRIVATE -Wno-sign-compare -Wno-unused-parameter -Wno-class-memaccess -Wno-comment -Wno-redundant-move -Wno-unknown-warning-option -Wno-maybe-uninitialized -Wno-class-memaccess -Wno-unused-but-set-variable -Wno-unused-function)
-target_compile_options(re2 PRIVATE -Wno-unused-parameter)
+# re2's `dfa.cc` still calls the `absl::Mutex` methods `ReaderLock/ReaderUnlock/
+# WriterLock/WriterUnlock`, which abseil LTS 20260107 deprecated (they remain as
+# inline shims, so behavior is unchanged). Suppress the deprecation so the
+# `-Werror` build isn't broken by third-party code we don't control. Remove once
+# re2 migrates off them (google/re2 issue #631, PR #644 -- both open as of 2026-07).
+target_compile_options(re2 PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations)
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(gtest PRIVATE -Wno-maybe-uninitialized)
 endif ()
