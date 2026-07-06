@@ -201,9 +201,31 @@ std::optional<std::string> unixSocketPath(const std::string& baseUrl) {
   return rest;
 }
 
-// Embed `inputs` (texts or image payloads) via the OpenAI-compatible endpoint
-// with a single request; returns one embedding per input, in input order. The
-// response's per-item `index` field is honoured where present.
+// POST the serialized JSON `requestBody` to `<baseUrl>/v1/embeddings`,
+// dispatching between the `unix:` socket and http(s) transports, and parse the
+// response body as JSON. Shared by the text and image request paths.
+nlohmann::json postEmbeddingRequest(
+    const std::string& baseUrl, const std::string& requestBody,
+    ad_utility::SharedCancellationHandle handle) {
+  std::string body;
+  if (auto socketPath = unixSocketPath(baseUrl); socketPath.has_value()) {
+    handle->throwIfCancelled();
+    body = postViaUnixSocket(socketPath.value(), requestBody);
+    handle->throwIfCancelled();
+  } else {
+    body = postViaTcp(baseUrl, requestBody, std::move(handle));
+  }
+  try {
+    return nlohmann::json::parse(body);
+  } catch (const std::exception& e) {
+    AD_THROW(
+        absl::StrCat("Could not parse embedding response as JSON: ", e.what()));
+  }
+}
+
+// Embed `inputs` (texts) via the OpenAI-compatible endpoint with a single
+// request; returns one embedding per input, in input order. The response's
+// per-item `index` field is honoured where present.
 std::vector<std::vector<float>> embedManyOpenAI(
     const std::string& baseUrl, const std::string& model,
     const std::vector<std::string>& inputs,
@@ -237,24 +259,8 @@ std::vector<std::vector<float>> embedManyOpenAI(
   }
 
   nlohmann::json request{{"model", model}, {"input", inputs}};
-  std::string requestBody = request.dump();
-
-  std::string body;
-  if (auto socketPath = unixSocketPath(baseUrl); socketPath.has_value()) {
-    handle->throwIfCancelled();
-    body = postViaUnixSocket(socketPath.value(), requestBody);
-    handle->throwIfCancelled();
-  } else {
-    body = postViaTcp(baseUrl, requestBody, std::move(handle));
-  }
-
-  nlohmann::json parsed;
-  try {
-    parsed = nlohmann::json::parse(body);
-  } catch (const std::exception& e) {
-    AD_THROW(
-        absl::StrCat("Could not parse embedding response as JSON: ", e.what()));
-  }
+  nlohmann::json parsed =
+      postEmbeddingRequest(baseUrl, request.dump(), std::move(handle));
   if (!parsed.contains("data") || !parsed["data"].is_array() ||
       parsed["data"].size() != inputs.size()) {
     AD_THROW(absl::StrCat(
@@ -299,13 +305,63 @@ std::vector<float> embedTextOpenAI(
 }
 
 // ____________________________________________________________________________
+nlohmann::json makeImageEmbeddingRequest(const std::string& model,
+                                         const std::string& imagePayload) {
+  nlohmann::json imagePart{
+      {"type", "image_url"},
+      {"image_url", nlohmann::json{{"url", imagePayload}}}};
+  nlohmann::json message{{"role", "user"},
+                         {"content", nlohmann::json::array({imagePart})}};
+  return nlohmann::json{{"model", model},
+                        {"encoding_format", "float"},
+                        {"messages", nlohmann::json::array({message})}};
+}
+
+// ____________________________________________________________________________
 std::vector<float> embedImageOpenAI(
     const std::string& baseUrl, const std::string& model,
     const std::string& imagePayload,
     ad_utility::SharedCancellationHandle handle) {
-  return std::move(
-      embedManyOpenAI(baseUrl, model, {imagePayload}, std::move(handle))
-          .front());
+  if (baseUrl.empty()) {
+    AD_THROW("This vector index has no embedding endpoint configured.");
+  }
+  // The chat-style multimodal request below is an HTTP API; the in-process
+  // `llama:` backend embeds text only.
+  if (ql::starts_with(baseUrl, "llama:")) {
+    AD_THROW(
+        "The in-process llama.cpp embedding backend cannot embed images; "
+        "configure an http(s) or unix: vLLM-style multimodal embedding "
+        "endpoint instead.");
+  }
+  nlohmann::json parsed = postEmbeddingRequest(
+      baseUrl, makeImageEmbeddingRequest(model, imagePayload).dump(),
+      std::move(handle));
+  if (!parsed.contains("data") || !parsed["data"].is_array() ||
+      parsed["data"].empty()) {
+    AD_THROW("The image embedding response has no non-empty `data` array.");
+  }
+  const auto& item = parsed["data"][0];
+  if (!item.is_object() || !item.contains("embedding") ||
+      !item["embedding"].is_array() || item["embedding"].empty()) {
+    AD_THROW(
+        "The image embedding response's `data[0].embedding` is not a "
+        "non-empty array.");
+  }
+  const auto& embedding = item["embedding"];
+  std::vector<float> out;
+  out.reserve(embedding.size());
+  for (const auto& value : embedding) {
+    if (!value.is_number()) {
+      AD_THROW("The image embedding contains a non-numeric value.");
+    }
+    float f = value.get<float>();
+    // A non-finite value would poison every distance comparison it enters.
+    if (!std::isfinite(f)) {
+      AD_THROW("The embedding response contains a non-finite value.");
+    }
+    out.push_back(f);
+  }
+  return out;
 }
 
 // ____________________________________________________________________________

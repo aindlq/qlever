@@ -25,6 +25,7 @@
 #include "index/IndexExtension.h"
 #include "index/IndexImpl.h"
 #include "parser/SparqlParser.h"
+#include "services/vectorSearch/EmbeddingClient.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexBuilder.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
@@ -696,6 +697,33 @@ TEST(VectorSearchService, vecEmbedRequiresConfiguredEndpoint) {
                    "<https://example.org/cat.jpg>)) AS ?d) } ORDER BY ?d",
                Variable{"?s"}),
       HasSubstr("has no embeddingUrl configured"));
+}
+
+// _____________________________________________________________________________
+// The image embedding request is vLLM's multimodal embedding shape: a
+// chat-style `messages` body with a single `image_url` content part carrying
+// the image payload verbatim (an http(s) URL or a data URI), plus
+// `encoding_format: "float"`. Text requests keep the plain `input` shape.
+TEST(VectorSearchService, imageEmbeddingRequestBodyIsVllmMultimodal) {
+  for (const std::string& payload :
+       {std::string{"https://example.org/cat.jpg"},
+        std::string{"data:image/png;base64,AAAA"}}) {
+    nlohmann::json body =
+        qlever::vector::makeImageEmbeddingRequest("clip", payload);
+    EXPECT_EQ(body["model"], "clip");
+    EXPECT_EQ(body["encoding_format"], "float");
+    ASSERT_TRUE(body["messages"].is_array());
+    ASSERT_EQ(body["messages"].size(), 1u);
+    const auto& message = body["messages"][0];
+    EXPECT_EQ(message["role"], "user");
+    ASSERT_TRUE(message["content"].is_array());
+    ASSERT_EQ(message["content"].size(), 1u);
+    const auto& part = message["content"][0];
+    EXPECT_EQ(part["type"], "image_url");
+    EXPECT_EQ(part["image_url"]["url"], payload);
+    // The body must NOT contain the text path's `input` field.
+    EXPECT_FALSE(body.contains("input"));
+  }
 }
 
 // _____________________________________________________________________________

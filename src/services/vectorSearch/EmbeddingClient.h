@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "util/CancellationHandle.h"
+#include "util/json.h"
 
 namespace qlever::vector {
 
@@ -28,10 +29,22 @@ std::vector<float> embedTextOpenAI(const std::string& baseUrl,
                                    const std::string& text,
                                    ad_utility::SharedCancellationHandle handle);
 
-// Embed an image via the same OpenAI-compatible endpoint. `imagePayload` is
-// what is sent in `input` -- a URL the endpoint fetches, or a
-// `data:image/...;base64,` data URI. (Multimodal embedding servers vary in
-// their exact request shape; this uses the common `input`-string convention.)
+// Build the vLLM multimodal embedding request body for a single image:
+// `{"model": <model>, "encoding_format": "float", "messages": [{"role":
+// "user", "content": [{"type": "image_url", "image_url": {"url":
+// <imagePayload>}}]}]}`. Exposed separately so the exact request shape is
+// unit-testable.
+nlohmann::json makeImageEmbeddingRequest(const std::string& model,
+                                         const std::string& imagePayload);
+
+// Embed an image via the vLLM multimodal embedding API, POSTed to the same
+// `<baseUrl>/v1/embeddings` endpoint as the text path. `imagePayload` -- an
+// http(s) image URL the endpoint fetches, or a `data:image/...;base64,` data
+// URI -- is sent verbatim inside a chat-style `messages` body with a single
+// `image_url` content part (see `makeImageEmbeddingRequest`), which is vLLM's
+// request shape for multimodal embedding models. The response is the usual
+// `CreateEmbeddingResponse` body; the embedding is read from
+// `data[0].embedding`.
 std::vector<float> embedImageOpenAI(
     const std::string& baseUrl, const std::string& model,
     const std::string& imagePayload,

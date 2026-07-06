@@ -130,6 +130,14 @@ to the index in the build spec:
 - `embeddingModel` is the model name sent with each request. Because both are
   properties of the *index*, a query is always embedded with the model that
   produced the stored vectors, and no endpoint URL ever appears in a query.
+- Text is embedded with the plain OpenAI shape (`{"model": …, "input": […]}`).
+  IMAGE embedding (`vec:embed` on an IRI, and the SERVICE's `vec:imageUrl`)
+  instead uses **vLLM's multimodal embedding format** on the same
+  `/v1/embeddings` path: a chat-style `messages` body with an `image_url`
+  content part (`{"model": …, "encoding_format": "float", "messages":
+  [{"role": "user", "content": [{"type": "image_url", "image_url": {"url":
+  <image URL or data URI>}}]}]}`). So for image queries, the endpoint must be
+  a vLLM-style multimodal embedding server.
 - Without `embeddingUrl`, the index is fully usable with explicit query
   vectors and entity↔entity distances; only `vec:embed` (and the SERVICE's
   text/image query points) error with "has no embeddingUrl configured".
