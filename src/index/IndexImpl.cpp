@@ -1003,12 +1003,6 @@ void IndexImpl::createFromOnDiskIndex(const std::string& onDiskBase,
   AD_LOG_DEBUG << "Number of words in internal and external vocabulary: "
                << vocab_.size() << std::endl;
 
-  // Let registered services load their auxiliary indices now that the
-  // vocabulary is available (see `IndexExtension.h`).
-  for (const auto& loadHook : IndexExtensionRegistry::get().loadHooks()) {
-    loadHook(*this, onDiskBase_);
-  }
-
   // Load the permutations and register the original metadata for the delta
   // triples.
   // The setting of the metadata doesn't affect the contents of the delta
@@ -1081,6 +1075,16 @@ void IndexImpl::createFromOnDiskIndex(const std::string& onDiskBase,
         onDiskBase + ".update-triples");
     graphNameManager_.setFilenameForPersistingAndReadFromDisk(
         onDiskBase + ".allocated-graphs-state");
+  }
+
+  // Let registered services load their auxiliary indices now that the index is
+  // fully loaded (see `IndexExtension.h`). This deliberately runs LAST: a load
+  // hook may insert delta triples (e.g. auto-materialized metadata triples),
+  // which requires the permutations' block metadata to locate the triples, and
+  // must not run before `readFromDisk` above, which requires that the local
+  // vocab of the delta triples is still empty.
+  for (const auto& loadHook : IndexExtensionRegistry::get().loadHooks()) {
+    loadHook(*this, onDiskBase_);
   }
 }
 

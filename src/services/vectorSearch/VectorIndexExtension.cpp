@@ -17,21 +17,31 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
+#include "absl/strings/str_cat.h"
 #include "backports/StartsWithAndEndsWith.h"
 #include "backports/algorithm.h"
+#include "global/Constants.h"
+#include "global/IdTriple.h"
+#include "index/DeltaTriples.h"
 #include "index/Index.h"
 #include "index/IndexExtension.h"
 #include "index/IndexImpl.h"
+#include "index/LocalVocab.h"
 #include "index/StringSortComparator.h"
 #include "parser/TripleComponent.h"
 #include "rdfTypes/Iri.h"
+#include "rdfTypes/Literal.h"
 #include "services/vectorSearch/EmbeddingClient.h"
 #include "services/vectorSearch/VectorIndexBuilder.h"
 #include "services/vectorSearch/VectorIndexFormat.h"
@@ -557,6 +567,91 @@ void buildHook(const Index& index, const std::string& basename,
   }
 }
 
+// The fields of one loaded vector index that become its auto-materialized
+// metadata triples (collected while the load hook iterates the indices).
+struct IndexMetadataFields {
+  std::string name_;
+  uint64_t dimensions_;
+  std::string metric_;
+  std::string precision_;
+  uint64_t count_;
+  std::string model_;  // empty when the index has no embedding endpoint
+};
+
+// Auto-materialize the thin per-index metadata triples (see
+// `docs/vector-index/index-payload-design.md`, section "idx: metadata
+// triples") as DELTA triples, so that every loaded vector index is
+// introspectable in plain SPARQL:
+//   SELECT * { <.../vectorSearch/index/emb> ?p ?o }
+// Runs once per server start and inserts a handful of triples per index (so
+// cost is irrelevant). `writeToDiskAfterRequest` is false: the triples are
+// re-materialized on every load anyway (re-insertion of an already inserted
+// triple is a no-op), so persisted-update files need not carry them.
+void materializeMetadataTriples(IndexImpl& impl,
+                                const std::vector<IndexMetadataFields>& rows) {
+  if (rows.empty()) {
+    return;
+  }
+  // Locating delta triples requires the block metadata of all (loaded)
+  // permutations; without them (`--only-pso-and-pos-permutations` or
+  // `doNotLoadPermutations`) updates are unsupported anyway, so skip.
+  if (impl.doNotLoadPermutations() || !impl.loadAllPermutations()) {
+    AD_LOG_WARN << "Not materializing the metadata triples of the vector "
+                   "indices: they require all permutations to be loaded."
+                << std::endl;
+    return;
+  }
+  try {
+    impl.deltaTriplesManager().modify<void>(
+        [&impl, &rows](DeltaTriples& deltaTriples) {
+          // New IRIs and literals get their ids from this local vocab.
+          // `insertTriples` re-homes the entries into the delta triples' own
+          // local vocab (`rewriteLocalVocabEntriesAndBlankNodes`), so this one
+          // only has to outlive the call.
+          LocalVocab localVocab;
+          auto toId = [&impl, &localVocab](TripleComponent tc) {
+            return std::move(tc).toValueId(impl, localVocab);
+          };
+          using Iri = ad_utility::triple_component::Iri;
+          using Literal = ad_utility::triple_component::Literal;
+          const Id graph = toId(Iri::fromIriref(DEFAULT_GRAPH_IRI));
+          DeltaTriples::Triples triples;
+          for (const IndexMetadataFields& row : rows) {
+            const Id subject = toId(Iri::fromIriref(
+                absl::StrCat(VECTOR_METADATA_SUBJECT_PREFIX, row.name_, ">")));
+            auto add = [&](std::string_view predicate, TripleComponent object) {
+              triples.push_back(
+                  IdTriple<0>{{subject, toId(Iri::fromIriref(predicate)),
+                               toId(std::move(object)), graph}});
+            };
+            add(VECTOR_METADATA_DIMENSION_IRI,
+                static_cast<int64_t>(row.dimensions_));
+            add(VECTOR_METADATA_METRIC_IRI,
+                Literal::literalWithoutQuotes(row.metric_));
+            add(VECTOR_METADATA_PRECISION_IRI,
+                Literal::literalWithoutQuotes(row.precision_));
+            add(VECTOR_METADATA_COUNT_IRI, static_cast<int64_t>(row.count_));
+            if (!row.model_.empty()) {
+              add(VECTOR_METADATA_MODEL_IRI,
+                  Literal::literalWithoutQuotes(row.model_));
+            }
+          }
+          // `insertTriples` requires its input to be sorted.
+          ql::ranges::sort(triples);
+          auto handle = std::make_shared<
+              DeltaTriples::CancellationHandle::element_type>();
+          deltaTriples.insertTriples(std::move(handle), std::move(triples));
+        },
+        /*writeToDiskAfterRequest=*/false);
+  } catch (const std::exception& e) {
+    // Metadata triples are a convenience; never let them prevent the server
+    // from starting.
+    AD_LOG_WARN << "Could not materialize the metadata triples of the vector "
+                   "indices: "
+                << e.what() << std::endl;
+  }
+}
+
 // LOAD hook: memory-map every `<base>.vec.<name>.*` index and attach the
 // collection to the `IndexImpl`. A broken or stale index is skipped with a
 // warning instead of preventing the whole server from starting -- queries
@@ -573,6 +668,7 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
     return;
   }
   auto collection = std::make_shared<VectorIndexCollection>();
+  std::vector<IndexMetadataFields> metadataFields;
   bool any = false;
   for (const auto& entry : fs::directory_iterator(dir, ec)) {
     const std::string fn = entry.path().filename().string();
@@ -636,12 +732,18 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                 << ", dim " << idx.dimensions()
                 << ", HNSW=" << (idx.hasHnsw() ? "yes" : "no") << ")"
                 << std::endl;
+    const VectorIndexConfig& config = idx.metadata().config_;
+    metadataFields.push_back({name, config.dimensions_,
+                              toString(config.metric_),
+                              toString(config.scalar_), idx.numLiveVectors(),
+                              config.embeddingModel_});
     collection->add(name, std::move(idx));
     any = true;
   }
   if (any) {
     impl.setExtension(std::string{VECTOR_EXTENSION_NAME},
                       std::move(collection));
+    materializeMetadataTriples(impl, metadataFields);
   }
 }
 

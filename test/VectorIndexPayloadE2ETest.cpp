@@ -117,6 +117,12 @@ QueryExecutionContext* qecWithPayloadIndex() {
   for (const auto& hook : IndexExtensionRegistry::get().loadHooks()) {
     hook(impl, basename);
   }
+  // The load hook auto-materialized the per-index metadata triples as DELTA
+  // triples, but the cached `getQec` context captured its located-triples
+  // snapshot at construction -- refresh it so queries see them (the server
+  // takes a fresh snapshot per query; the test context does not).
+  qec->setLocatedTriplesForEvaluation(
+      impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
   // The load hook memory-maps the index, which keeps the data alive; the
   // directory entries (and the input bundle) can go right away.
   for (auto* suffix :
@@ -177,6 +183,43 @@ TEST(VectorIndexPayloadE2E, rankEntitiesByDistanceToQueryVector) {
   // The ranking is monotone in the distance.
   EXPECT_LE(table(1, dCol).getDouble(), table(2, dCol).getDouble());
   EXPECT_LT(table(2, dCol).getDouble(), table(3, dCol).getDouble());
+}
+
+// _____________________________________________________________________________
+// The index itself is a queryable RDF resource (design doc, section "idx:
+// metadata triples"): at load time the hook auto-materializes thin metadata
+// triples on `<.../vectorSearch/index/emb>` as delta triples, so the space is
+// introspectable in plain SPARQL -- dimension, metric, precision, and member
+// count, all matching the fixture's `.npy` bundle (4 vectors of dimension 3,
+// cosine metric, stored as f32).
+TEST(VectorIndexPayloadE2E, indexMetadataTriplesAreQueryable) {
+  auto* qec = qecWithPayloadIndex();
+  QueryExecutionTree qet = planQuery(
+      qec,
+      "SELECT ?dim ?metric ?precision ?count WHERE { "
+      "<https://qlever.cs.uni-freiburg.de/vectorSearch/index/emb> "
+      "<https://qlever.cs.uni-freiburg.de/vectorSearch/dimension> ?dim ; "
+      "<https://qlever.cs.uni-freiburg.de/vectorSearch/metric> ?metric ; "
+      "<https://qlever.cs.uni-freiburg.de/vectorSearch/precision> ?precision ; "
+      "<https://qlever.cs.uni-freiburg.de/vectorSearch/count> ?count }");
+  auto result = qet.getResult();
+  const IdTable& table = result->idTable();
+
+  // Exactly one metadata record for the index.
+  ASSERT_EQ(table.numRows(), 1u);
+  // The metadata literals live in the delta triples' local vocab.
+  auto getLiteral = [&](std::string_view varName) {
+    Id id = table(0, qet.getVariableColumn(Variable{std::string{varName}}));
+    EXPECT_EQ(id.getDatatype(), Datatype::LocalVocabIndex)
+        << varName << " should be a (local vocab) literal";
+    return id.getLocalVocabIndex()->toStringRepresentation();
+  };
+  EXPECT_EQ(table(0, qet.getVariableColumn(Variable{"?dim"})),
+            Id::makeFromInt(3));
+  EXPECT_EQ(getLiteral("?metric"), "\"cosine\"");
+  EXPECT_EQ(getLiteral("?precision"), "\"f32\"");
+  EXPECT_EQ(table(0, qet.getVariableColumn(Variable{"?count"})),
+            Id::makeFromInt(4));
 }
 
 // _____________________________________________________________________________

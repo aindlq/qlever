@@ -25,6 +25,29 @@ namespace qlever::vector {
 // via the generic extension mechanism (see `index/IndexExtension.h`).
 inline constexpr std::string_view VECTOR_EXTENSION_NAME = "vectorSearch";
 
+// The auto-materialized metadata triples that make every loaded vector index
+// queryable as an RDF resource (see
+// `docs/vector-index/index-payload-design.md`, section "idx: metadata
+// triples"): the load hook inserts, once per index,
+//   <.../vectorSearch/index/NAME>  vec:dimension  3 ;
+//       vec:metric "cosine" ; vec:precision "f32" ; vec:count 4 ;
+//       vec:model "clip" .          # only if an embedding model is configured
+// as DELTA triples. The IRIs live in the public `vectorSearch` namespace (NOT
+// in QLever's internal `builtin-functions/` namespace), so the triples behave
+// like ordinary inserted data and are visible to plain SPARQL.
+inline constexpr std::string_view VECTOR_METADATA_SUBJECT_PREFIX =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/index/";
+inline constexpr std::string_view VECTOR_METADATA_DIMENSION_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/dimension>";
+inline constexpr std::string_view VECTOR_METADATA_METRIC_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/metric>";
+inline constexpr std::string_view VECTOR_METADATA_PRECISION_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/precision>";
+inline constexpr std::string_view VECTOR_METADATA_COUNT_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/count>";
+inline constexpr std::string_view VECTOR_METADATA_MODEL_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/model>";
+
 // All vector indices of a database, keyed by name. This is the object stored as
 // the "vectorSearch" index extension and retrieved at query time.
 class VectorIndexCollection {

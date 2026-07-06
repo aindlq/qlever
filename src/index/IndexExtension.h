@@ -24,9 +24,12 @@ class IndexImpl;
 //   with
 //     the freshly built index loaded, so URI->Id resolution is available. It
 //     reads its slice of the build configuration JSON and writes its files.
-//   * a LOAD hook   -- run at server/engine start, after the vocabulary is
-//     loaded. It memory-maps its files and stores the result on the `IndexImpl`
-//     via `setExtension`, to be retrieved at query time via `getExtension`.
+//   * a LOAD hook   -- run at server/engine start, after the index is fully
+//     loaded (vocabulary, permutations, and persisted updates). It memory-maps
+//     its files and stores the result on the `IndexImpl` via `setExtension`,
+//     to be retrieved at query time via `getExtension`. Because the index is
+//     fully loaded, a load hook may also insert delta triples (e.g.
+//     auto-materialized metadata triples describing its auxiliary index).
 //
 // The whole config JSON is passed to every build hook; each hook picks its own
 // key (its service name), so a generic `--service-index <json>` CLI option
