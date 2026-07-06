@@ -218,6 +218,10 @@ if (QLEVER_WITH_VECTOR_SEARCH)
     # End-to-end tests of the vector-search magic SERVICE (parsing, planning,
     # operations); needs the service's self-registration, hence the OBJECT lib.
     addLinkAndDiscoverTest(VectorSearchServiceTest engine service_vectorSearch)
+
+    # End-to-end test of the "index-payload" flow: `.npy` bundle -> build hook
+    # -> load hook -> `vec:distance` ranking in SPARQL.
+    addLinkAndDiscoverTest(VectorIndexPayloadE2ETest engine service_vectorSearch)
 endif ()
 
 # BufferedVectorTest also uses conflicting filenames.
