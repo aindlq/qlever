@@ -111,8 +111,8 @@ entities with vectors has changed substantially.
 
 There are exactly **two** surfaces: a **search SERVICE** (find the k nearest
 entities of the index) and a **`vec:distance` function** (rank a set of
-entities you already have). There is no nested `{ ... }` pattern inside the
-SERVICE.
+entities you already have; `vec:embed` supplies query vectors for it). There
+is no nested `{ ... }` pattern inside the SERVICE.
 
 ### 1. Search — `SERVICE vec:`
 
@@ -164,37 +164,47 @@ similar), `vec:k`/`vec:numNearestNeighbors` (default 10),
 `vec:maxDistance` (optional distance cutoff), and `vec:algorithm`
 (`vec:exact`, `vec:hnsw`, or `vec:auto` = HNSW if available).
 
-### 2. Rank a set — the `vec:distance` function
+### 2. Rank a set — the `vec:distance` function (+ `vec:embed`)
 
 To rank entities you *already have* (a candidate set from ordinary SPARQL),
 score each with `vec:distance` and use `ORDER BY` + `LIMIT` — no SERVICE, no
-nesting, and `k` is just the `LIMIT`:
+nesting, and `k` is just the `LIMIT`. The index is addressed by its **IRI**
+`<…/vectorSearch/index/NAME>` (`vidx:NAME` below) — the same resource that
+carries the queryable metadata triples:
 
 ```sparql
+PREFIX vidx: <https://qlever.cs.uni-freiburg.de/vectorSearch/index/>
 SELECT ?s ?d WHERE {
   ?s <is-a> <Statue> ; <located-in> <London> .              # the set you have
-  BIND(vec:distance("clip", ?s, <http://.../artwork/123>) AS ?d)
+  BIND(vec:distance(vidx:clip, ?s, <http://.../artwork/123>) AS ?d)
   FILTER(BOUND(?d))                                          # drop vectorless ?s
 } ORDER BY ?d LIMIT 10
 ```
 
-`vec:distance("index", ?entity, <query>)` returns the distance from a constant
-query point to `?entity`'s stored vector (`UNDEF` if it has none — keep the
-`FILTER(BOUND(?d))` for a correct top-k, since `UNDEF` sorts first). The query
-point is a float-list literal or a constant entity IRI. Two variants embed the
-query point at query time, **via the index's own endpoint** (looked up by the
-index name, so the query is embedded with the model that produced the stored
-vectors — no endpoint URL ever appears in the query):
+`vec:distance(vidx:NAME, S1, S2)` returns the distance between two vector
+*sources*. Each source is an expression that yields, per row, either an
+**entity** (its stored vector is looked up in the index) or a
+**comma-separated float-list string** (an inline query vector, or the result
+of `vec:embed`). A row whose source is neither — including an entity without a
+vector — is `UNDEF` (keep the `FILTER(BOUND(?d))` for a correct top-k, since
+`UNDEF` sorts first). So entity↔entity (`vec:distance(vidx:clip, ?a, ?b)`),
+entity↔query-vector, and text/image search all go through the one function:
 
-- `vec:distanceText("index", ?e, "a green statue")` — embed free text;
-- `vec:distanceImage("index", ?e, <url>)` — embed an image URL (or a base64
-  literal).
+- `vec:embed(vidx:NAME, "a green statue")` — embed free text **via the
+  index's own endpoint** (its `embeddingUrl`/`embeddingModel` build keys, so
+  the query is embedded with the model that produced the stored vectors — no
+  endpoint URL ever appears in the query) and return the vector as a
+  float-list string, ready to feed into `vec:distance`;
+- `vec:embed(vidx:NAME, <url>)` — an IRI input is an image URL (or `data:`
+  URI), fetched and embedded by the endpoint.
 
-The text/image is embedded **once** per query. All search results and function
-evaluations are cacheable, including the embedding-based ones: the exact
-text/image is part of the cache key and the endpoint + model are fixed for the
-run, so an identical repeated query reuses the (expensive-to-embed) result. The
-result cache is in-memory and cleared on restart.
+A constant source is resolved/embedded **once** per query; `vec:embed`
+memoizes by input, so even a per-row input embeds once per distinct value. All
+search results and function evaluations are cacheable, including the
+embedding-based ones: the exact input is part of the cache key and the
+endpoint + model are fixed for the run, so an identical repeated query reuses
+the (expensive-to-embed) result. The result cache is in-memory and cleared on
+restart.
 
 ## Design notes
 
@@ -221,8 +231,9 @@ result cache is in-memory and cleared on restart.
   `IdTable`s, cancellation checks inside the scan loops, cache keys covering
   every semantic ingredient (bit-exact query vectors and text/image query
   points), cost estimates that reflect exact-scan vs. HNSW-probe cost. Ranking
-  an existing set is the `vec:distance*` function family (a `SparqlExpression`
-  registered with the generic `SparqlFunctionRegistry`), which reads the same
+  an existing set is the `vec:distance`/`vec:embed` functions
+  (`SparqlExpression`s registered with the generic `SparqlFunctionRegistry`),
+  which read the same
   loaded index; `VectorIndex::searchExact` still offers a candidate-restricted
   merge-join gather primitive for a future index-accelerated ranking path.
 - **Extensibility**: the registries make a magic service a self-contained

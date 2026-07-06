@@ -18,7 +18,7 @@ branch) and concluded it buys nothing anyone actually uses, at real cost:
 
 - **No use case for `SELECT`/`CONSTRUCT` of a raw vector.**
   - *Entity-to-entity similarity* ("images like this one") is cleaner as
-    `vec:distance("images", ?y, <X>)` — pass the entity, the function looks up both
+    `vec:distance(vidx:images, ?y, <X>)` — pass the entity, the function looks up both
     vectors internally. Materialising X's vector would be a step backwards.
   - *Bulk export for downstream ML* is real, but SPARQL `SELECT` is the wrong tool
     (512 floats × N as text); it wants a binary export, which argues *against* literals.
@@ -83,24 +83,29 @@ in the index array keyed by that entity — **no triples are created for the vec
 
 ## Query surface
 
-### 1. `vec:distance("index", ?entity, query)` — the composable primitive
+### 1. `vec:distance(<…/index/NAME>, S1, S2)` — the composable primitive
 
-Looks up `?entity`'s vector in the named index and returns a **uniform smaller-is-closer
-distance** (cosine → `1−cos`, dot → negated, l2 → distance). Returns **UNDEF** when the
-entity is not in the index (so filtering on the index is implicit). `query` is:
+Returns a **uniform smaller-is-closer distance** (cosine → `1−cos`, dot → negated,
+l2 → distance) between two vector *sources*. The first argument is the index **IRI**
+(the same resource the metadata triples live on, so the thing you search is the thing
+you can introspect). Each source is an expression yielding, per row, either
 
-- a **text** literal → embedded via the index's configured model (`vec:distanceText`),
-- an **entity** → its stored vector is looked up,
-- a **precomputed vector** → passed as a string, parsed internally.
+- an **entity** → its stored vector is looked up, or
+- a **precomputed vector** → a comma-separated float string, parsed internally
+  (`vec:embed(<…/index/NAME>, input)` produces exactly this form via the index's
+  configured endpoint/model — a text literal embeds as text, an IRI as an image URL).
 
-The metric is a property of the index (from its metadata), so there is **one** distance
-function; you never pass a metric. Every search is therefore `ORDER BY ?d ASC LIMIT k`.
+Anything else — including an entity not in the index — makes the row **UNDEF** (so
+filtering on the index is implicit). A constant source is resolved once per query, not
+per row. The metric is a property of the index (from its metadata), so there is **one**
+distance function; you never pass a metric. Every search is therefore
+`ORDER BY ?d ASC LIMIT k`.
 
 **Filtered / composed** — entities come from your own patterns:
 ```sparql
 SELECT ?art ?d WHERE {
   ?art a <Painting> .
-  BIND(vec:distanceText("images", ?art, "a red bicycle") AS ?d)
+  BIND(vec:distance(vidx:images, ?art, vec:embed(vidx:images, "a red bicycle")) AS ?d)
   FILTER(BOUND(?d))
 } ORDER BY ?d LIMIT 10
 ```
@@ -112,7 +117,7 @@ pattern the embeddings were derived from (their type/predicate):
 ```sparql
 SELECT ?art ?d WHERE {
   ?art <hasImage> ?img .                                     # the natural enumerator
-  BIND(vec:distanceText("images", ?art, "a red bicycle") AS ?d)
+  BIND(vec:distance(vidx:images, ?art, vec:embed(vidx:images, "a red bicycle")) AS ?d)
   FILTER(BOUND(?d))
 } ORDER BY ?d LIMIT 10
 ```
@@ -155,15 +160,16 @@ per *index* rather than per *embedding*).
 
 **Reused verbatim from `vector-store-redesign`:** `VectorIndex`/`VectorIndexBuilder`
 (entity-keyed flat store + HNSW), `buildFromNpy` + `VectorInputReader`, the NumKong SIMD
-per-precision kernels, `VectorDistanceExpression` (`vec:distance`/`distanceText`/`Image`),
-the `SERVICE` (`VectorSearch`, `vec:algorithm exact|hnsw`), the embed client.
+per-precision kernels, `VectorDistanceExpression` (`vec:distance`, since generalized to
+two sources + the separate `vec:embed`), the `SERVICE` (`VectorSearch`,
+`vec:algorithm exact|hnsw`), the embed client.
 
 **New (this branch):**
 1. **Auto-materialised `idx:` metadata triples** at build time (model / dimension /
    precision / metric / count on the index resource) + the load-time registry over them.
 2. **The `.npy` bundle metadata** (`.meta.json`: model / metric / precision / name) so a
    bundle fully describes its space.
-3. **End-to-end tests**: `.npy` bundle → build → `vec:distanceText` ranking →
+3. **End-to-end tests**: `.npy` bundle → build → `vec:distance` ranking →
    `SELECT` the `idx:` metadata.
 4. Documentation (this file).
 

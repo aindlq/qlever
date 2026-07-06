@@ -25,6 +25,7 @@
 #include "parser/MagicServiceRegistry.h"
 #include "parser/SparqlFunctionRegistry.h"
 #include "services/vectorSearch/VectorDistanceExpression.h"
+#include "services/vectorSearch/VectorEmbedExpression.h"
 #include "services/vectorSearch/VectorSearch.h"
 #include "services/vectorSearch/VectorSearchJoin.h"
 #include "services/vectorSearch/VectorSearchQuery.h"
@@ -72,19 +73,18 @@ void registerVectorSearchService() {
         }
       });
 
-  // 3. Parser: register the `vec:distance*` SPARQL functions so that
+  // 3. Parser: register the vector-search SPARQL functions so that
   //    `BIND(vec:distance(...) AS ?d) ... ORDER BY ?d LIMIT k` ranks an
-  //    existing set with QLever's own operators. `vec:distanceText`/`Image`
-  //    embed the query point at query time via the index's own endpoint. The
-  //    factories live in this folder; the parser only sees the generic
-  //    registry.
+  //    existing set with QLever's own operators. `vec:distance` takes two
+  //    generalized vector sources (entities or float-list strings);
+  //    `vec:embed` turns a text literal / image IRI into such a float-list
+  //    string via the index's own endpoint, so the two compose. The factories
+  //    live in this folder; the parser only sees the generic registry.
   auto& functions = parsedQuery::SparqlFunctionRegistry::get();
   functions.addExact(std::string{parsedQuery::VECTOR_DISTANCE_IRI},
                      &sparqlExpression::makeVectorDistanceExpression);
-  functions.addExact(std::string{parsedQuery::VECTOR_DISTANCE_TEXT_IRI},
-                     &sparqlExpression::makeVectorDistanceTextExpression);
-  functions.addExact(std::string{parsedQuery::VECTOR_DISTANCE_IMAGE_IRI},
-                     &sparqlExpression::makeVectorDistanceImageExpression);
+  functions.addExact(std::string{parsedQuery::VECTOR_EMBED_IRI},
+                     &sparqlExpression::makeVectorEmbedExpression);
 }
 
 // Run the registration at static-initialization time. The folder is linked as

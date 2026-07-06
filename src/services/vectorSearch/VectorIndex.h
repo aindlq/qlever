@@ -159,6 +159,11 @@ class VectorIndex {
     // if `entity` has no (live) vector in this index.
     float operator()(Id entity) const;
 
+    // The distance from the query point to a raw f32 `vector` (encoded into
+    // the storage scalar first), or `NaN` if `vector`'s dimension does not
+    // match the index.
+    float operator()(ql::span<const float> vector) const;
+
    private:
     friend class VectorIndex;
     DistanceComputer(const Impl* impl, std::vector<char> queryBytes)
@@ -178,6 +183,16 @@ class VectorIndex {
   // `entity` (used directly, no f32 round trip). Returns `nullopt` if `entity`
   // has no (live) vector in this index.
   std::optional<DistanceComputer> makeDistanceComputerByEntity(Id entity) const;
+
+  // One-shot pairwise distances in the index's metric (used by the generalized
+  // `vec:distance` expression when neither side is a fixed query point, so no
+  // reusable `DistanceComputer` pays off). Entity vectors are used as stored
+  // (no f32 round trip); raw f32 vectors are encoded into the storage scalar.
+  // Return `NaN` when an entity has no (live) vector in this index or a raw
+  // vector's dimension does not match the index.
+  float distance(Id a, Id b) const;
+  float distance(Id entity, ql::span<const float> vector) const;
+  float distance(ql::span<const float> a, ql::span<const float> b) const;
 
  private:
   std::unique_ptr<Impl> impl_;

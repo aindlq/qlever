@@ -37,7 +37,8 @@ using ad_utility::testing::makeGetId;
 using ::testing::HasSubstr;
 
 constexpr std::string_view PREFIX =
-    "PREFIX vec: <https://qlever.cs.uni-freiburg.de/vectorSearch/>\n";
+    "PREFIX vec: <https://qlever.cs.uni-freiburg.de/vectorSearch/>\n"
+    "PREFIX vidx: <https://qlever.cs.uni-freiburg.de/vectorSearch/index/>\n";
 
 // The test knowledge graph: three statues and two paintings. `<e4>`
 // deliberately gets NO vector below.
@@ -219,7 +220,7 @@ TEST(VectorSearchService, vecDistanceBindMatchesComputer) {
   QueryExecutionTree qet = planQuery(
       qec, std::string{PREFIX} +
                "SELECT ?e ?d WHERE { ?e <is-a> <Statue> . "
-               "BIND(vec:distance(\"clip\", ?e, \"1,0,0,0\") AS ?d) }");
+               "BIND(vec:distance(vidx:clip, ?e, \"1,0,0,0\") AS ?d) }");
   auto result = qet.getResult();
   size_t eCol = qet.getVariableColumn(Variable{"?e"});
   size_t dCol = qet.getVariableColumn(Variable{"?d"});
@@ -252,7 +253,7 @@ TEST(VectorSearchService, vecDistanceOrderByLimitIsFilteredSearch) {
   QueryExecutionTree qet = planQuery(
       qec, std::string{PREFIX} +
                "SELECT ?e ?d WHERE { ?e <is-a> <Statue> . "
-               "BIND(vec:distance(\"clip\", ?e, \"1,0,0,0\") AS ?d) } "
+               "BIND(vec:distance(vidx:clip, ?e, \"1,0,0,0\") AS ?d) } "
                "ORDER BY ?d");
   auto result = qet.getResult();
   size_t eCol = qet.getVariableColumn(Variable{"?e"});
@@ -275,7 +276,7 @@ TEST(VectorSearchService, vecDistanceQueryByEntityIri) {
   QueryExecutionTree qet = planQuery(
       qec, std::string{PREFIX} +
                "SELECT ?e ?d WHERE { ?e <is-a> <Statue> . "
-               "BIND(vec:distance(\"clip\", ?e, <e0>) AS ?d) } ORDER BY ?d");
+               "BIND(vec:distance(vidx:clip, ?e, <e0>) AS ?d) } ORDER BY ?d");
   auto result = qet.getResult();
   size_t eCol = qet.getVariableColumn(Variable{"?e"});
   size_t dCol = qet.getVariableColumn(Variable{"?d"});
@@ -288,6 +289,31 @@ TEST(VectorSearchService, vecDistanceQueryByEntityIri) {
 }
 
 // _____________________________________________________________________________
+// The two vector sources are symmetric: the constant query point may just as
+// well be the SECOND source with the per-row entity first -- the metric is
+// symmetric, the ranking identical.
+TEST(VectorSearchService, vecDistanceSourcesAreSymmetric) {
+  auto* qec = qecWithVectorIndex();
+  for (std::string_view call : {"vec:distance(vidx:clip, \"1,0,0,0\", ?e)",
+                                "vec:distance(vidx:clip, <e0>, ?e)"}) {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?e ?d WHERE { ?e <is-a> <Statue> . BIND(" +
+                           std::string{call} + " AS ?d) } ORDER BY ?d");
+    auto result = qet.getResult();
+    size_t eCol = qet.getVariableColumn(Variable{"?e"});
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    auto getId = makeGetId(qec->getIndex());
+    ASSERT_EQ(table.numRows(), 3u);
+    EXPECT_EQ(table(0, eCol), getId("<e0>"));
+    EXPECT_EQ(table(1, eCol), getId("<e1>"));
+    EXPECT_EQ(table(2, eCol), getId("<e3>"));
+    EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+  }
+}
+
+// _____________________________________________________________________________
 // An entity without a vector evaluates to UNDEF (and is dropped by ORDER BY /
 // comparisons), rather than erroring.
 TEST(VectorSearchService, vecDistanceMissingVectorIsUndef) {
@@ -295,7 +321,7 @@ TEST(VectorSearchService, vecDistanceMissingVectorIsUndef) {
   QueryExecutionTree qet = planQuery(
       qec, std::string{PREFIX} +
                "SELECT ?e ?d WHERE { ?e <is-a> <Painting> . "
-               "BIND(vec:distance(\"clip\", ?e, \"1,0,0,0\") AS ?d) }");
+               "BIND(vec:distance(vidx:clip, ?e, \"1,0,0,0\") AS ?d) }");
   auto result = qet.getResult();
   size_t eCol = qet.getVariableColumn(Variable{"?e"});
   size_t dCol = qet.getVariableColumn(Variable{"?d"});
@@ -325,7 +351,7 @@ TEST(VectorSearchService, vecDistanceOrderByNeedsBoundFilter) {
     QueryExecutionTree qet = planQuery(
         qec, std::string{PREFIX} +
                  "SELECT ?e WHERE { ?e <is-a> <Painting> . "
-                 "BIND(vec:distance(\"clip\", ?e, \"0,1,0,0\") AS ?d) " +
+                 "BIND(vec:distance(vidx:clip, ?e, \"0,1,0,0\") AS ?d) " +
                  (withFilter ? "FILTER(BOUND(?d)) " : "") +
                  "} ORDER BY ?d LIMIT 1");
     auto result = qet.getResult();
@@ -340,8 +366,8 @@ TEST(VectorSearchService, vecDistanceOrderByNeedsBoundFilter) {
 
 // _____________________________________________________________________________
 // Configuration/usage errors of `vec:distance` surface clearly: parse-time for
-// a wrong arity or argument kind, evaluation-time for an unknown index or a
-// dimension mismatch.
+// a wrong arity or a first argument that is not an index IRI, evaluation-time
+// for an unknown index or a malformed/mismatched CONSTANT query vector.
 TEST(VectorSearchService, vecDistanceErrors) {
   auto* qec = qecWithVectorIndex();
   auto selectBind = [](std::string_view call) {
@@ -352,28 +378,42 @@ TEST(VectorSearchService, vecDistanceErrors) {
   };
   // Wrong arity (parse time).
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec, selectBind("vec:distance(\"clip\", ?e)")),
+      planQuery(qec, selectBind("vec:distance(vidx:clip, ?e)")),
       HasSubstr("three arguments"));
-  // First argument not a string literal (parse time).
+  // First argument not an IRI at all (parse time).
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, selectBind("vec:distance(?e, ?e, \"1,0,0,0\")")),
-      HasSubstr("string literal naming the vector index"));
-  // Third argument neither a float-list literal nor an IRI (parse time).
+      HasSubstr("first argument must be the index IRI"));
+  // First argument a string literal (the OLD calling convention; parse time).
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec, selectBind("vec:distance(\"clip\", ?e, ?e)")),
-      HasSubstr("third argument"));
+      planQuery(qec, selectBind("vec:distance(\"clip\", ?e, \"1,0,0,0\")")),
+      HasSubstr("first argument must be the index IRI"));
+  // First argument an IRI outside the `.../vectorSearch/index/` namespace
+  // (parse time).
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, selectBind("vec:distance(<http://example.org/notanindex>,"
+                                " ?e, \"1,0,0,0\")")),
+      HasSubstr("first argument must be the index IRI"));
   // Unknown index (evaluation time).
   {
     QueryExecutionTree qet =
-        planQuery(qec, selectBind("vec:distance(\"nope\", ?e, \"1,0,0,0\")"));
+        planQuery(qec, selectBind("vec:distance(vidx:nope, ?e, \"1,0,0,0\")"));
     AD_EXPECT_THROW_WITH_MESSAGE(qet.getResult(),
                                  HasSubstr("no vector index named"));
   }
-  // Dimension mismatch (evaluation time).
+  // Dimension mismatch of a CONSTANT query vector (evaluation time; a per-row
+  // mismatch resolves to UNDEF instead).
   {
     QueryExecutionTree qet =
-        planQuery(qec, selectBind("vec:distance(\"clip\", ?e, \"1,0\")"));
+        planQuery(qec, selectBind("vec:distance(vidx:clip, ?e, \"1,0\")"));
     AD_EXPECT_THROW_WITH_MESSAGE(qet.getResult(), HasSubstr("dimension"));
+  }
+  // A CONSTANT string that is not a float list (evaluation time).
+  {
+    QueryExecutionTree qet = planQuery(
+        qec, selectBind("vec:distance(vidx:clip, ?e, \"not a vector\")"));
+    AD_EXPECT_THROW_WITH_MESSAGE(
+        qet.getResult(), HasSubstr("not a comma-separated list of finite"));
   }
 }
 
@@ -624,34 +664,55 @@ TEST(VectorSearchService, unjoinedOuterLeftThrows) {
 }
 
 // _____________________________________________________________________________
-// `vec:distanceText` embeds the query text at query time via the index's OWN
-// endpoint (looked up by the index name). The test "clip" index has no endpoint
-// configured, so it fails with the clear "no embedding endpoint" error -- which
-// exercises the index-keyed embed path of the function.
-TEST(VectorSearchService, vecDistanceTextEmbedsViaIndexEndpoint) {
+// `vec:embed` embeds its input at query time via the index's OWN endpoint
+// (looked up by the index IRI). The test "clip" index has no endpoint
+// configured, so it fails with the clear "no embeddingUrl" error -- which
+// exercises the index-keyed endpoint resolution of the function. This holds
+// both standalone and composed into `vec:distance` (the text-search idiom),
+// and for an image input (an IRI) just the same.
+TEST(VectorSearchService, vecEmbedRequiresConfiguredEndpoint) {
   auto* qec = qecWithVectorIndex();
   AD_EXPECT_THROW_WITH_MESSAGE(
       runQuery(qec,
                std::string{PREFIX} +
+                   "SELECT ?s ?v WHERE { ?s <is-a> <Statue> . "
+                   "BIND(vec:embed(vidx:clip, \"a green statue\") AS ?v) }",
+               Variable{"?v"}),
+      HasSubstr("has no embeddingUrl configured"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      runQuery(qec,
+               std::string{PREFIX} +
                    "SELECT ?s ?d WHERE { ?s <is-a> <Statue> . "
-                   "BIND(vec:distanceText(\"clip\", ?s, \"a green statue\") AS "
-                   "?d) } ORDER BY ?d",
+                   "BIND(vec:distance(vidx:clip, ?s, "
+                   "vec:embed(vidx:clip, \"a green statue\")) AS ?d) } "
+                   "ORDER BY ?d",
                Variable{"?s"}),
-      HasSubstr("embedding endpoint"));
+      HasSubstr("has no embeddingUrl configured"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      runQuery(qec,
+               std::string{PREFIX} +
+                   "SELECT ?s ?d WHERE { ?s <is-a> <Statue> . "
+                   "BIND(vec:distance(vidx:clip, ?s, vec:embed(vidx:clip, "
+                   "<https://example.org/cat.jpg>)) AS ?d) } ORDER BY ?d",
+               Variable{"?s"}),
+      HasSubstr("has no embeddingUrl configured"));
 }
 
 // _____________________________________________________________________________
-// `vec:distanceImage` likewise embeds an image URL via the index's endpoint.
-TEST(VectorSearchService, vecDistanceImageEmbedsViaIndexEndpoint) {
+// Parse-time errors of `vec:embed`: a wrong arity and a first argument that is
+// not an index IRI.
+TEST(VectorSearchService, vecEmbedParseErrors) {
   auto* qec = qecWithVectorIndex();
+  auto selectBind = [](std::string_view call) {
+    return std::string{PREFIX} + "SELECT ?v WHERE { BIND(" + std::string{call} +
+           " AS ?v) }";
+  };
   AD_EXPECT_THROW_WITH_MESSAGE(
-      runQuery(qec,
-               std::string{PREFIX} +
-                   "SELECT ?s ?d WHERE { ?s <is-a> <Statue> . "
-                   "BIND(vec:distanceImage(\"clip\", ?s, "
-                   "<https://example.org/cat.jpg>) AS ?d) } ORDER BY ?d",
-               Variable{"?s"}),
-      HasSubstr("embedding endpoint"));
+      planQuery(qec, selectBind("vec:embed(vidx:clip)")),
+      HasSubstr("two arguments"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, selectBind("vec:embed(\"clip\", \"a text\")")),
+      HasSubstr("first argument must be the index IRI"));
 }
 
 // _____________________________________________________________________________

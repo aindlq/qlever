@@ -9,35 +9,38 @@
 
 #include <absl/strings/charconv.h>
 #include <absl/strings/str_cat.h>
-#include <absl/strings/str_join.h>
 #include <absl/strings/str_split.h>
 
 #include <cmath>
-#include <limits>
+#include <optional>
+#include <utility>
 #include <variant>
 
 #include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/SparqlExpressionGenerators.h"
+#include "index/ExportIds.h"
 #include "index/Index.h"
 #include "index/IndexImpl.h"
 #include "parser/NormalizedString.h"
-#include "parser/TripleComponent.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
-#include "services/vectorSearch/VectorQueryPoint.h"
 #include "util/Exception.h"
 
 namespace sparqlExpression {
 
 namespace {
+using qlever::vector::VectorIndex;
+
 // How often the per-row loop polls the cancellation handle -- frequent enough
 // for prompt cancellation, rare enough to stay out of the hot path.
 constexpr size_t CHECK_INTERRUPT_PERIOD = 65536;
 
 // Parse a comma-separated list of finite floats, e.g. "0.1,-0.2,0.3" (the
-// literal form of an explicit query vector). Throws on anything that is not a
-// finite number.
-std::vector<float> parseFloatList(std::string_view s) {
+// string form of an explicit query vector, and the output format of
+// `vec:embed`). Returns `nullopt` (instead of throwing) on anything that is
+// not a non-empty list of finite numbers, because per-row values that are not
+// float lists simply resolve to `UNDEF`.
+std::optional<std::vector<float>> tryParseFloatList(std::string_view s) {
   std::vector<float> out;
   for (std::string_view token :
        absl::StrSplit(s, ',', absl::SkipWhitespace{})) {
@@ -52,50 +55,131 @@ std::vector<float> parseFloatList(std::string_view s) {
         absl::from_chars(token.data(), token.data() + token.size(), value);
     if (ec != std::errc{} || ptr != token.data() + token.size() ||
         !std::isfinite(value)) {
-      AD_THROW(absl::StrCat(
-          "vec:distance: the query vector contains a value that is not a "
-          "finite number: \"",
-          token, "\"."));
+      return std::nullopt;
     }
     out.push_back(value);
   }
   if (out.empty()) {
-    AD_THROW(
-        "vec:distance: the query vector literal must contain at least one "
-        "number.");
+    return std::nullopt;
   }
   return out;
 }
 
-// Extract the content of a constant string-literal argument, or `nullopt` if
-// `expr` is not a string literal.
-std::optional<std::string> getStringLiteral(const SparqlExpression* expr) {
-  if (const auto* lit = dynamic_cast<const StringLiteralExpression*>(expr)) {
-    return std::string{asStringViewUnsafe(lit->value().getContent())};
+// A resolved vector source (one side of the distance):
+//  * `monostate`     -> no vector (the row evaluates to `UNDEF`);
+//  * `Id`            -> an entity with a stored vector in the index;
+//  * `vector<float>` -> an explicit (parsed) query vector.
+using ResolvedSource = std::variant<std::monostate, Id, std::vector<float>>;
+
+// Whether a source is being resolved ONCE (a constant sub-expression) or per
+// row. A constant that is a malformed or dimension-mismatched float list
+// throws a loud, user-facing error (it is certainly a query mistake); per-row
+// values never throw and resolve to `monostate` (-> `UNDEF`) instead, so a
+// mixed column cannot abort a scan.
+enum class SourceMode { Constant, PerRow };
+
+// Resolve one evaluated source element (a `ValueId` or an
+// `IdOrLocalVocabEntry`) to a `ResolvedSource`: the entity path first (a
+// cheap rowmap lookup), then the float-list path for literal content.
+template <typename E>
+ResolvedSource resolveSource(const E& element, const VectorIndex& vidx,
+                             const std::string& indexName,
+                             const EvaluationContext* context,
+                             SourceMode mode) {
+  using T = std::decay_t<E>;
+  static_assert(std::is_same_v<T, ValueId> ||
+                std::is_same_v<T, IdOrLocalVocabEntry>);
+
+  // The entity path: a value id whose entity has a (live) stored vector.
+  const ValueId* id = nullptr;
+  if constexpr (std::is_same_v<T, ValueId>) {
+    id = &element;
+  } else {
+    id = std::get_if<ValueId>(&element);
   }
-  return std::nullopt;
+  if (id != nullptr) {
+    if (id->isUndefined()) {
+      return std::monostate{};
+    }
+    if (vidx.hasVector(*id)) {
+      return *id;
+    }
+  }
+
+  // The float-list path: literal content that parses as floats (an inline
+  // "0.1,0.2,..." or the output of `vec:embed`). An IRI/entity WITHOUT a
+  // stored vector also ends up here and resolves to `monostate`, because an
+  // IRI never parses as a float list.
+  std::optional<ad_utility::triple_component::LiteralOrIri> term;
+  if (id != nullptr) {
+    term = ql::exportIds::idToLiteralOrIri(context->_qec.getIndex().getImpl(),
+                                           *id, context->_localVocab);
+  } else if constexpr (std::is_same_v<T, IdOrLocalVocabEntry>) {
+    term = static_cast<const ad_utility::triple_component::LiteralOrIri&>(
+        std::get<LocalVocabEntry>(element));
+  }
+  if (!term.has_value() || !term->isLiteral()) {
+    return std::monostate{};
+  }
+  std::string_view content = asStringViewUnsafe(term->getContent());
+  std::optional<std::vector<float>> floats = tryParseFloatList(content);
+  if (!floats.has_value()) {
+    if (mode == SourceMode::Constant) {
+      AD_THROW(absl::StrCat(
+          "vec:distance: the constant string \"", content,
+          "\" is not a comma-separated list of finite numbers (a query "
+          "vector), and no entity with a vector in index \"",
+          indexName, "\" matches it."));
+    }
+    return std::monostate{};
+  }
+  if (floats->size() != vidx.dimensions()) {
+    if (mode == SourceMode::Constant) {
+      AD_THROW(absl::StrCat("vec:distance: the query vector has dimension ",
+                            floats->size(), ", but vector index \"", indexName,
+                            "\" has dimension ", vidx.dimensions(), "."));
+    }
+    return std::monostate{};
+  }
+  return std::move(floats).value();
+}
+
+// Convert a raw distance (`NaN` = no result) to the result `Id`.
+Id toDistanceId(float distance) {
+  return std::isnan(distance)
+             ? Id::makeUndefined()
+             : Id::makeFromDouble(static_cast<double>(distance));
+}
+
+// The one-shot distance between two resolved sources (used when neither side
+// is a fixed query point that would pay for a reusable `DistanceComputer`).
+Id pairDistance(const ResolvedSource& a, const ResolvedSource& b,
+                const VectorIndex& vidx) {
+  if (std::holds_alternative<std::monostate>(a) ||
+      std::holds_alternative<std::monostate>(b)) {
+    return Id::makeUndefined();
+  }
+  const Id* idA = std::get_if<Id>(&a);
+  const Id* idB = std::get_if<Id>(&b);
+  if (idA != nullptr && idB != nullptr) {
+    return toDistanceId(vidx.distance(*idA, *idB));
+  }
+  if (idA != nullptr) {
+    return toDistanceId(vidx.distance(*idA, std::get<std::vector<float>>(b)));
+  }
+  if (idB != nullptr) {
+    return toDistanceId(vidx.distance(*idB, std::get<std::vector<float>>(a)));
+  }
+  return toDistanceId(vidx.distance(std::get<std::vector<float>>(a),
+                                    std::get<std::vector<float>>(b)));
 }
 }  // namespace
 
 // _____________________________________________________________________________
-VectorDistanceExpression::VectorDistanceExpression(
-    std::string indexName, Ptr entity,
-    std::optional<std::vector<float>> queryVector,
-    std::optional<ad_utility::triple_component::Iri> queryEntityIri,
-    std::optional<std::string> queryText, std::optional<ImageQuery> queryImage)
+VectorDistanceExpression::VectorDistanceExpression(std::string indexName,
+                                                   Ptr source1, Ptr source2)
     : indexName_{std::move(indexName)},
-      entity_{std::move(entity)},
-      queryVector_{std::move(queryVector)},
-      queryEntityIri_{std::move(queryEntityIri)},
-      queryText_{std::move(queryText)},
-      queryImage_{std::move(queryImage)} {
-  // Exactly one query-point form must be set.
-  AD_CONTRACT_CHECK(static_cast<int>(queryVector_.has_value()) +
-                        static_cast<int>(queryEntityIri_.has_value()) +
-                        static_cast<int>(queryText_.has_value()) +
-                        static_cast<int>(queryImage_.has_value()) ==
-                    1);
-}
+      sources_{std::move(source1), std::move(source2)} {}
 
 // _____________________________________________________________________________
 ExpressionResult VectorDistanceExpression::evaluate(
@@ -106,77 +190,38 @@ ExpressionResult VectorDistanceExpression::evaluate(
     AD_THROW(absl::StrCat("vec:distance: no vector index named \"", indexName_,
                           "\" is loaded."));
   }
-
-  // Encode the (constant) query point ONCE into a reusable distance functor. A
-  // text/image query point is embedded (once, cached in `embeddedQuery_`) via
-  // the index's own endpoint -- reusing `resolveQueryPoint`, the same path the
-  // search SERVICE uses, so the query is embedded with the model that produced
-  // the stored vectors.
-  std::optional<qlever::vector::VectorIndex::DistanceComputer> computer;
-  if (queryVector_.has_value()) {
-    // Throws on a dimension mismatch with the index.
-    computer = vectorIndex->makeDistanceComputer(queryVector_.value());
-  } else if (queryEntityIri_.has_value()) {
-    TripleComponent tc{queryEntityIri_.value()};
-    std::optional<Id> queryId = tc.toValueId(index);
-    if (!queryId.has_value()) {
-      AD_THROW(absl::StrCat("vec:distance: the query entity ",
-                            queryEntityIri_->toStringRepresentation(),
-                            " is not in the knowledge graph."));
-    }
-    computer = vectorIndex->makeDistanceComputerByEntity(queryId.value());
-    if (!computer.has_value()) {
-      AD_THROW(absl::StrCat("vec:distance: the query entity ",
-                            queryEntityIri_->toStringRepresentation(),
-                            " has no vector in index \"", indexName_, "\"."));
-    }
-  } else {
-    // Text or image query point -> embed ONCE, then cache the vector.
-    if (!embeddedQuery_.has_value()) {
-      qlever::vector::VectorSearchConfiguration config;
-      config.indexName_ = indexName_;
-      config.queryText_ = queryText_;
-      config.queryImage_ = queryImage_;
-      qlever::vector::QueryPoint point = qlever::vector::resolveQueryPoint(
-          config, *vectorIndex, index.getImpl(), context->cancellationHandle_);
-      // A text/image query point always resolves to an (embedded) vector, or
-      // `resolveQueryPoint` throws (no endpoint / dimension mismatch).
-      embeddedQuery_ = std::get<std::vector<float>>(std::move(point));
-    }
-    computer = vectorIndex->makeDistanceComputer(embeddedQuery_.value());
-  }
-  const auto& computeDistance = computer.value();
-
+  const VectorIndex& vidx = *vectorIndex;
   const size_t resultSize = context->size();
-  VectorWithMemoryLimit<Id> out{context->_allocator};
-  out.reserve(resultSize);
 
-  // Map a single evaluated operand element to the entity `Id`. Only a plain
-  // vocabulary/blank-node id can have a stored vector; a literal or local-vocab
-  // entity never does, so it maps to `Undefined` (-> `UNDEF` distance).
-  auto toEntityId = [](const auto& element) -> Id {
-    using E = std::decay_t<decltype(element)>;
-    if constexpr (std::is_same_v<E, ValueId>) {
-      return element;
-    } else if constexpr (std::is_same_v<E, IdOrLocalVocabEntry>) {
-      const ValueId* id = std::get_if<ValueId>(&element);
-      return id != nullptr ? *id : Id::makeUndefined();
-    } else {
+  // Per-row source against a FIXED source: encode the fixed query point ONCE
+  // into a reusable `DistanceComputer` (one rowmap lookup + one SIMD kernel
+  // call per row).
+  auto perRowAgainstConstant = [&](const ResolvedSource& constant,
+                                   auto&& perRow) -> ExpressionResult {
+    if (std::holds_alternative<std::monostate>(constant)) {
+      // The fixed side resolves to no vector -> every row is UNDEF. (A
+      // constant is a valid constant result, it broadcasts to all rows.)
       return Id::makeUndefined();
     }
-  };
-
-  size_t sinceCheck = 0;
-  auto appendDistances = [&](const auto& input) {
+    std::optional<VectorIndex::DistanceComputer> computer =
+        std::holds_alternative<Id>(constant)
+            ? vidx.makeDistanceComputerByEntity(std::get<Id>(constant))
+            : std::optional{vidx.makeDistanceComputer(
+                  std::get<std::vector<float>>(constant))};
+    // `resolveSource` only returns an entity after checking `hasVector`.
+    AD_CORRECTNESS_CHECK(computer.has_value());
+    VectorWithMemoryLimit<Id> out{context->_allocator};
+    out.reserve(resultSize);
+    size_t sinceCheck = 0;
     for (const auto& element :
-         detail::makeGenerator(input, resultSize, context)) {
-      Id entity = toEntityId(element);
+         detail::makeGenerator(AD_FWD(perRow), resultSize, context)) {
+      ResolvedSource row =
+          resolveSource(element, vidx, indexName_, context, SourceMode::PerRow);
       Id result = Id::makeUndefined();
-      if (!entity.isUndefined()) {
-        float distance = computeDistance(entity);
-        if (!std::isnan(distance)) {
-          result = Id::makeFromDouble(static_cast<double>(distance));
-        }
+      if (const Id* entity = std::get_if<Id>(&row)) {
+        result = toDistanceId((*computer)(*entity));
+      } else if (const auto* vec = std::get_if<std::vector<float>>(&row)) {
+        result = toDistanceId((*computer)(*vec));
       }
       out.push_back(result);
       if (++sinceCheck == CHECK_INTERRUPT_PERIOD) {
@@ -184,121 +229,116 @@ ExpressionResult VectorDistanceExpression::evaluate(
         context->cancellationHandle_->throwIfCancelled();
       }
     }
+    return out;
   };
 
-  ExpressionResult entityResult = entity_->evaluate(context);
-  std::visit([&](auto&& input) { appendDistances(input); },
-             std::move(entityResult));
-  return out;
+  // Both sources per-row: zip the two generators and compute each pair
+  // one-shot (entity<->entity uses the stored bytes directly, no copies).
+  auto perRowPair = [&](auto&& perRow1, auto&& perRow2) -> ExpressionResult {
+    VectorWithMemoryLimit<Id> out{context->_allocator};
+    out.reserve(resultSize);
+    auto gen1 = detail::makeGenerator(AD_FWD(perRow1), resultSize, context);
+    auto gen2 = detail::makeGenerator(AD_FWD(perRow2), resultSize, context);
+    auto it1 = gen1.begin();
+    auto it2 = gen2.begin();
+    size_t sinceCheck = 0;
+    for (size_t i = 0; i < resultSize; ++i, ++it1, ++it2) {
+      ResolvedSource a =
+          resolveSource(*it1, vidx, indexName_, context, SourceMode::PerRow);
+      ResolvedSource b =
+          resolveSource(*it2, vidx, indexName_, context, SourceMode::PerRow);
+      out.push_back(pairDistance(a, b, vidx));
+      if (++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+        sinceCheck = 0;
+        context->cancellationHandle_->throwIfCancelled();
+      }
+    }
+    return out;
+  };
+
+  ExpressionResult result1 = sources_[0]->evaluate(context);
+  ExpressionResult result2 = sources_[1]->evaluate(context);
+
+  // Branch on constness: the expression framework yields a CONSTANT result
+  // for a constant sub-expression, so a constant source (an inline float
+  // list, a constant entity IRI, a `vec:embed` of constants, ...) is
+  // parsed/looked up/encoded exactly once, never per row.
+  return std::visit(
+      [&](auto&& in1, auto&& in2) -> ExpressionResult {
+        using T1 = std::decay_t<decltype(in1)>;
+        using T2 = std::decay_t<decltype(in2)>;
+        if constexpr (isConstantResult<T1> && isConstantResult<T2>) {
+          // Both constant -> a single constant distance.
+          ResolvedSource a = resolveSource(in1, vidx, indexName_, context,
+                                           SourceMode::Constant);
+          ResolvedSource b = resolveSource(in2, vidx, indexName_, context,
+                                           SourceMode::Constant);
+          return pairDistance(a, b, vidx);
+        } else if constexpr (isConstantResult<T1>) {
+          return perRowAgainstConstant(
+              resolveSource(in1, vidx, indexName_, context,
+                            SourceMode::Constant),
+              AD_FWD(in2));
+        } else if constexpr (isConstantResult<T2>) {
+          // All supported metrics are symmetric, so the sides may swap.
+          return perRowAgainstConstant(
+              resolveSource(in2, vidx, indexName_, context,
+                            SourceMode::Constant),
+              AD_FWD(in1));
+        } else {
+          return perRowPair(AD_FWD(in1), AD_FWD(in2));
+        }
+      },
+      std::move(result1), std::move(result2));
 }
 
 // _____________________________________________________________________________
 std::string VectorDistanceExpression::getCacheKey(
     const VariableToColumnMap& varColMap) const {
-  std::string query;
-  if (queryVector_.has_value()) {
-    query = absl::StrCat("v:", absl::StrJoin(queryVector_.value(), ","));
-  } else if (queryEntityIri_.has_value()) {
-    query = absl::StrCat("e:", queryEntityIri_->toStringRepresentation());
-  } else if (queryText_.has_value()) {
-    query = absl::StrCat("t:", queryText_->size(), ":", queryText_.value());
-  } else {
-    query = absl::StrCat("i:", static_cast<int>(queryImage_->kind_), ":",
-                         queryImage_->value_.size(), ":", queryImage_->value_);
-  }
   return absl::StrCat("VEC_DISTANCE(", indexName_, "|",
-                      entity_->getCacheKey(varColMap), "|", query, ")");
+                      sources_[0]->getCacheKey(varColMap), "|",
+                      sources_[1]->getCacheKey(varColMap), ")");
 }
 
 // _____________________________________________________________________________
 ql::span<SparqlExpression::Ptr> VectorDistanceExpression::childrenImpl() {
-  return {&entity_, 1};
+  return {sources_.data(), sources_.size()};
 }
 
-namespace {
-// Shared front of the three factories: check arity == 3 and extract the
-// index-name string literal (argument 0).
-std::string parseIndexName(const std::vector<SparqlExpression::Ptr>& args,
-                           std::string_view fn) {
-  if (args.size() != 3) {
-    AD_THROW(absl::StrCat(fn,
-                          " takes three arguments: an index-name string "
-                          "literal, the entity (usually a variable), and the "
-                          "query point; got ",
-                          args.size(), "."));
+// _____________________________________________________________________________
+std::string parseVectorIndexIriArgument(const SparqlExpression* arg,
+                                        std::string_view functionName) {
+  if (const auto* iri = dynamic_cast<const IriExpression*>(arg)) {
+    std::optional<std::string> name = qlever::vector::indexNameFromMetadataIri(
+        iri->value().toStringRepresentation());
+    if (name.has_value()) {
+      return std::move(name).value();
+    }
   }
-  std::optional<std::string> indexName = getStringLiteral(args[0].get());
-  if (!indexName.has_value()) {
-    AD_THROW(absl::StrCat(
-        fn,
-        ": the first argument must be a string literal naming the vector "
-        "index, e.g. ",
-        fn, "(\"clip\", ?e, ...)."));
-  }
-  return std::move(indexName).value();
+  AD_THROW(absl::StrCat(
+      functionName,
+      ": the first argument must be the index IRI -- the same resource that "
+      "carries the index's metadata triples -- of the form ",
+      qlever::vector::VECTOR_METADATA_SUBJECT_PREFIX, "NAME>, e.g. ",
+      functionName, "(", qlever::vector::VECTOR_METADATA_SUBJECT_PREFIX,
+      "clip>, ...)."));
 }
-}  // namespace
 
 // _____________________________________________________________________________
 SparqlExpression::Ptr makeVectorDistanceExpression(
     std::vector<SparqlExpression::Ptr> args) {
-  std::string indexName = parseIndexName(args, "vec:distance");
-  // The third argument is the constant query point: either a float-list string
-  // literal, or an entity IRI whose stored vector is the query.
-  std::optional<std::vector<float>> queryVector;
-  std::optional<ad_utility::triple_component::Iri> queryEntityIri;
-  if (auto floats = getStringLiteral(args[2].get()); floats.has_value()) {
-    queryVector = parseFloatList(floats.value());
-  } else if (const auto* iri =
-                 dynamic_cast<const IriExpression*>(args[2].get())) {
-    queryEntityIri = iri->value();
-  } else {
-    AD_THROW(
-        "vec:distance: the third argument (the query point) must be a "
-        "comma-separated float-list string literal (e.g. \"0.1,0.2,0.3\") or a "
-        "constant entity IRI.");
+  if (args.size() != 3) {
+    AD_THROW(absl::StrCat(
+        "vec:distance takes three arguments: the index IRI (",
+        qlever::vector::VECTOR_METADATA_SUBJECT_PREFIX,
+        "NAME>) and two vector sources, each of which is an entity with a "
+        "stored vector or a comma-separated float-list string; got ",
+        args.size(), "."));
   }
+  std::string indexName =
+      parseVectorIndexIriArgument(args[0].get(), "vec:distance");
   return std::make_unique<VectorDistanceExpression>(
-      std::move(indexName), std::move(args[1]), std::move(queryVector),
-      std::move(queryEntityIri), std::nullopt, std::nullopt);
-}
-
-// _____________________________________________________________________________
-SparqlExpression::Ptr makeVectorDistanceTextExpression(
-    std::vector<SparqlExpression::Ptr> args) {
-  std::string indexName = parseIndexName(args, "vec:distanceText");
-  std::optional<std::string> text = getStringLiteral(args[2].get());
-  if (!text.has_value()) {
-    AD_THROW(
-        "vec:distanceText: the third argument must be a string literal of the "
-        "query text to embed, e.g. vec:distanceText(\"clip\", ?e, \"a green "
-        "statue\").");
-  }
-  return std::make_unique<VectorDistanceExpression>(
-      std::move(indexName), std::move(args[1]), std::nullopt, std::nullopt,
-      std::move(text), std::nullopt);
-}
-
-// _____________________________________________________________________________
-SparqlExpression::Ptr makeVectorDistanceImageExpression(
-    std::vector<SparqlExpression::Ptr> args) {
-  using ImageKind = qlever::vector::VectorSearchConfiguration::ImageKind;
-  std::string indexName = parseIndexName(args, "vec:distanceImage");
-  // The image query point is either a URL (an IRI, fetched by the endpoint) or
-  // a base64 payload (a string literal).
-  std::optional<VectorDistanceExpression::ImageQuery> image;
-  if (const auto* iri = dynamic_cast<const IriExpression*>(args[2].get())) {
-    image = {ImageKind::Url, iri->value().toStringRepresentation()};
-  } else if (auto b64 = getStringLiteral(args[2].get()); b64.has_value()) {
-    image = {ImageKind::Base64, std::move(b64).value()};
-  } else {
-    AD_THROW(
-        "vec:distanceImage: the third argument must be an image URL (a "
-        "constant IRI) or a base64 string literal.");
-  }
-  return std::make_unique<VectorDistanceExpression>(
-      std::move(indexName), std::move(args[1]), std::nullopt, std::nullopt,
-      std::nullopt, std::move(image));
+      std::move(indexName), std::move(args[1]), std::move(args[2]));
 }
 
 }  // namespace sparqlExpression

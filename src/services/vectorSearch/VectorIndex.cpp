@@ -190,12 +190,17 @@ struct VectorIndex::Impl {
     return static_cast<size_t>(it->row_);
   }
 
-  // Distance between an (encoded) query and row `i`, using the (punned) index
-  // metric so that exact and HNSW distances are identical.
-  float distanceToRow(const char* queryBytes, size_t i) const {
+  // Distance between two (encoded, `rowBytes()`-sized) vectors, using the
+  // (punned) index metric so that exact and HNSW distances are identical.
+  float distanceBetweenBytes(const char* a, const char* b) const {
     return static_cast<float>(
-        metric_.value()(reinterpret_cast<const uu::byte_t*>(queryBytes),
-                        reinterpret_cast<const uu::byte_t*>(rowPtr(i))));
+        metric_.value()(reinterpret_cast<const uu::byte_t*>(a),
+                        reinterpret_cast<const uu::byte_t*>(b)));
+  }
+
+  // Distance between an (encoded) query and row `i`.
+  float distanceToRow(const char* queryBytes, size_t i) const {
+    return distanceBetweenBytes(queryBytes, rowPtr(i));
   }
 
   FlatStoreMetric graphMetric() const {
@@ -474,6 +479,55 @@ float VectorIndex::DistanceComputer::operator()(Id entity) const {
     return std::numeric_limits<float>::quiet_NaN();
   }
   return impl_->distanceToRow(queryBytes_.data(), row.value());
+}
+
+// ____________________________________________________________________________
+float VectorIndex::DistanceComputer::operator()(
+    ql::span<const float> vector) const {
+  if (vector.size() != impl_->dim()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  std::vector<char> buffer;
+  const char* encoded = impl_->encodeQuery(vector, buffer);
+  return impl_->distanceBetweenBytes(queryBytes_.data(), encoded);
+}
+
+// ____________________________________________________________________________
+float VectorIndex::distance(Id a, Id b) const {
+  const auto& impl = *impl_;
+  auto rowA = impl.rowOf(a);
+  auto rowB = impl.rowOf(b);
+  if (!rowA.has_value() || !rowB.has_value()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  return impl.distanceBetweenBytes(impl.rowPtr(rowA.value()),
+                                   impl.rowPtr(rowB.value()));
+}
+
+// ____________________________________________________________________________
+float VectorIndex::distance(Id entity, ql::span<const float> vector) const {
+  const auto& impl = *impl_;
+  auto row = impl.rowOf(entity);
+  if (!row.has_value() || vector.size() != impl.dim()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  std::vector<char> buffer;
+  const char* encoded = impl.encodeQuery(vector, buffer);
+  return impl.distanceToRow(encoded, row.value());
+}
+
+// ____________________________________________________________________________
+float VectorIndex::distance(ql::span<const float> a,
+                            ql::span<const float> b) const {
+  const auto& impl = *impl_;
+  if (a.size() != impl.dim() || b.size() != impl.dim()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  std::vector<char> bufferA;
+  std::vector<char> bufferB;
+  const char* encodedA = impl.encodeQuery(a, bufferA);
+  const char* encodedB = impl.encodeQuery(b, bufferB);
+  return impl.distanceBetweenBytes(encodedA, encodedB);
 }
 
 // ____________________________________________________________________________

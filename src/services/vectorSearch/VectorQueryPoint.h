@@ -35,9 +35,9 @@ using QueryPoint = std::variant<std::monostate, std::vector<float>, Id>;
 
 // Resolve the query point of `config` against the index `vidx` (embedding text
 // or an image via the index's endpoint if needed). Throws on a dimension
-// mismatch or a missing embedding endpoint. Shared by the `VectorSearch`
-// operation and the `vec:distanceText`/`vec:distanceImage` functions so there
-// is a single implementation of the query-point handling (including embedding).
+// mismatch or a missing embedding endpoint. Used by the `VectorSearch`
+// operation (the SERVICE's `vec:queryText`/`vec:imageUrl` surface); the
+// function surface embeds via `vec:embed` instead.
 QueryPoint resolveQueryPoint(const VectorSearchConfiguration& config,
                              const VectorIndex& vidx, const IndexImpl& index,
                              ad_utility::SharedCancellationHandle handle);

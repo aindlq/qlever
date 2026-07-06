@@ -8,54 +8,54 @@
 #ifndef QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORDISTANCEEXPRESSION_H
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORDISTANCEEXPRESSION_H
 
-#include <optional>
+#include <array>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "engine/sparqlExpressions/SparqlExpression.h"
-#include "rdfTypes/Iri.h"
-#include "services/vectorSearch/VectorSearchConfig.h"
 
 namespace sparqlExpression {
 
-// The `vec:distance*` SPARQL expression family: a per-row double distance from
-// a fixed query point to the vector stored for `?entity` in the named vector
-// index. Rows whose entity has no (live) vector evaluate to `UNDEF`. Combined
-// with QLever's own `BIND`, `ORDER BY`, and `LIMIT`, this IS filtered top-k
-// vector search -- no bespoke operator needed:
+// The `vec:distance` SPARQL expression: a per-row double distance between two
+// vector SOURCES in the named vector index. Each source is an arbitrary
+// sub-expression that evaluates (per row) to either
+//  * an ENTITY (IRI/id) -> its stored vector is looked up in the index, or
+//  * a comma-separated FLOAT-LIST string (e.g. an inline "0.1,0.2,..." or the
+//    result of `vec:embed`) -> parsed into a query vector.
+// A row whose source is neither (including an entity without a live vector)
+// evaluates to `UNDEF`. Combined with QLever's own `BIND`, `ORDER BY`, and
+// `LIMIT`, this IS filtered top-k vector search -- no bespoke operator needed:
 //
-//   BIND(vec:distance("clip", ?e, "0.1,0.2,...") AS ?d)
+//   BIND(vec:distance(<.../index/clip>, ?e, "0.1,0.2,...") AS ?d)
 //   FILTER(BOUND(?d)) ... ORDER BY ?d LIMIT k
 //
-// IMPORTANT: keep the `FILTER(BOUND(?d))` when the bound `?entity` set may
-// contain entities WITHOUT a vector. `UNDEF` sorts BEFORE every real value in
-// ascending `ORDER BY`, so without the filter a `LIMIT k` would return
-// vectorless entities (with an `UNDEF` distance) first instead of the k
-// nearest. The filter is unnecessary only when every candidate is known to
-// have a vector.
+// This makes entity<->entity (`vec:distance(<idx>, ?a, ?b)`), entity<->text
+// (`vec:distance(<idx>, ?a, vec:embed(<idx>, "cat"))`), and inline query
+// vectors all work through ONE composable function; the metric is a property
+// of the index, so distances are uniformly smaller-is-closer.
 //
-// The query point is a CONSTANT, in one of four forms (the function IRI picks
-// which): an explicit float-list literal or a constant entity IRI whose stored
-// vector is used (`vec:distance`); free text (`vec:distanceText`); or an image
-// URL/base64 (`vec:distanceImage`). Text and images are embedded ONCE, at query
-// time, via the SAME endpoint the index was built with (looked up by the index
-// name) -- so the query is guaranteed to use the model that produced the stored
-// vectors, and no endpoint URL ever appears in the query. This lives entirely
-// in the vector-search service folder and is wired into the parser via the
-// generic `parsedQuery::SparqlFunctionRegistry`.
+// IMPORTANT: keep the `FILTER(BOUND(?d))` when a source may be UNDEF for some
+// rows. `UNDEF` sorts BEFORE every real value in ascending `ORDER BY`, so
+// without the filter a `LIMIT k` would return sourceless rows first instead of
+// the k nearest. The filter is unnecessary only when every row is known to
+// resolve.
+//
+// A source whose sub-expression is CONSTANT (a string literal, a constant
+// IRI, a `vec:embed` of constants, ...) is resolved ONCE -- the expression
+// framework yields a constant result for a constant sub-expression, and this
+// expression branches on that -- so a constant query point is parsed/encoded a
+// single time, not per row. The first argument is the index IRI
+// `<.../vectorSearch/index/NAME>`: the SAME resource the auto-materialized
+// metadata triples live on, so the thing you search is the thing you can
+// introspect with plain SPARQL. This lives entirely in the vector-search
+// service folder and is wired into the parser via the generic
+// `parsedQuery::SparqlFunctionRegistry`.
 class VectorDistanceExpression : public SparqlExpression {
  public:
-  using ImageQuery = qlever::vector::VectorSearchConfiguration::ImageQuery;
-
-  // The query point is given by EXACTLY ONE of `queryVector`/`queryEntityIri`/
-  // `queryText`/`queryImage`. `entity` is the operand expression evaluated per
-  // row (typically a variable).
-  VectorDistanceExpression(
-      std::string indexName, Ptr entity,
-      std::optional<std::vector<float>> queryVector,
-      std::optional<ad_utility::triple_component::Iri> queryEntityIri,
-      std::optional<std::string> queryText,
-      std::optional<ImageQuery> queryImage);
+  // `source1`/`source2` are the two vector-source operand expressions,
+  // evaluated per row (each typically a variable, a constant, or `vec:embed`).
+  VectorDistanceExpression(std::string indexName, Ptr source1, Ptr source2);
 
   ExpressionResult evaluate(EvaluationContext* context) const override;
   std::string getCacheKey(const VariableToColumnMap& varColMap) const override;
@@ -64,25 +64,20 @@ class VectorDistanceExpression : public SparqlExpression {
   ql::span<Ptr> childrenImpl() override;
 
   std::string indexName_;
-  Ptr entity_;
-  std::optional<std::vector<float>> queryVector_;
-  std::optional<ad_utility::triple_component::Iri> queryEntityIri_;
-  std::optional<std::string> queryText_;
-  std::optional<ImageQuery> queryImage_;
-  // The text/image query point embedded ONCE (per evaluation of this
-  // expression object), so repeated per-block `evaluate` calls don't re-embed.
-  mutable std::optional<std::vector<float>> embeddedQuery_;
+  std::array<Ptr, 2> sources_;
 };
 
-// Factories used by the `SparqlFunctionRegistry` (arity 3: an index-name string
-// literal, an operand expression for the entity, and the constant query point).
-// `Text` reads a text literal; `Image` reads an image URL (IRI) or base64
-// literal. Throw a user-facing error on a wrong arity or argument kind.
+// Shared front of the vector-search function factories: extract the index
+// name from `arg`, which must be a constant IRI of the form
+// `<.../vectorSearch/index/NAME>` (see `VECTOR_METADATA_SUBJECT_PREFIX`).
+// Throws a user-facing error (mentioning `functionName`) otherwise.
+std::string parseVectorIndexIriArgument(const SparqlExpression* arg,
+                                        std::string_view functionName);
+
+// Factory used by the `SparqlFunctionRegistry` (arity 3: the index IRI and the
+// two vector-source expressions). Throws a user-facing error on a wrong arity
+// or a malformed index argument.
 SparqlExpression::Ptr makeVectorDistanceExpression(
-    std::vector<SparqlExpression::Ptr> args);
-SparqlExpression::Ptr makeVectorDistanceTextExpression(
-    std::vector<SparqlExpression::Ptr> args);
-SparqlExpression::Ptr makeVectorDistanceImageExpression(
     std::vector<SparqlExpression::Ptr> args);
 
 }  // namespace sparqlExpression

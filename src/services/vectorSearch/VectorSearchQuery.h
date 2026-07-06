@@ -24,18 +24,20 @@ namespace parsedQuery {
 inline constexpr std::string_view VECTOR_SEARCH_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/>";
 
-// The IRIs of the `vec:distance*` SPARQL function family: a per-row distance
-// from a query point to `?entity`'s stored vector. BIND one and ORDER BY +
-// LIMIT to run a filtered top-k search using QLever's own operators. The query
-// point is a constant vector/entity (`vec:distance`), or free text / an image
-// embedded at query time via the index's own endpoint (`vec:distanceText` /
-// `vec:distanceImage`). Registered with the `SparqlFunctionRegistry`.
+// The IRIs of the vector-search SPARQL functions, registered with the
+// `SparqlFunctionRegistry`:
+//  * `vec:distance(<.../index/NAME>, s1, s2)` -- the per-row distance between
+//    two vector sources (each an entity with a stored vector, or a
+//    comma-separated float-list string, e.g. from `vec:embed`). BIND it and
+//    ORDER BY + LIMIT to run a filtered top-k search using QLever's own
+//    operators.
+//  * `vec:embed(<.../index/NAME>, input)` -- embed a text literal or an image
+//    IRI via the index's own configured endpoint and return the vector as a
+//    float-list string (composable with `vec:distance`).
 inline constexpr std::string_view VECTOR_DISTANCE_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/distance>";
-inline constexpr std::string_view VECTOR_DISTANCE_TEXT_IRI =
-    "<https://qlever.cs.uni-freiburg.de/vectorSearch/distanceText>";
-inline constexpr std::string_view VECTOR_DISTANCE_IMAGE_IRI =
-    "<https://qlever.cs.uni-freiburg.de/vectorSearch/distanceImage>";
+inline constexpr std::string_view VECTOR_EMBED_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/embed>";
 
 class VectorSearchException : public std::runtime_error {
   using std::runtime_error::runtime_error;

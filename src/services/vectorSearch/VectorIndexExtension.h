@@ -10,10 +10,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "backports/StartsWithAndEndsWith.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "util/HashMap.h"
 
@@ -47,6 +49,26 @@ inline constexpr std::string_view VECTOR_METADATA_COUNT_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/count>";
 inline constexpr std::string_view VECTOR_METADATA_MODEL_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/model>";
+
+// The inverse of the metadata-subject construction: extract the index name
+// from an index IRI `<.../vectorSearch/index/NAME>` (the full string
+// representation, including the angle brackets), or `nullopt` if `iri` is not
+// of that form. This is how the `vec:distance`/`vec:embed` SPARQL functions
+// resolve their first argument -- the SAME IRI that carries the queryable
+// metadata triples above identifies the index to search.
+inline std::optional<std::string> indexNameFromMetadataIri(
+    std::string_view iri) {
+  if (!ql::starts_with(iri, VECTOR_METADATA_SUBJECT_PREFIX) ||
+      !ql::ends_with(iri, ">")) {
+    return std::nullopt;
+  }
+  iri.remove_prefix(VECTOR_METADATA_SUBJECT_PREFIX.size());
+  iri.remove_suffix(1);
+  if (iri.empty()) {
+    return std::nullopt;
+  }
+  return std::string{iri};
+}
 
 // All vector indices of a database, keyed by name. This is the object stored as
 // the "vectorSearch" index extension and retrieved at query time.

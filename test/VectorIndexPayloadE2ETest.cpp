@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "./util/GTestHelpers.h"
 #include "./util/IndexTestHelpers.h"
 #include "engine/QueryPlanner.h"
 #include "index/IndexExtension.h"
@@ -38,7 +39,8 @@ using ad_utility::testing::getQec;
 using ad_utility::testing::makeGetId;
 
 constexpr std::string_view PREFIX =
-    "PREFIX vec: <https://qlever.cs.uni-freiburg.de/vectorSearch/>\n";
+    "PREFIX vec: <https://qlever.cs.uni-freiburg.de/vectorSearch/>\n"
+    "PREFIX vidx: <https://qlever.cs.uni-freiburg.de/vectorSearch/index/>\n";
 
 // The test knowledge graph: four entities that get a vector below, plus
 // `<nomember>`, which is in the graph but deliberately NOT in the vector
@@ -229,7 +231,7 @@ TEST(VectorIndexPayloadE2E, rankEntitiesByDistanceToQueryVector) {
   QueryExecutionTree qet =
       planQuery(qec, std::string{PREFIX} +
                          "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
-                         "BIND(vec:distance(\"emb\", ?e, \"1,0,0\") AS ?d) "
+                         "BIND(vec:distance(vidx:emb, ?e, \"1,0,0\") AS ?d) "
                          "FILTER(BOUND(?d)) } ORDER BY ?d LIMIT 3");
   auto result = qet.getResult();
   size_t eCol = qet.getVariableColumn(Variable{"?e"});
@@ -304,7 +306,7 @@ TEST(VectorIndexPayloadE2E, nonMemberDistanceIsUndef) {
   QueryExecutionTree qet =
       planQuery(qec, std::string{PREFIX} +
                          "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
-                         "BIND(vec:distance(\"emb\", ?e, \"1,0,0\") AS ?d) }");
+                         "BIND(vec:distance(vidx:emb, ?e, \"1,0,0\") AS ?d) }");
   auto result = qet.getResult();
   size_t eCol = qet.getVariableColumn(Variable{"?e"});
   size_t dCol = qet.getVariableColumn(Variable{"?d"});
@@ -324,6 +326,115 @@ TEST(VectorIndexPayloadE2E, nonMemberDistanceIsUndef) {
     }
   }
   EXPECT_TRUE(sawNonMember);
+}
+
+// _____________________________________________________________________________
+// Entity<->entity distance with BOTH sources constant: `vec:distance` looks up
+// both stored vectors ("how similar are <a> and <c>?"). The constant result
+// broadcasts over the enumerated rows. <a> and <c> have identical stored
+// vectors (distance ~0); <a> and <d> are orthogonal (cosine distance ~1); a
+// pair involving the vectorless <nomember> is UNDEF.
+TEST(VectorIndexPayloadE2E, entityToEntityDistanceByStoredVectors) {
+  auto* qec = qecWithPayloadIndex();
+  auto constantDistance = [&](std::string_view pair) {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
+                           "BIND(vec:distance(vidx:emb, " +
+                           std::string{pair} + ") AS ?d) }");
+    auto result = qet.getResult();
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    EXPECT_EQ(table.numRows(), 5u);
+    return table(0, dCol);
+  };
+  Id identical = constantDistance("<a>, <c>");
+  ASSERT_EQ(identical.getDatatype(), Datatype::Double);
+  EXPECT_NEAR(identical.getDouble(), 0.0, 1e-4);
+  Id orthogonal = constantDistance("<a>, <d>");
+  ASSERT_EQ(orthogonal.getDatatype(), Datatype::Double);
+  EXPECT_NEAR(orthogonal.getDouble(), 1.0, 1e-3);
+  EXPECT_TRUE(constantDistance("<a>, <nomember>").isUndefined());
+}
+
+// _____________________________________________________________________________
+// Entity<->entity with BOTH sources per-row variables: a variable pair join
+// ranks all pairs correctly. Over the 4 indexed entities {a, b, c, d} with
+// a = c = e0, b at cosine distance 0.4 from e0, and d orthogonal, the 16
+// member pairs split into 6 identical pairs (distance ~0: (a,a), (a,c), (c,a),
+// (c,c), (b,b), (d,d)), 4 pairs at ~0.4 (a/c x b, both directions), and 6
+// orthogonal pairs at ~1. Pairs involving <nomember> are UNDEF and dropped by
+// FILTER(BOUND).
+TEST(VectorIndexPayloadE2E, variablePairDistanceRanksAllPairs) {
+  auto* qec = qecWithPayloadIndex();
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?a ?b ?d WHERE { ?a <is-a> <Item> . ?b <is-a> <Item> . "
+               "BIND(vec:distance(vidx:emb, ?a, ?b) AS ?d) "
+               "FILTER(BOUND(?d)) } ORDER BY ?d");
+  auto result = qet.getResult();
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+
+  // 5 x 5 pairs minus the 9 involving the vectorless <nomember>.
+  ASSERT_EQ(table.numRows(), 16u);
+  for (size_t r = 0; r < 6; ++r) {
+    EXPECT_NEAR(table(r, dCol).getDouble(), 0.0, 1e-4) << "row " << r;
+  }
+  for (size_t r = 6; r < 10; ++r) {
+    EXPECT_NEAR(table(r, dCol).getDouble(), 0.4, 1e-3) << "row " << r;
+  }
+  for (size_t r = 10; r < 16; ++r) {
+    EXPECT_NEAR(table(r, dCol).getDouble(), 1.0, 1e-3) << "row " << r;
+  }
+}
+
+// _____________________________________________________________________________
+// A PER-ROW float-list string source (exactly the shape `vec:embed` produces
+// per row): each row's query vector comes from a string-valued expression, is
+// parsed per row, and rows whose entity has no vector stay UNDEF.
+TEST(VectorIndexPayloadE2E, perRowFloatListStringSource) {
+  auto* qec = qecWithPayloadIndex();
+  // <b> is compared against its own vector (distance ~0); everything else
+  // against <d>'s vector [0,0,1] (so <d> ~0, <a>/<c> ~1).
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
+               "BIND(IF(STR(?e) = \"b\", \"0.6,0.8,0\", \"0,0,1\") AS ?q) "
+               "BIND(vec:distance(vidx:emb, ?e, ?q) AS ?d) "
+               "FILTER(BOUND(?d)) } ORDER BY ?d");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+
+  ASSERT_EQ(table.numRows(), 4u);  // <nomember> dropped via FILTER(BOUND).
+  std::set<uint64_t> nearest{table(0, eCol).getBits(),
+                             table(1, eCol).getBits()};
+  EXPECT_TRUE(nearest.contains(getId("<b>").getBits()));
+  EXPECT_TRUE(nearest.contains(getId("<d>").getBits()));
+  EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+  EXPECT_NEAR(table(1, dCol).getDouble(), 0.0, 1e-4);
+  EXPECT_NEAR(table(2, dCol).getDouble(), 1.0, 1e-3);
+  EXPECT_NEAR(table(3, dCol).getDouble(), 1.0, 1e-3);
+}
+
+// _____________________________________________________________________________
+// `vec:embed` on an index WITHOUT a configured `embeddingUrl` fails with a
+// clear error, also when composed into `vec:distance` (the text-search
+// idiom). The LIVE embed path needs an embedding endpoint and is therefore
+// not end-to-end testable here; `vec:embed`'s output SHAPE (a float-list
+// string) is what the inline-string and per-row-string tests above exercise.
+TEST(VectorIndexPayloadE2E, embedWithoutEndpointThrows) {
+  auto* qec = qecWithPayloadIndex();
+  QueryExecutionTree qet =
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
+                         "BIND(vec:distance(vidx:emb, ?e, "
+                         "vec:embed(vidx:emb, \"a red bicycle\")) AS ?d) }");
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      qet.getResult(), ::testing::HasSubstr("has no embeddingUrl configured"));
 }
 
 // _____________________________________________________________________________
@@ -371,7 +482,7 @@ TEST(VectorIndexPayloadE2E, bf16ScalarStoresTwoBytesAndRanksCorrectly) {
   QueryExecutionTree qet =
       planQuery(qec, std::string{PREFIX} +
                          "SELECT ?e ?d WHERE { ?e <is-a> <Bf16Item> . "
-                         "BIND(vec:distance(\"embbf16\", ?e, \"" +
+                         "BIND(vec:distance(vidx:embbf16, ?e, \"" +
                          queryVector +
                          "\") AS ?d) "
                          "FILTER(BOUND(?d)) } ORDER BY ?d");
