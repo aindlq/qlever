@@ -13,9 +13,11 @@
 
 #include <cmath>
 #include <optional>
+#include <string>
 #include <utility>
 #include <variant>
 
+#include "backports/StartsWithAndEndsWith.h"
 #include "engine/sparqlExpressions/LiteralExpression.h"
 #include "engine/sparqlExpressions/SparqlExpressionGenerators.h"
 #include "index/ExportIds.h"
@@ -120,6 +122,45 @@ ResolvedSource resolveSource(const E& element, const VectorIndex& vidx,
   }
   if (!term.has_value() || !term->isLiteral()) {
     return std::monostate{};
+  }
+  const auto& literal = term->getLiteral();
+  // A TYPED query-vector literal `"f0,f1,..."^^<.../vec/MODEL/PRECISION>` (the
+  // output of `vec:embed`/`vec:vector` -- possibly of a DIFFERENT index)
+  // carries its embedding space in the datatype. VALIDATE it against THIS
+  // index before even parsing the floats: same-dimension vectors from
+  // different models are numerically computable but semantically garbage, so
+  // a space mismatch makes the row UNDEF (or throws for a constant source,
+  // like the dimension error below). The model check is skipped when EITHER
+  // side declares no model, so vector-only indices (no `embeddingModel`) stay
+  // usable. A PLAIN untyped float-list string (an inline query vector) skips
+  // all of this and is only dimension-checked below.
+  if (literal.hasDatatype()) {
+    std::string_view datatypeIri = asStringViewUnsafe(literal.getDatatype());
+    if (ql::starts_with(datatypeIri,
+                        qlever::vector::VEC_QUERY_DATATYPE_PREFIX)) {
+      std::optional<std::pair<std::string, std::string>> space =
+          qlever::vector::parseVectorQueryDatatypeIri(datatypeIri);
+      const auto& config = vidx.metadata().config_;
+      const std::string precision = qlever::vector::toString(config.scalar_);
+      const bool modelComparable =
+          space.has_value() &&
+          (space->first.empty() || config.embeddingModel_.empty() ||
+           space->first == config.embeddingModel_);
+      if (!space.has_value() || space->second != precision ||
+          !modelComparable) {
+        if (mode == SourceMode::Constant) {
+          AD_THROW(absl::StrCat(
+              "vec:distance: the typed query vector's datatype <", datatypeIri,
+              "> does not match vector index \"", indexName, "\" (model \"",
+              config.embeddingModel_.empty() ? "<none>"
+                                             : config.embeddingModel_,
+              "\", precision \"", precision,
+              "\"): vectors are only comparable within one embedding space "
+              "(same model, same precision, same dimension)."));
+        }
+        return std::monostate{};
+      }
+    }
   }
   std::string_view content = asStringViewUnsafe(term->getContent());
   std::optional<std::vector<float>> floats = tryParseFloatList(content);

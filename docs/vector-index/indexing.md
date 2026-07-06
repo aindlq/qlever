@@ -103,7 +103,7 @@ array (e.g. one for image embeddings, one for text).
 | `hnsw`    | `true` builds the ANN graph; `false` = exact/flat store only   |
 | `scalar`  | *(optional)* storage precision `f32` (default) \| `f16` \| `bf16` \| `i8`|
 | `embeddingUrl`   | *(optional)* embedding endpoint bound to this index (see below) |
-| `embeddingModel` | *(optional)* model name sent to that endpoint            |
+| `embeddingModel` | *(optional)* model name sent to that endpoint; also names the index's embedding space for the typed-query-vector comparability check (see "Typed query vectors") |
 
 - bf16 — for bf16 embeddings save a **native 2-byte bf16 `.npy`** via
   [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes):
@@ -168,7 +168,7 @@ BIND(vec:distance(vidx:emb, <http://example.org/doc1>,
                             <http://example.org/doc3>) AS ?dist)
 
 # text search: embed the query via the index's own endpoint (`embeddingUrl`),
-# then rank by distance -- vec:embed returns the float-list string form
+# then rank by distance -- vec:embed returns a TYPED float-list literal
 BIND(vec:distance(vidx:emb, ?doc,
                   vec:embed(vidx:emb, "a red bicycle")) AS ?dist)
 
@@ -186,6 +186,52 @@ BIND(vec:distance(vidx:emb, ?doc,
 - For a huge, *unfiltered* whole-index top-k, use the HNSW `SERVICE` instead of
   the brute-force scan above (see the design doc). A selective filter on the
   entity (like `?doc a :Document`) keeps the exact brute-force path fast.
+
+### Typed query vectors & cross-index search (`vec:vector`)
+
+`vec:embed` returns its vector as a **typed literal**
+
+```
+"f0,f1,…"^^<https://qlever.cs.uni-freiburg.de/vectorSearch/vec/MODEL/PRECISION>
+```
+
+(e.g. `…/vec/clip/f32`), where `MODEL` is the index's `embeddingModel` (empty
+for a vector-only index) and `PRECISION` its storage `scalar` — the datatype
+carries the **embedding space** the vector lives in.
+`vec:vector(<…/index/NAME>, entity)` returns the entity's **stored** vector
+from that index, decoded to f32, in the same typed form (UNDEF for an entity
+that is not in the index).
+
+`vec:distance` **validates** a typed query vector against the index it is
+called on — the vector is used only if
+
+- its `PRECISION` equals the index's storage scalar,
+- its `MODEL` equals the index's `embeddingModel` (skipped when **either**
+  side declares no model, so model-less indices keep working), and
+- its float count equals the index's dimension.
+
+A mismatching per-row value makes that row **UNDEF** — never a silently wrong
+number; a mismatching *constant* throws a clear error (it is certainly a query
+mistake). A plain **untyped** float string is only dimension-checked, so
+inline query vectors like `"0.1,0.2,…"` keep working.
+
+This makes **cross-index** distance safe — compare entities of one index
+against a vector fetched from another, iff the two indices share an embedding
+space (same model + precision + dimension):
+
+```sparql
+# artworks similar to a photo: ?p's stored vector comes from vidx:photo and
+# carries that index's space; vec:distance checks it against vidx:artwork
+BIND(vec:distance(vidx:artwork, ?a, vec:vector(vidx:photo, ?p)) AS ?d)
+```
+
+Note the simplest layout needs no cross-index step at all: an index is
+entity-keyed, so entities of different kinds embedded with the **same model
+can live in one index**, where entity↔entity distance is direct
+(`vec:distance(vidx:all, ?a, ?p)`). FUTURE option (documented, deliberately
+not implemented): a `matryoshka: true` index flag that lets a *longer*
+Matryoshka-trained query vector be auto-truncated to a shorter index's
+dimension instead of being rejected by the dimension check.
 
 ## 5. Re-indexing
 

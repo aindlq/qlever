@@ -9,7 +9,6 @@
 
 #include <absl/strings/str_cat.h>
 
-#include <charconv>
 #include <optional>
 #include <utility>
 #include <variant>
@@ -19,6 +18,7 @@
 #include "index/Index.h"
 #include "index/IndexImpl.h"
 #include "parser/NormalizedString.h"
+#include "rdfTypes/Iri.h"
 #include "services/vectorSearch/EmbeddingClient.h"
 #include "services/vectorSearch/VectorDistanceExpression.h"
 #include "services/vectorSearch/VectorIndex.h"
@@ -70,25 +70,6 @@ std::optional<EmbedInput> getEmbedInput(const E& element,
   std::string value{asStringViewUnsafe(term->getContent())};
   return EmbedInput{term->isIri(), std::move(value)};
 }
-
-// Serialize an embedding as a comma-separated float-list string, each float in
-// its shortest round-trippable form (`std::to_chars`) -- the query-vector
-// format `vec:distance` parses.
-std::string toFloatListString(const std::vector<float>& embedding) {
-  std::string out;
-  // ~15 characters per shortest-round-trip float incl. the comma.
-  out.reserve(embedding.size() * 15);
-  char buffer[64];
-  for (float value : embedding) {
-    auto [ptr, ec] = std::to_chars(buffer, buffer + sizeof(buffer), value);
-    AD_CORRECTNESS_CHECK(ec == std::errc{});
-    if (!out.empty()) {
-      out.push_back(',');
-    }
-    out.append(buffer, ptr);
-  }
-  return out;
-}
 }  // namespace
 
 // _____________________________________________________________________________
@@ -111,6 +92,14 @@ ExpressionResult VectorEmbedExpression::evaluate(
         "\" has no embeddingUrl configured, so there is no embedding endpoint "
         "to embed the query with."));
   }
+  // The result literals are TYPED with the index's embedding space (model +
+  // storage precision), so `vec:distance` can validate comparability -- also
+  // against a DIFFERENT index (see `VEC_QUERY_DATATYPE_PREFIX`).
+  const auto datatype =
+      ad_utility::triple_component::Iri::fromIrirefWithoutBrackets(
+          qlever::vector::vectorQueryDatatypeIri(
+              config.embeddingModel_,
+              qlever::vector::toString(config.scalar_)));
 
   // Embed one input, MEMOIZED by (kind, value): a constant input embeds once,
   // a per-row variable embeds once per distinct value.
@@ -126,7 +115,8 @@ ExpressionResult VectorEmbedExpression::evaluate(
                        : qlever::vector::embedTextOpenAI(
                              config.embeddingUrl_, config.embeddingModel_,
                              input.value_, context->cancellationHandle_);
-    return cache_.emplace(std::move(key), toFloatListString(embedding))
+    return cache_
+        .emplace(std::move(key), qlever::vector::toFloatListString(embedding))
         .first->second;
   };
 
@@ -138,7 +128,7 @@ ExpressionResult VectorEmbedExpression::evaluate(
     }
     return LocalVocabEntry{
         ad_utility::triple_component::Literal::literalWithoutQuotes(
-            embedMemoized(input.value())),
+            embedMemoized(input.value()), datatype),
         context->getLocalVocabContext()};
   };
 

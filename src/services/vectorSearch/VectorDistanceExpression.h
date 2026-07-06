@@ -21,8 +21,14 @@ namespace sparqlExpression {
 // vector SOURCES in the named vector index. Each source is an arbitrary
 // sub-expression that evaluates (per row) to either
 //  * an ENTITY (IRI/id) -> its stored vector is looked up in the index, or
-//  * a comma-separated FLOAT-LIST string (e.g. an inline "0.1,0.2,..." or the
-//    result of `vec:embed`) -> parsed into a query vector.
+//  * a comma-separated FLOAT-LIST literal -> parsed into a query vector:
+//    either PLAIN (an inline "0.1,0.2,...", dimension-checked only) or TYPED
+//    with an embedding space, `"..."^^<.../vec/MODEL/PRECISION>` (the output
+//    of `vec:embed`/`vec:vector`), which is VALIDATED against the index --
+//    the model (unless either side declares none), the precision, and the
+//    dimension must all match, so a vector fetched from a DIFFERENT index via
+//    `vec:vector` is safe: it computes iff the two indices share a space and
+//    is `UNDEF` otherwise (see `VEC_QUERY_DATATYPE_PREFIX`).
 // A row whose source is neither (including an entity without a live vector)
 // evaluates to `UNDEF`. Combined with QLever's own `BIND`, `ORDER BY`, and
 // `LIMIT`, this IS filtered top-k vector search -- no bespoke operator needed:

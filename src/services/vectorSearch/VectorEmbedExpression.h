@@ -24,9 +24,11 @@ namespace sparqlExpression {
 //  * a string literal -> embedded as TEXT, or
 //  * an IRI           -> treated as an IMAGE URL (or `data:` URI), which the
 //                        endpoint fetches and embeds.
-// The result is the embedding as a comma-separated float-list string (a
-// LocalVocab literal, shortest round-trippable floats) -- exactly the query
-// vector format `vec:distance` parses, so the two compose:
+// The result is the embedding as a comma-separated float-list literal (a
+// LocalVocab literal, shortest round-trippable floats) TYPED with the index's
+// embedding space, `"f0,f1,..."^^<.../vec/MODEL/PRECISION>` (see
+// `VEC_QUERY_DATATYPE_PREFIX`) -- exactly the query-vector form `vec:distance`
+// parses AND validates (model/precision/dimension), so the two compose:
 //
 //   BIND(vec:distance(<.../index/emb>, ?e,
 //                     vec:embed(<.../index/emb>, "a red bicycle")) AS ?d)

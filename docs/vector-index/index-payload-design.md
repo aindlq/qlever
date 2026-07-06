@@ -91,15 +91,35 @@ l2 → distance) between two vector *sources*. The first argument is the index *
 you can introspect). Each source is an expression yielding, per row, either
 
 - an **entity** → its stored vector is looked up, or
-- a **precomputed vector** → a comma-separated float string, parsed internally
-  (`vec:embed(<…/index/NAME>, input)` produces exactly this form via the index's
-  configured endpoint/model — a text literal embeds as text, an IRI as an image URL).
+- a **precomputed vector** → a comma-separated float-list literal, parsed internally.
+  Either **plain** (an inline `"0.1,0.2,…"`, dimension-checked only) or **typed** with
+  an embedding space, `"f0,f1,…"^^<…/vectorSearch/vec/MODEL/PRECISION>` — the form
+  `vec:embed(<…/index/NAME>, input)` (endpoint/model of the index; a text literal
+  embeds as text, an IRI as an image URL) and `vec:vector(<…/index/NAME>, entity)`
+  (the entity's *stored* vector, decoded to f32) return. A typed vector is
+  **validated** against the index `vec:distance` is called on: precision and float
+  count (dimension) must match, and the model must match unless either side declares
+  none — a mismatch is UNDEF (or a clear throw for a constant), never a silently
+  wrong number.
 
 Anything else — including an entity not in the index — makes the row **UNDEF** (so
 filtering on the index is implicit). A constant source is resolved once per query, not
 per row. The metric is a property of the index (from its metadata), so there is **one**
 distance function; you never pass a metric. Every search is therefore
 `ORDER BY ?d ASC LIMIT k`.
+
+**Cross-index** — because the typed literal carries its source index's space, a vector
+fetched from one index is safely usable in another *iff the two indices share an
+embedding space* (same model + precision + dimension):
+```sparql
+BIND(vec:distance(vidx:artwork, ?a, vec:vector(vidx:photo, ?p)) AS ?d)
+```
+computes if `vidx:photo` and `vidx:artwork` agree on model/precision/dimension and is
+UNDEF otherwise. The simplest layout avoids the cross-index step entirely: an index is
+entity-keyed, so entities of different kinds embedded with the **same model can live in
+one index** and entity↔entity distance is direct. FUTURE (documented, deliberately not
+implemented): a `matryoshka: true` index flag to auto-truncate a *longer*
+Matryoshka-trained query vector to a shorter index's dimension instead of rejecting it.
 
 **Filtered / composed** — entities come from your own patterns:
 ```sparql
@@ -171,7 +191,11 @@ two sources + the separate `vec:embed`), the `SERVICE` (`VectorSearch`,
    bundle fully describes its space.
 3. **End-to-end tests**: `.npy` bundle → build → `vec:distance` ranking →
    `SELECT` the `idx:` metadata.
-4. Documentation (this file).
+4. **Typed query vectors + `vec:vector`**: `vec:embed`/`vec:vector` return
+   `"floats"^^<…/vec/MODEL/PRECISION>`; `vec:distance` validates the space
+   (model unless either side is model-less, precision, dimension) → safe
+   cross-index distance, UNDEF on mismatch.
+5. Documentation (this file).
 
 ## Open / deferred
 
@@ -181,3 +205,6 @@ two sources + the separate `vec:embed`), the `SERVICE` (`VectorSearch`,
 - Uniform-distance polish for `vec:distance` if any metric still returns similarity.
 - Expose `residency` (mlock / aligned huge-page copy) as a per-index build-spec key so
   hot indices can be pinned; the mechanism already exists (`VectorIndex.h`).
+- A `matryoshka: true` index flag: auto-truncate a longer Matryoshka-trained typed
+  query vector to a shorter index's dimension in the `vec:distance` validation
+  (today a dimension mismatch is always UNDEF/an error).

@@ -122,6 +122,7 @@ add_library(service_vectorSearch OBJECT
         VectorQueryPoint.cpp
         VectorDistanceExpression.cpp
         VectorEmbedExpression.cpp
+        VectorVectorExpression.cpp
         VectorIndexExtension.cpp
         EmbeddingClient.cpp)
 # `vectorStorage` and `http` are PUBLIC so they propagate to the binaries that

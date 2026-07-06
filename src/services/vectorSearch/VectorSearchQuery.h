@@ -33,11 +33,16 @@ inline constexpr std::string_view VECTOR_SEARCH_IRI =
 //    operators.
 //  * `vec:embed(<.../index/NAME>, input)` -- embed a text literal or an image
 //    IRI via the index's own configured endpoint and return the vector as a
-//    float-list string (composable with `vec:distance`).
+//    typed float-list literal (composable with `vec:distance`).
+//  * `vec:vector(<.../index/NAME>, entity)` -- the entity's STORED vector as
+//    the same typed float-list literal, the bridge for validated CROSS-INDEX
+//    distances (see `VectorVectorExpression`).
 inline constexpr std::string_view VECTOR_DISTANCE_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/distance>";
 inline constexpr std::string_view VECTOR_EMBED_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/embed>";
+inline constexpr std::string_view VECTOR_VECTOR_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/vector>";
 
 class VectorSearchException : public std::runtime_error {
   using std::runtime_error::runtime_error;

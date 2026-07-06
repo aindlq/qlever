@@ -302,6 +302,84 @@ QueryExecutionContext* qecWithNativeBf16Index() {
   }
   return qec;
 }
+
+// ===========================================================================
+// The CROSS-INDEX fixture: one knowledge graph, THREE vector indices (same
+// dimension 3, cosine, f32) built in a single spec, with DISTINCT entities:
+//  * `idxa` (model "clip"):  <a1>=[1,0,0], <a2>=[0.6,0.8,0], <a3>=[0,0,1]
+//                            (<a4> is an AItem WITHOUT a vector);
+//  * `idxb` (model "clip"):  <b1>=[1,0,0], <b2>=[0,1,0] -- the SAME embedding
+//                            space as `idxa`, so `vec:vector(idxb, ...)` is
+//                            comparable in `idxa`;
+//  * `idxother` (model "other"): <o1>=[1,0,0] -- same dim/precision but a
+//                            DIFFERENT model, so it must NOT be comparable.
+constexpr std::string_view KG_CROSS =
+    "<a1> <is-a> <AItem> . <a2> <is-a> <AItem> . <a3> <is-a> <AItem> . "
+    "<a4> <is-a> <AItem> . <b1> <is-a> <BItem> . <b2> <is-a> <BItem> . "
+    "<o1> <is-a> <OItem> .";
+
+// The typed query-vector datatype IRIs used in the queries below (bracketless
+// prefix; see `VEC_QUERY_DATATYPE_PREFIX`).
+constexpr std::string_view VEC_DT_CLIP_F32 =
+    "https://qlever.cs.uni-freiburg.de/vectorSearch/vec/clip/f32";
+constexpr std::string_view VEC_DT_CLIP_F16 =
+    "https://qlever.cs.uni-freiburg.de/vectorSearch/vec/clip/f16";
+
+QueryExecutionContext* qecWithCrossIndexes() {
+  QueryExecutionContext* qec = getQec(std::string{KG_CROSS});
+  auto& impl = const_cast<Index&>(qec->getIndex()).getImpl();
+  if (impl.getExtension(std::string{qlever::vector::VECTOR_EXTENSION_NAME}) !=
+      nullptr) {
+    return qec;
+  }
+  std::string basename =
+      (std::filesystem::temp_directory_path() /
+       ("qlever-vecpayloade2e-cross-" + std::to_string(::getpid())))
+          .string();
+  writeNpyBundle(basename + ".a.npy", basename + ".a.iris",
+                 {{"<a1>", {1.f, 0.f, 0.f}},
+                  {"<a2>", {0.6f, 0.8f, 0.f}},
+                  {"<a3>", {0.f, 0.f, 1.f}}});
+  writeNpyBundle(basename + ".b.npy", basename + ".b.iris",
+                 {{"<b1>", {1.f, 0.f, 0.f}}, {"<b2>", {0.f, 1.f, 0.f}}});
+  writeNpyBundle(basename + ".o.npy", basename + ".o.iris",
+                 {{"<o1>", {1.f, 0.f, 0.f}}});
+  auto entry = [&](const std::string& name, const std::string& input,
+                   const std::string& model) {
+    return nlohmann::json{{"name", name},
+                          {"npy", basename + "." + input + ".npy"},
+                          {"iris", basename + "." + input + ".iris"},
+                          {"metric", "cosine"},
+                          {"hnsw", false},
+                          {"embeddingModel", model}};
+  };
+  nlohmann::json spec{{"vectorSearch", nlohmann::json::array(
+                                           {entry("idxa", "a", "clip"),
+                                            entry("idxb", "b", "clip"),
+                                            entry("idxother", "o", "other")})}};
+  for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
+    hook(qec->getIndex(), basename, spec);
+  }
+  for (const auto& hook : IndexExtensionRegistry::get().loadHooks()) {
+    hook(impl, basename);
+  }
+  qec->setLocatedTriplesForEvaluation(
+      impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
+  for (std::string_view name : {"idxa", "idxb", "idxother"}) {
+    for (std::string_view suffix :
+         {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
+      std::error_code ec;
+      std::filesystem::remove(
+          basename + ".vec." + std::string{name} + std::string{suffix}, ec);
+    }
+  }
+  for (std::string_view suffix :
+       {".a.npy", ".a.iris", ".b.npy", ".b.iris", ".o.npy", ".o.iris"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + std::string{suffix}, ec);
+  }
+  return qec;
+}
 }  // namespace
 
 // _____________________________________________________________________________
@@ -631,4 +709,276 @@ TEST(VectorIndexPayloadE2E, nativeBf16NpyInputResolvesAndRanks) {
   EXPECT_NEAR(table(2, dCol).getDouble(), 1.0 - 1.0 / std::sqrt(2.0), 1e-2);
   EXPECT_EQ(table(3, eCol), getId("<d>"));
   EXPECT_NEAR(table(3, dCol).getDouble(), 1.0, 1e-3);
+}
+
+// _____________________________________________________________________________
+// `vec:vector` fetches an entity's STORED vector as a TYPED query-vector
+// literal `"floats"^^<.../vec/MODEL/PRECISION>` carrying the index's embedding
+// space (here: model "clip", the f32 storage scalar) -- the exact form
+// `vec:embed` also returns, and the one `vec:distance` validates.
+TEST(VectorIndexPayloadE2E, vectorReturnsTypedLiteralOfIndexSpace) {
+  auto* qec = qecWithCrossIndexes();
+  QueryExecutionTree qet =
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT ?v WHERE { ?a <is-a> <AItem> . "
+                         "BIND(vec:vector(vidx:idxa, <a1>) AS ?v) }");
+  auto result = qet.getResult();
+  const IdTable& table = result->idTable();
+  ASSERT_EQ(table.numRows(), 4u);
+  Id id = table(0, qet.getVariableColumn(Variable{"?v"}));
+  ASSERT_EQ(id.getDatatype(), Datatype::LocalVocabIndex);
+  EXPECT_EQ(id.getLocalVocabIndex()->toStringRepresentation(),
+            "\"1,0,0\"^^<" + std::string{VEC_DT_CLIP_F32} + ">");
+}
+
+// _____________________________________________________________________________
+// The typed literal from `vec:vector` is accepted by `vec:distance` on the
+// SAME index (identical space -> the validation passes) and ranks correctly:
+// distance to <a1>'s own stored vector [1,0,0] gives <a1> ~0, <a2> ~0.4,
+// <a3> ~1; the vectorless <a4> stays UNDEF and is filtered.
+TEST(VectorIndexPayloadE2E, typedVectorLiteralAcceptedBySameIndex) {
+  auto* qec = qecWithCrossIndexes();
+  QueryExecutionTree qet =
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT ?a ?d WHERE { ?a <is-a> <AItem> . "
+                         "BIND(vec:distance(vidx:idxa, ?a, "
+                         "vec:vector(vidx:idxa, <a1>)) AS ?d) "
+                         "FILTER(BOUND(?d)) } ORDER BY ?d");
+  auto result = qet.getResult();
+  size_t aCol = qet.getVariableColumn(Variable{"?a"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+
+  ASSERT_EQ(table.numRows(), 3u);
+  EXPECT_EQ(table(0, aCol), getId("<a1>"));
+  EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+  EXPECT_EQ(table(1, aCol), getId("<a2>"));
+  EXPECT_NEAR(table(1, dCol).getDouble(), 0.4, 1e-3);
+  EXPECT_EQ(table(2, aCol), getId("<a3>"));
+  EXPECT_NEAR(table(2, dCol).getDouble(), 1.0, 1e-3);
+}
+
+// _____________________________________________________________________________
+// CROSS-INDEX distance between two indices that share an embedding space
+// (same model "clip", same precision f32, same dimension 3): a vector fetched
+// from `idxb` via `vec:vector` is validated and USED by `vec:distance` on
+// `idxa`. Constant form first (<b1>'s vector [1,0,0] against all AItems),
+// then the fully per-row pair form.
+TEST(VectorIndexPayloadE2E, crossIndexDistanceSameSpaceRanks) {
+  auto* qec = qecWithCrossIndexes();
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?a ?d WHERE { ?a <is-a> <AItem> . "
+                           "BIND(vec:distance(vidx:idxa, ?a, "
+                           "vec:vector(vidx:idxb, <b1>)) AS ?d) "
+                           "FILTER(BOUND(?d)) } ORDER BY ?d");
+    auto result = qet.getResult();
+    size_t aCol = qet.getVariableColumn(Variable{"?a"});
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    auto getId = makeGetId(qec->getIndex());
+    ASSERT_EQ(table.numRows(), 3u);
+    EXPECT_EQ(table(0, aCol), getId("<a1>"));
+    EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+    EXPECT_EQ(table(1, aCol), getId("<a2>"));
+    EXPECT_NEAR(table(1, dCol).getDouble(), 0.4, 1e-3);
+    EXPECT_EQ(table(2, aCol), getId("<a3>"));
+    EXPECT_NEAR(table(2, dCol).getDouble(), 1.0, 1e-3);
+  }
+  {
+    // Per-row on BOTH sides: every (AItem, BItem) pair, ?b's vector fetched
+    // from idxb per row and measured in idxa. Cosine distances: (a1,b1)=0,
+    // (a2,b2)=0.2, (a2,b1)=0.4, and three orthogonal pairs at 1.
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?a ?b ?d WHERE { "
+                           "?a <is-a> <AItem> . ?b <is-a> <BItem> . "
+                           "BIND(vec:distance(vidx:idxa, ?a, "
+                           "vec:vector(vidx:idxb, ?b)) AS ?d) "
+                           "FILTER(BOUND(?d)) } ORDER BY ?d");
+    auto result = qet.getResult();
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    // 3 vectored AItems x 2 BItems (the vectorless <a4> pairs are UNDEF).
+    ASSERT_EQ(table.numRows(), 6u);
+    EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+    EXPECT_NEAR(table(1, dCol).getDouble(), 0.2, 1e-3);
+    EXPECT_NEAR(table(2, dCol).getDouble(), 0.4, 1e-3);
+    for (size_t r = 3; r < 6; ++r) {
+      EXPECT_NEAR(table(r, dCol).getDouble(), 1.0, 1e-3) << "row " << r;
+    }
+  }
+}
+
+// _____________________________________________________________________________
+// CROSS-INDEX with a DIFFERENT `embeddingModel` ("other" vs "clip"): the
+// typed vector is NOT comparable, although dimension and precision match.
+// A per-row source makes those rows UNDEF; a constant source throws a clear
+// error (mirroring the dimension error), because it is certainly a query
+// mistake.
+TEST(VectorIndexPayloadE2E, crossIndexModelMismatchIsUndefOrThrows) {
+  auto* qec = qecWithCrossIndexes();
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?a ?d WHERE { "
+                           "?a <is-a> <AItem> . ?o <is-a> <OItem> . "
+                           "BIND(vec:distance(vidx:idxa, ?a, "
+                           "vec:vector(vidx:idxother, ?o)) AS ?d) }");
+    auto result = qet.getResult();
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 4u);
+    for (size_t r = 0; r < table.numRows(); ++r) {
+      EXPECT_TRUE(table(r, dCol).isUndefined()) << "row " << r;
+    }
+  }
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?a ?d WHERE { ?a <is-a> <AItem> . "
+                           "BIND(vec:distance(vidx:idxa, ?a, "
+                           "vec:vector(vidx:idxother, <o1>)) AS ?d) }");
+    AD_EXPECT_THROW_WITH_MESSAGE(
+        qet.getResult(),
+        ::testing::HasSubstr("does not match vector index \"idxa\""));
+  }
+}
+
+// _____________________________________________________________________________
+// A typed query-vector literal with the WRONG PRECISION (f16 vs the index's
+// f32 store) or the WRONG DIMENSION: per-row -> UNDEF for exactly those rows;
+// constant -> a clear throw.
+TEST(VectorIndexPayloadE2E, typedLiteralWrongPrecisionOrDimension) {
+  auto* qec = qecWithCrossIndexes();
+  auto getId = makeGetId(qec->getIndex());
+  // Per row: <a1> gets a correctly-typed query vector, every other row a
+  // wrong-precision one -> only <a1> is bound.
+  auto boundOnlyA1 = [&](const std::string& wrongTyped) {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?a ?d WHERE { ?a <is-a> <AItem> . "
+                           "BIND(IF(STR(?a) = \"a1\", \"1,0,0\"^^<" +
+                           std::string{VEC_DT_CLIP_F32} + ">, " + wrongTyped +
+                           ") AS ?q) "
+                           "BIND(vec:distance(vidx:idxa, ?a, ?q) AS ?d) "
+                           "FILTER(BOUND(?d)) }");
+    auto result = qet.getResult();
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 1u);
+    EXPECT_EQ(table(0, qet.getVariableColumn(Variable{"?a"})), getId("<a1>"));
+    EXPECT_NEAR(table(0, qet.getVariableColumn(Variable{"?d"})).getDouble(),
+                0.0, 1e-4);
+  };
+  // Wrong precision (f16-typed floats against the f32 store).
+  boundOnlyA1("\"1,0,0\"^^<" + std::string{VEC_DT_CLIP_F16} + ">");
+  // Wrong dimension (2 floats against the 3-dimensional index).
+  boundOnlyA1("\"1,0\"^^<" + std::string{VEC_DT_CLIP_F32} + ">");
+
+  // Constant sources throw loudly instead.
+  auto expectThrow = [&](const std::string& constantSource,
+                         const std::string& messagePart) {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?a ?d WHERE { ?a <is-a> <AItem> . "
+                           "BIND(vec:distance(vidx:idxa, ?a, " +
+                           constantSource + ") AS ?d) }");
+    AD_EXPECT_THROW_WITH_MESSAGE(qet.getResult(),
+                                 ::testing::HasSubstr(messagePart));
+  };
+  expectThrow("\"1,0,0\"^^<" + std::string{VEC_DT_CLIP_F16} + ">",
+              "does not match vector index \"idxa\"");
+  expectThrow("\"1,0\"^^<" + std::string{VEC_DT_CLIP_F32} + ">",
+              "has dimension 2, but vector index \"idxa\" has dimension 3");
+}
+
+// _____________________________________________________________________________
+// `vec:vector` of an entity that is NOT a member of the index -> UNDEF, both
+// for a constant entity (<b1> lives in idxb, not idxa) and per row (<a4> is
+// an AItem without a vector).
+TEST(VectorIndexPayloadE2E, vectorOfNonMemberIsUndef) {
+  auto* qec = qecWithCrossIndexes();
+  auto getId = makeGetId(qec->getIndex());
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?v WHERE { ?a <is-a> <AItem> . "
+                           "BIND(vec:vector(vidx:idxa, <b1>) AS ?v) }");
+    auto result = qet.getResult();
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 4u);
+    EXPECT_TRUE(table(0, qet.getVariableColumn(Variable{"?v"})).isUndefined());
+  }
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?a ?v WHERE { ?a <is-a> <AItem> . "
+                           "BIND(vec:vector(vidx:idxa, ?a) AS ?v) }");
+    auto result = qet.getResult();
+    size_t aCol = qet.getVariableColumn(Variable{"?a"});
+    size_t vCol = qet.getVariableColumn(Variable{"?v"});
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 4u);
+    bool sawNonMember = false;
+    for (size_t r = 0; r < table.numRows(); ++r) {
+      if (table(r, aCol) == getId("<a4>")) {
+        EXPECT_TRUE(table(r, vCol).isUndefined());
+        sawNonMember = true;
+      } else {
+        EXPECT_EQ(table(r, vCol).getDatatype(), Datatype::LocalVocabIndex)
+            << "row " << r << " should have a typed vector literal";
+      }
+    }
+    EXPECT_TRUE(sawNonMember);
+  }
+}
+
+// _____________________________________________________________________________
+// The model check is SKIPPED when either side declares no model, so a
+// vector-only index (the "emb" fixture has no `embeddingModel`) still accepts
+// any typed query vector of matching precision and dimension -- and its own
+// `vec:vector` output is typed with an EMPTY model segment (`.../vec//f32`)
+// and round-trips through `vec:distance` on the same index.
+TEST(VectorIndexPayloadE2E, modellessIndexSkipsModelCheck) {
+  auto* qec = qecWithPayloadIndex();
+  auto getId = makeGetId(qec->getIndex());
+  {
+    // A "clip"-typed constant query vector against the model-less index:
+    // comparable (one side has no model), ranks like the flagship test.
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
+                           "BIND(vec:distance(vidx:emb, ?e, \"1,0,0\"^^<" +
+                           std::string{VEC_DT_CLIP_F32} +
+                           ">) AS ?d) FILTER(BOUND(?d)) } ORDER BY ?d");
+    auto result = qet.getResult();
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 4u);
+    EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+    EXPECT_NEAR(table(3, dCol).getDouble(), 1.0, 1e-3);
+  }
+  {
+    // The model-less index's own `vec:vector` literal: empty model segment,
+    // accepted right back by the same index.
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?v ?d WHERE { ?e <is-a> <Item> . "
+                           "BIND(vec:vector(vidx:emb, <a>) AS ?v) "
+                           "BIND(vec:distance(vidx:emb, <c>, ?v) AS ?d) }");
+    auto result = qet.getResult();
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 5u);
+    Id v = table(0, qet.getVariableColumn(Variable{"?v"}));
+    ASSERT_EQ(v.getDatatype(), Datatype::LocalVocabIndex);
+    EXPECT_EQ(v.getLocalVocabIndex()->toStringRepresentation(),
+              "\"1,0,0\"^^<https://qlever.cs.uni-freiburg.de/vectorSearch/"
+              "vec//f32>");
+    // <a> and <c> have identical stored vectors -> distance ~0.
+    Id d = table(0, qet.getVariableColumn(Variable{"?d"}));
+    ASSERT_EQ(d.getDatatype(), Datatype::Double);
+    EXPECT_NEAR(d.getDouble(), 0.0, 1e-4);
+  }
 }
