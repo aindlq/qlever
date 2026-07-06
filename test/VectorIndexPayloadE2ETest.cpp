@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -63,9 +64,11 @@ const std::vector<std::pair<std::string, std::vector<float>>>& testVectors() {
 
 // Write `rows` as a NumPy v1.0 `.npy` file (little-endian float32, C-order)
 // plus the row-aligned IRI sidecar -- the exact input bundle of the design.
-void writeNpyBundle(const std::string& npyPath, const std::string& irisPath) {
-  const size_t numRows = testVectors().size();
-  const size_t dim = testVectors().front().second.size();
+void writeNpyBundle(
+    const std::string& npyPath, const std::string& irisPath,
+    const std::vector<std::pair<std::string, std::vector<float>>>& rows) {
+  const size_t numRows = rows.size();
+  const size_t dim = rows.front().second.size();
   std::string dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
                      std::to_string(numRows) + ", " + std::to_string(dim) +
                      "), }";
@@ -82,7 +85,7 @@ void writeNpyBundle(const std::string& npyPath, const std::string& irisPath) {
   out.write(lenBytes, 2);
   out.write(dict.data(), dict.size());
   std::ofstream irisOut{irisPath};
-  for (const auto& [iri, vec] : testVectors()) {
+  for (const auto& [iri, vec] : rows) {
     out.write(reinterpret_cast<const char*>(vec.data()),
               vec.size() * sizeof(float));
     irisOut << iri << "\n";
@@ -107,7 +110,7 @@ QueryExecutionContext* qecWithPayloadIndex() {
           .string();
   std::string npy = basename + ".input.npy";
   std::string iris = basename + ".input.iris";
-  writeNpyBundle(npy, iris);
+  writeNpyBundle(npy, iris, testVectors());
   nlohmann::json spec = nlohmann::json::parse(
       R"({"vectorSearch":[{"name":"emb","npy":")" + npy + R"(","iris":")" +
       iris + R"(","metric":"cosine","hnsw":false}]})");
@@ -141,6 +144,76 @@ QueryExecutionTree planQuery(QueryExecutionContext* qec, std::string query) {
   auto handle = std::make_shared<ad_utility::CancellationHandle<>>();
   QueryPlanner planner{qec, handle};
   return planner.createExecutionTree(pq);
+}
+
+// ===========================================================================
+// The bf16 fixture: a SEPARATE knowledge graph (a distinct `getQec` cache
+// entry) whose vector index is built with `"scalar": "bf16"` from the same
+// fp32 `.npy` bundle format. Every vector component is exactly
+// bf16-representable (0, 0.25, 0.5, 1), so truncating the fp32 input to the
+// 2-byte bf16 store is lossless and the cosine distances are exact.
+constexpr std::string_view KG_BF16 =
+    "<a> <is-a> <Bf16Item> . <b> <is-a> <Bf16Item> . "
+    "<c> <is-a> <Bf16Item> . <d> <is-a> <Bf16Item> .";
+
+// The dimension is deliberately large enough that the page-rounded on-disk
+// size of the flat store distinguishes 2-byte bf16 from 4-byte fp32 rows
+// (tiny matrices land in a single page either way).
+constexpr size_t BF16_DIM = 1024;
+constexpr size_t BF16_NUM_VECTORS = 4;
+
+// `<a>` and `<c>` equal the basis vector e0 (distance 0 to an e0 query),
+// `<b>` is at 45 degrees in the e0/e1 plane (cosine distance 1 - 1/sqrt(2)),
+// and `<d>` is orthogonal (distance 1).
+std::vector<std::pair<std::string, std::vector<float>>> bf16TestVectors() {
+  std::vector<float> e0(BF16_DIM, 0.f);
+  e0[0] = 1.f;
+  std::vector<float> diag(BF16_DIM, 0.f);
+  diag[0] = 0.5f;
+  diag[1] = 0.5f;
+  std::vector<float> e2(BF16_DIM, 0.f);
+  e2[2] = 1.f;
+  return {{"<a>", e0}, {"<b>", diag}, {"<c>", e0}, {"<d>", e2}};
+}
+
+// Build the "embbf16" index through the registered hooks and return the qec
+// together with the on-disk size of its `.vec.embbf16.data` flat store
+// (measured before the fixture unlinks the mmap-ed files).
+std::pair<QueryExecutionContext*, std::uintmax_t> qecWithBf16Index() {
+  static std::uintmax_t dataFileSize = 0;
+  QueryExecutionContext* qec = getQec(std::string{KG_BF16});
+  auto& impl = const_cast<Index&>(qec->getIndex()).getImpl();
+  if (impl.getExtension(std::string{qlever::vector::VECTOR_EXTENSION_NAME}) !=
+      nullptr) {
+    return {qec, dataFileSize};
+  }
+  std::string basename =
+      (std::filesystem::temp_directory_path() /
+       ("qlever-vecpayloade2e-bf16-" + std::to_string(::getpid())))
+          .string();
+  std::string npy = basename + ".input.npy";
+  std::string iris = basename + ".input.iris";
+  writeNpyBundle(npy, iris, bf16TestVectors());
+  nlohmann::json spec = nlohmann::json::parse(
+      R"({"vectorSearch":[{"name":"embbf16","npy":")" + npy + R"(","iris":")" +
+      iris + R"(","metric":"cosine","scalar":"bf16","hnsw":false}]})");
+  for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
+    hook(qec->getIndex(), basename, spec);
+  }
+  dataFileSize = std::filesystem::file_size(basename + ".vec.embbf16.data");
+  for (const auto& hook : IndexExtensionRegistry::get().loadHooks()) {
+    hook(impl, basename);
+  }
+  qec->setLocatedTriplesForEvaluation(
+      impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
+  for (auto* suffix :
+       {".vec.embbf16.meta", ".vec.embbf16.keys", ".vec.embbf16.rowmap",
+        ".vec.embbf16.data", ".vec.embbf16.iris", ".vec.embbf16.hnsw",
+        ".input.npy", ".input.iris"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + suffix, ec);
+  }
+  return {qec, dataFileSize};
 }
 }  // namespace
 
@@ -251,4 +324,76 @@ TEST(VectorIndexPayloadE2E, nonMemberDistanceIsUndef) {
     }
   }
   EXPECT_TRUE(sawNonMember);
+}
+
+// _____________________________________________________________________________
+// The bf16 storage scalar: the `.npy` input stays fp32 (numpy has no portable
+// bf16), but `"scalar": "bf16"` stores every vector as 2-byte bf16. The
+// fixture's components are exactly bf16-representable, so the f32 -> bf16
+// truncation is lossless and `vec:distance` ranks exactly like an fp32 store:
+// identical vectors at distance ~0, orthogonal at cosine distance ~1.
+TEST(VectorIndexPayloadE2E, bf16ScalarStoresTwoBytesAndRanksCorrectly) {
+  auto [qec, dataFileSize] = qecWithBf16Index();
+
+  // Proof that the flat store holds 2-byte bf16, not 4-byte fp32: the
+  // `.vec.embbf16.data` file must fit the bf16 payload plus at most one page
+  // of `MmapVector` rounding and its 32-byte trailer -- strictly less than
+  // the raw fp32 payload alone would need.
+  const std::uintmax_t bf16Payload = BF16_NUM_VECTORS * BF16_DIM * 2;
+  EXPECT_GE(dataFileSize, bf16Payload);
+  EXPECT_LE(dataFileSize,
+            bf16Payload + static_cast<std::uintmax_t>(getpagesize()) + 32);
+  EXPECT_LT(dataFileSize, BF16_NUM_VECTORS * BF16_DIM * 4);
+
+  // The persisted metadata agrees: the auto-materialized `precision` triple
+  // of the index says "bf16".
+  {
+    QueryExecutionTree qet = planQuery(
+        qec,
+        "SELECT ?precision WHERE { "
+        "<https://qlever.cs.uni-freiburg.de/vectorSearch/index/embbf16> "
+        "<https://qlever.cs.uni-freiburg.de/vectorSearch/precision> "
+        "?precision }");
+    auto result = qet.getResult();
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 1u);
+    Id id = table(0, qet.getVariableColumn(Variable{"?precision"}));
+    ASSERT_EQ(id.getDatatype(), Datatype::LocalVocabIndex);
+    EXPECT_EQ(id.getLocalVocabIndex()->toStringRepresentation(), "\"bf16\"");
+  }
+
+  // Ranking against the query point e0 (all components bf16-exact, so the
+  // only imprecision is the bf16 arithmetic of the distance kernel itself).
+  std::string queryVector = "1";
+  for (size_t i = 1; i < BF16_DIM; ++i) {
+    queryVector += ",0";
+  }
+  QueryExecutionTree qet =
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT ?e ?d WHERE { ?e <is-a> <Bf16Item> . "
+                         "BIND(vec:distance(\"embbf16\", ?e, \"" +
+                         queryVector +
+                         "\") AS ?d) "
+                         "FILTER(BOUND(?d)) } ORDER BY ?d");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+
+  ASSERT_EQ(table.numRows(), 4u);
+  // The exact matches <a> and <c> (identical bf16 rows -> distance ~0) rank
+  // first, in either order.
+  std::set<uint64_t> nearest{table(0, eCol).getBits(),
+                             table(1, eCol).getBits()};
+  EXPECT_TRUE(nearest.contains(getId("<a>").getBits()));
+  EXPECT_TRUE(nearest.contains(getId("<c>").getBits()));
+  EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-4);
+  EXPECT_NEAR(table(1, dCol).getDouble(), 0.0, 1e-4);
+  // Then <b> at 45 degrees (cosine distance 1 - 1/sqrt(2)), then the
+  // orthogonal <d> at distance 1 (small tolerance for the bf16 kernel).
+  EXPECT_EQ(table(2, eCol), getId("<b>"));
+  EXPECT_NEAR(table(2, dCol).getDouble(), 1.0 - 1.0 / std::sqrt(2.0), 1e-2);
+  EXPECT_EQ(table(3, eCol), getId("<d>"));
+  EXPECT_NEAR(table(3, dCol).getDouble(), 1.0, 1e-3);
 }

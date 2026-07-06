@@ -120,10 +120,14 @@ enum class VectorMetric : uint8_t { Cosine, L2Sq, InnerProduct };
 
 // The scalar type the vectors are stored as. `F32` is the default; the
 // smaller types trade a little recall for a half/quarter storage (and page
-// cache) footprint. NOTE: `I8` rescales every vector to a common magnitude
-// (usearch's dot-product-oriented int8 cast), so it is only meaningful with
-// the `cosine` metric (the builder rejects `i8` + `l2sq`/`innerProduct`).
-enum class VectorScalar : uint8_t { F32, F16, I8 };
+// cache) footprint. `Bf16` is the lossless choice for embeddings that were
+// produced in bf16: the fp32 `.npy` input is a bf16 upscaled to f32, and
+// truncating it back to bf16 recovers the original bits exactly. NOTE: `I8`
+// rescales every vector to a common magnitude (usearch's dot-product-oriented
+// int8 cast), so it is only meaningful with the `cosine` metric (the builder
+// rejects `i8` + `l2sq`/`innerProduct`). (`Bf16` is appended after `I8` to
+// keep the preexisting enum values stable.)
+enum class VectorScalar : uint8_t { F32, F16, I8, Bf16 };
 
 // Bytes per stored scalar value.
 inline size_t bytesPerScalar(VectorScalar s) {
@@ -134,6 +138,8 @@ inline size_t bytesPerScalar(VectorScalar s) {
       return 2;
     case VectorScalar::I8:
       return 1;
+    case VectorScalar::Bf16:
+      return 2;
   }
   return 4;
 }
@@ -167,6 +173,8 @@ inline std::string toString(VectorScalar s) {
       return "f16";
     case VectorScalar::I8:
       return "i8";
+    case VectorScalar::Bf16:
+      return "bf16";
   }
   return "f32";
 }
@@ -175,6 +183,7 @@ inline VectorScalar vectorScalarFromString(std::string_view s) {
   if (s == "f32") return VectorScalar::F32;
   if (s == "f16") return VectorScalar::F16;
   if (s == "i8") return VectorScalar::I8;
+  if (s == "bf16") return VectorScalar::Bf16;
   throw std::runtime_error("Unknown vector scalar type: " + std::string{s});
 }
 

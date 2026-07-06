@@ -115,6 +115,8 @@ inline uu::scalar_kind_t toUsearchScalar(VectorScalar s) {
       return uu::scalar_kind_t::f16_k;
     case VectorScalar::I8:
       return uu::scalar_kind_t::i8_k;
+    case VectorScalar::Bf16:
+      return uu::scalar_kind_t::bf16_k;
   }
   return uu::scalar_kind_t::f32_k;
 }

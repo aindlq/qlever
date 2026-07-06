@@ -98,7 +98,11 @@ array (e.g. one for image embeddings, one for text).
 | `iris`    | path to the row-aligned IRI list                               |
 | `metric`  | `cosine` \| `dot` \| `l2` (distance; smaller = closer)         |
 | `hnsw`    | `true` builds the ANN graph; `false` = exact/flat store only   |
-| `scalar`  | *(optional)* storage precision `f32` (default) \| `f16` \| `i8`|
+| `scalar`  | *(optional)* storage precision `f32` (default) \| `f16` \| `bf16` \| `i8`|
+
+- bf16 — for bf16 embeddings: save the `.npy` as fp32 (numpy has no bf16) and
+  set `scalar: bf16`; qlever stores 2-byte bf16, lossless since the fp32 is an
+  upscaled bf16.
 
 ## 4. Serve and query
 
