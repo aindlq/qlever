@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -25,6 +26,7 @@
 #include <fstream>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "./util/GTestHelpers.h"
@@ -33,6 +35,7 @@
 #include "index/IndexExtension.h"
 #include "index/IndexImpl.h"
 #include "parser/SparqlParser.h"
+#include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "util/json.h"
 
@@ -578,6 +581,66 @@ TEST(VectorIndexPayloadE2E, nonMemberDistanceIsUndef) {
     }
   }
   EXPECT_TRUE(sawNonMember);
+}
+
+// _____________________________________________________________________________
+// The sorted-input fast path end to end: when the per-row entity source is a
+// bare variable bound by an index scan (so the entity column is the input's
+// leading sort key), `vec:distance` takes the merge-walk fast path -- whose
+// result must be BIT-IDENTICAL to the per-row primitive `(*computer)(entity)`.
+// The same query with the entity wrapped in `COALESCE` (no longer a bare
+// variable) declines the fast path and runs the per-row fallback; both must
+// equal the reference and each other.
+TEST(VectorIndexPayloadE2E, sortedFastPathMatchesPerRowReference) {
+  auto* qec = qecWithPayloadIndex();
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "emb");
+  ASSERT_TRUE(vidx);
+  auto computer = vidx->makeDistanceComputer(std::vector<float>{1.f, 0.f, 0.f});
+
+  // Run `query`, and assert every row's `?d` equals the reference distance-Id
+  // computed for that row's `?e` via the per-row primitive. Returns the `?d`
+  // column so callers can compare runs for determinism.
+  auto runAndCheck = [&](const std::string& query) {
+    QueryExecutionTree qet = planQuery(qec, std::string{PREFIX} + query);
+    auto result = qet.getResult();
+    size_t eCol = qet.getVariableColumn(Variable{"?e"});
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    EXPECT_EQ(table.numRows(), 5u);  // all five entities, incl. <nomember>.
+    std::vector<std::pair<uint64_t, Id>> byEntity;
+    for (size_t r = 0; r < table.numRows(); ++r) {
+      Id e = table(r, eCol);
+      Id expected = qlever::vector::distanceToValueId(computer(e));
+      EXPECT_EQ(table(r, dCol), expected) << "row " << r;
+      byEntity.emplace_back(e.getBits(), table(r, dCol));
+    }
+    std::sort(byEntity.begin(), byEntity.end());
+    return byEntity;
+  };
+
+  // Fast path, constant on the RIGHT.
+  auto fastRight = runAndCheck(
+      "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
+      "BIND(vec:distance(vidx:emb, ?e, \"1,0,0\") AS ?d) }");
+  // Fast path, constant on the LEFT (metrics are symmetric; still fast path).
+  auto fastLeft = runAndCheck(
+      "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
+      "BIND(vec:distance(vidx:emb, \"1,0,0\", ?e) AS ?d) }");
+  // Fallback: COALESCE(?e) is not a bare variable, so the detection declines
+  // and the per-row path runs.
+  auto fallback = runAndCheck(
+      "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
+      "BIND(vec:distance(vidx:emb, \"1,0,0\", COALESCE(?e)) AS ?d) }");
+
+  // Determinism: a second run of the fast-path query is identical.
+  auto fastRightAgain = runAndCheck(
+      "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
+      "BIND(vec:distance(vidx:emb, ?e, \"1,0,0\") AS ?d) }");
+
+  // Fast path (both orders), fallback, and the repeat all agree per entity.
+  EXPECT_EQ(fastRight, fastLeft);
+  EXPECT_EQ(fastRight, fallback);
+  EXPECT_EQ(fastRight, fastRightAgain);
 }
 
 // _____________________________________________________________________________

@@ -8,6 +8,8 @@
 #ifndef QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEX_H
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEX_H
 
+#include <absl/functional/function_ref.h>
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -20,6 +22,14 @@
 #include "services/vectorSearch/VectorIndexFormat.h"
 
 namespace qlever::vector {
+
+// Map a raw metric distance to the `vec:distance` result `Id`: a `NaN`
+// distance (the "no live vector" sentinel) becomes UNDEF, any real distance
+// becomes the double-encoded value. Defined ONCE here so the per-row
+// `vec:distance` path and the sorted merge-walk fast path
+// (`gatherSortedDistances`) share the exact same mapping and stay
+// bit-identical.
+Id distanceToValueId(float distance);
 
 // One result of a similarity search: an entity and its distance to the query
 // (smaller = more similar, in the index's metric). The entity is identified by
@@ -190,6 +200,14 @@ class VectorIndex {
     // match the index.
     float operator()(ql::span<const float> vector) const;
 
+    // The distance from the query point to an ALREADY-KNOWN row of the flat
+    // store, with NO rowmap lookup. This is the primitive of the sorted
+    // merge-walk fast path (`gatherSortedDistances`), which resolves the row
+    // once while walking the id-sorted rowmap. For a row that came from
+    // `rowOf(entity)` this returns exactly `(*this)(entity)`. Precondition:
+    // `row < numVectors()` (the walk only ever passes a valid rowmap row).
+    float atRow(size_t row) const;
+
    private:
     friend class VectorIndex;
     DistanceComputer(const Impl* impl, std::vector<char> queryBytes)
@@ -219,6 +237,36 @@ class VectorIndex {
   float distance(Id a, Id b) const;
   float distance(Id entity, ql::span<const float> vector) const;
   float distance(ql::span<const float> a, ql::span<const float> b) const;
+
+  // Sorted-input fast path for `vec:distance`: compute the distance from
+  // `computer`'s query point to every entity in `ascendingEntities`, which
+  // MUST be sorted ascending by `Id` bits (the caller only takes this path
+  // when the entity column is the input's primary sort key, so it matches the
+  // physical id order of the store). Instead of a rowmap binary search per
+  // row, MERGE-WALK the column against the id-sorted rowmap in one linear pass
+  // (one `lower_bound` per parallel chunk, then a forward cursor), and reuse
+  // the previous result for consecutive duplicate ids so a repeated entity
+  // costs one SIMD distance, not N. Writes `out[i]` for every `i`:
+  //  * live member    -> `distanceToValueId(computer.atRow(row))`, where `row`
+  //                      is the SAME row `rowOf` would find, so the result is
+  //                      bit-identical to the per-row path's
+  //                      `distanceToValueId((*computer)(entity))`;
+  //  * everything else -> `onMiss(i)` (a non-member id, UNDEF, or -- for the
+  //                      `vec:distance` expression -- a per-row float-list
+  //                      literal; `onMiss` is only ever invoked for these
+  //                      NON-member rows, so members never pay for it).
+  // Runs in parallel over contiguous chunks capped at `numThreads` workers
+  // (<= 1, or a non-OpenMP build => serial); `isCancelled` is polled once per
+  // chunk (non-throwing -- a cancelled chunk leaves its caller-prefilled
+  // `out[i]`, and the caller raises the actual cancellation afterwards).
+  // `out.size()` must equal `ascendingEntities.size()`. `onMiss` and
+  // `isCancelled` may be called concurrently from the workers, so they must be
+  // thread-safe const reads (the expression's are).
+  void gatherSortedDistances(ql::span<const Id> ascendingEntities,
+                             const DistanceComputer& computer,
+                             absl::FunctionRef<Id(size_t)> onMiss,
+                             absl::FunctionRef<bool()> isCancelled,
+                             int numThreads, ql::span<Id> out) const;
 
  private:
   std::unique_ptr<Impl> impl_;

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,10 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "backports/algorithm.h"
 #include "services/vectorSearch/UsearchGraph.h"
@@ -492,12 +497,24 @@ std::optional<std::vector<float>> VectorIndex::getVector(Id entity) const {
 }
 
 // ____________________________________________________________________________
+Id distanceToValueId(float distance) {
+  return std::isnan(distance)
+             ? Id::makeUndefined()
+             : Id::makeFromDouble(static_cast<double>(distance));
+}
+
+// ____________________________________________________________________________
 float VectorIndex::DistanceComputer::operator()(Id entity) const {
   auto row = impl_->rowOf(entity);
   if (!row.has_value()) {
     return std::numeric_limits<float>::quiet_NaN();
   }
   return impl_->distanceToRow(queryBytes_.data(), row.value());
+}
+
+// ____________________________________________________________________________
+float VectorIndex::DistanceComputer::atRow(size_t row) const {
+  return impl_->distanceToRow(queryBytes_.data(), row);
 }
 
 // ____________________________________________________________________________
@@ -578,6 +595,102 @@ VectorIndex::makeDistanceComputerByEntity(Id entity) const {
   const char* stored = impl.rowPtr(row.value());
   std::vector<char> owned(stored, stored + impl.rowBytes());
   return DistanceComputer{&impl, std::move(owned)};
+}
+
+namespace {
+// Rows per contiguous chunk of the sorted merge-walk: each chunk pays ONE
+// `lower_bound` into the rowmap and then walks a forward cursor, so the whole
+// scan does ~one binary search per chunk instead of one per row. Also the
+// cancellation-poll granularity. Coarse on purpose (the per-row cost is one
+// pointer compare plus at most one SIMD kernel call).
+constexpr size_t GATHER_CHUNK = 1024;
+
+// Below this many rows the fork/join overhead of the parallel walk is not
+// worth it, so a small block stays serial (mirrors the per-row path's
+// threshold in `VectorDistanceExpression.cpp`).
+constexpr size_t GATHER_PARALLEL_THRESHOLD = 2048;
+}  // namespace
+
+// ____________________________________________________________________________
+void VectorIndex::gatherSortedDistances(ql::span<const Id> ascendingEntities,
+                                        const DistanceComputer& computer,
+                                        absl::FunctionRef<Id(size_t)> onMiss,
+                                        absl::FunctionRef<bool()> isCancelled,
+                                        int numThreads,
+                                        ql::span<Id> out) const {
+  const auto& impl = *impl_;
+  const size_t n = ascendingEntities.size();
+  AD_CORRECTNESS_CHECK(out.size() == n);
+  if (n == 0) {
+    return;
+  }
+  // The id-sorted rowmap as a contiguous, random-access span so each chunk can
+  // `lower_bound` its first id and then advance a local cursor.
+  const IdRowPair* rmBegin = impl.rowmap_.data();
+  const IdRowPair* rmEnd = rmBegin + impl.rowmap_.size();
+
+  // Process one contiguous chunk [lo, hi) of the ascending entity column. ONE
+  // binary search locates the chunk's first id in the rowmap; a LOCAL cursor
+  // `j` then walks forward as the (ascending) ids advance, so the matched row
+  // is exactly the one `rowOf` would return (same rowmap, same comparator).
+  // `j` is per-chunk scratch and every `out[i]` write is disjoint, so chunks
+  // are independent and safe to run concurrently.
+  auto processChunk = [&](size_t lo, size_t hi) {
+    const IdRowPair* j =
+        std::lower_bound(rmBegin, rmEnd, ascendingEntities[lo].getBits(),
+                         [](const IdRowPair& pair, uint64_t bits) {
+                           return pair.idBits_ < bits;
+                         });
+    for (size_t i = lo; i < hi; ++i) {
+      // Consecutive duplicate ids resolve to the same row/distance -- reuse the
+      // previous result instead of recomputing the SIMD distance.
+      if (i > lo && ascendingEntities[i] == ascendingEntities[i - 1]) {
+        out[i] = out[i - 1];
+        continue;
+      }
+      uint64_t bits = ascendingEntities[i].getBits();
+      while (j != rmEnd && j->idBits_ < bits) {
+        ++j;
+      }
+      if (j != rmEnd && j->idBits_ == bits) {
+        out[i] =
+            distanceToValueId(computer.atRow(static_cast<size_t>(j->row_)));
+      } else {
+        // Not a live member: defer to the caller's per-row handling (a
+        // non-member id, UNDEF, or a per-row float-list literal), keeping the
+        // fast path bit-identical to the per-row path for these rows too.
+        out[i] = onMiss(i);
+      }
+    }
+  };
+
+  const size_t numChunks = (n + GATHER_CHUNK - 1) / GATHER_CHUNK;
+#ifdef _OPENMP
+  if (numThreads > 1 && n >= GATHER_PARALLEL_THRESHOLD) {
+#pragma omp parallel for schedule(dynamic) num_threads(numThreads)
+    for (size_t c = 0; c < numChunks; ++c) {
+      // Non-throwing per-chunk cancellation poll: an exception must never
+      // unwind out of the OpenMP region, so a cancelled scan just leaves the
+      // remaining chunks' caller-prefilled `out[i]` and the caller raises the
+      // real cancellation afterwards.
+      if (isCancelled()) {
+        continue;
+      }
+      size_t lo = c * GATHER_CHUNK;
+      processChunk(lo, std::min(n, lo + GATHER_CHUNK));
+    }
+    return;
+  }
+#else
+  (void)numThreads;
+#endif
+  for (size_t c = 0; c < numChunks; ++c) {
+    if (isCancelled()) {
+      return;
+    }
+    size_t lo = c * GATHER_CHUNK;
+    processChunk(lo, std::min(n, lo + GATHER_CHUNK));
+  }
 }
 
 namespace {

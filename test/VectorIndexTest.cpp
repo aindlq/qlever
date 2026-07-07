@@ -260,6 +260,93 @@ TEST(VectorIndex, distanceComputerByEntity) {
 }
 
 // _____________________________________________________________________________
+// The sorted-input fast path (`gatherSortedDistances`, the merge-walk behind
+// `vec:distance` when the entity column is the leading sort key) must produce
+// results BIT-IDENTICAL to the per-row primitive `(*computer)(entity)`, for an
+// ascending column that mixes live members, interleaved non-members, and
+// consecutive DUPLICATE entities, and that exceeds the parallel threshold.
+// This simultaneously exercises `DistanceComputer::atRow`: every member's
+// `out[i]` is `distanceToValueId(computer.atRow(row))`, so matching the
+// reference proves `atRow(rowOf(id)) == (*computer)(id)`.
+TEST(VectorIndex, gatherSortedDistancesIsBitIdenticalToPerRow) {
+  auto b = buildTmp(/*withHnsw=*/false);
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+
+  // A fixed query point (a stored unit vector, so distances vary and one
+  // member sits at ~0).
+  auto computer = idx.makeDistanceComputer(b.data.vecs[3]);
+
+  // Build a strictly non-decreasing (by Id bits) column > the parallel
+  // threshold. Member ids are `mkId(1000 + 7*i)`; every other raw value is a
+  // NON-member. Consecutive duplicates are injected on both members and
+  // non-members. Ids are ascending because `mkId` is monotone in the raw
+  // value.
+  std::vector<Id> column;
+  bool sawMemberDup = false;
+  bool sawNonMemberUndef = false;
+  for (uint64_t v = 900; column.size() < 5000; ++v) {
+    Id id = mkId(v);
+    column.push_back(id);
+    if (v % 4 == 0) {
+      column.push_back(id);  // a consecutive duplicate
+    }
+    if (v % 40 == 0) {
+      column.push_back(id);  // occasionally a triple
+    }
+  }
+  ASSERT_GT(column.size(), 2048u);
+  ASSERT_TRUE(std::is_sorted(column.begin(), column.end(), [](Id a, Id c) {
+    return a.getBits() < c.getBits();
+  }));
+
+  // The serial per-row REFERENCE, computed only through the public per-row
+  // primitive `(*computer)(entity)` + the shared distance->Id mapping.
+  std::vector<Id> reference(column.size());
+  for (size_t i = 0; i < column.size(); ++i) {
+    reference[i] = qlever::vector::distanceToValueId(computer(column[i]));
+    if (reference[i].isUndefined()) {
+      sawNonMemberUndef = true;
+    }
+    if (i > 0 && column[i] == column[i - 1] && !reference[i].isUndefined()) {
+      sawMemberDup = true;
+    }
+  }
+  ASSERT_TRUE(sawMemberDup) << "the column must contain a duplicated member";
+  ASSERT_TRUE(sawNonMemberUndef)
+      << "the column must contain an interleaved non-member";
+
+  // At this layer a non-member is genuinely UNDEF (no vocab/float-list to
+  // resolve), matching the reference's NaN->UNDEF.
+  auto undefOnMiss = [](size_t) { return Id::makeUndefined(); };
+  auto neverCancel = [] { return false; };
+
+  // Parallel walk (numThreads > 1 exercises the OpenMP chunked branch).
+  std::vector<Id> parallelOut(column.size());
+  idx.gatherSortedDistances(column, computer, undefOnMiss, neverCancel,
+                            /*numThreads=*/4, parallelOut);
+  // Serial walk (numThreads == 1 forces the serial branch).
+  std::vector<Id> serialOut(column.size());
+  idx.gatherSortedDistances(column, computer, undefOnMiss, neverCancel,
+                            /*numThreads=*/1, serialOut);
+  // A second parallel run, for determinism.
+  std::vector<Id> parallelOut2(column.size());
+  idx.gatherSortedDistances(column, computer, undefOnMiss, neverCancel,
+                            /*numThreads=*/4, parallelOut2);
+
+  for (size_t i = 0; i < column.size(); ++i) {
+    ASSERT_EQ(parallelOut[i], reference[i]) << "parallel row " << i;
+    ASSERT_EQ(serialOut[i], reference[i]) << "serial row " << i;
+    ASSERT_EQ(parallelOut2[i], parallelOut[i]) << "determinism row " << i;
+    // Consecutive duplicate ids resolve to identical results.
+    if (i > 0 && column[i] == column[i - 1]) {
+      ASSERT_EQ(parallelOut[i], parallelOut[i - 1]) << "dup row " << i;
+    }
+  }
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
 TEST(VectorIndex, exactSearchOverCandidateSubset) {
   auto b = buildTmp(/*withHnsw=*/false);
   VectorIndex idx;

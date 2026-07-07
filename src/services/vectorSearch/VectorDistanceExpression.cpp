@@ -220,11 +220,12 @@ ResolvedSource resolveSource(const E& element, const VectorIndex& vidx,
   return std::move(floats).value();
 }
 
-// Convert a raw distance (`NaN` = no result) to the result `Id`.
+// Convert a raw distance (`NaN` = no result) to the result `Id`. Forwards to
+// the shared `qlever::vector::distanceToValueId` so the per-row path and the
+// sorted merge-walk fast path (`VectorIndex::gatherSortedDistances`) use the
+// EXACT same mapping and stay bit-identical.
 Id toDistanceId(float distance) {
-  return std::isnan(distance)
-             ? Id::makeUndefined()
-             : Id::makeFromDouble(static_cast<double>(distance));
+  return qlever::vector::distanceToValueId(distance);
 }
 
 // The one-shot distance between two resolved sources (used when neither side
@@ -413,6 +414,105 @@ ExpressionResult VectorDistanceExpression::evaluate(
     return out;
   };
 
+  // Sorted-input fast path: the per-row source is a BARE VARIABLE whose column
+  // is the input's PRIMARY sort key, so the entity column is ascending by
+  // `Id` bits -- the SAME order the flat store is physically laid out in.
+  // Instead of a rowmap binary search per row (`perRowAgainstConstant`), do
+  // ONE parallel merge-walk of the column against the id-sorted rowmap, with
+  // dedup of consecutive duplicate entities. Bit-identical to
+  // `perRowAgainstConstant`: for a live member the walk finds the row `rowOf`
+  // would, so `computer.atRow(row) == (*computer)(entity)`; non-members (and
+  // any per-row float-list literal) fall through to the SAME `resolveSource`
+  // closure the per-row path uses (`onMiss`).
+  auto sortedFastPath = [&](const ResolvedSource& constant,
+                            ColumnIndex colIdx) -> ExpressionResult {
+    if (std::holds_alternative<std::monostate>(constant)) {
+      // The fixed side resolves to no vector -> every row is UNDEF.
+      return Id::makeUndefined();
+    }
+    std::optional<VectorIndex::DistanceComputer> computer =
+        std::holds_alternative<Id>(constant)
+            ? vidx.makeDistanceComputerByEntity(std::get<Id>(constant))
+            : std::optional{vidx.makeDistanceComputer(
+                  std::get<std::vector<float>>(constant))};
+    AD_CORRECTNESS_CHECK(computer.has_value());
+
+    // The sorted entity column, sliced to this block's [_beginIndex,
+    // _endIndex) -- exactly the ids the per-row path would materialize via
+    // `getIdsFromVariable`.
+    ql::span<const Id> completeColumn = context->_inputTable.getColumn(colIdx);
+    AD_CORRECTNESS_CHECK(context->_beginIndex <= context->_endIndex &&
+                         context->_endIndex <= completeColumn.size());
+    ql::span<const Id> column{completeColumn.begin() + context->_beginIndex,
+                              completeColumn.begin() + context->_endIndex};
+    AD_CORRECTNESS_CHECK(column.size() == resultSize);
+
+    VectorWithMemoryLimit<Id> out{context->_allocator};
+    out.resize(resultSize, Id::makeUndefined());
+    context->cancellationHandle_->throwIfCancelled();
+
+    // The EXACT per-row closure the fallback uses, reused for NON-member rows
+    // only (the merge-walk resolves members cheaply via `atRow`). Pure const
+    // reads, so it is safe to call from the parallel workers.
+    auto onMiss = [&](size_t i) -> Id {
+      ResolvedSource row = resolveSource(column[i], vidx, indexName_, context,
+                                         SourceMode::PerRow);
+      if (const Id* entity = std::get_if<Id>(&row)) {
+        return toDistanceId((*computer)(*entity));
+      }
+      if (const auto* vec = std::get_if<std::vector<float>>(&row)) {
+        return toDistanceId((*computer)(*vec));
+      }
+      return Id::makeUndefined();
+    };
+
+    int numThreads = 1;
+#ifdef _OPENMP
+    numThreads = vectorDistanceThreadCap();
+#endif
+    vidx.gatherSortedDistances(
+        column, *computer, onMiss,
+        [&] { return context->cancellationHandle_->isCancelled(); }, numThreads,
+        out);
+    // A cancelled scan leaves un-filled slots at UNDEF; raise the real
+    // timeout/manual-cancel exception with the proper message.
+    context->cancellationHandle_->throwIfCancelled();
+
+    // Count the produced (non-UNDEF) distances for the summary log, matching
+    // the per-row path's accounting (each non-UNDEF row, duplicates included).
+    for (const Id& id : out) {
+      if (!id.isUndefined()) {
+        ++numDistances;
+      }
+    }
+    return out;
+  };
+
+  // Try the sorted fast path for a `constant` vs a per-row source; falls back
+  // to `perRowAgainstConstant` unless the per-row source is a bare variable
+  // (checked via the expression API) whose column is the input's leading sort
+  // key (so the column is ascending by `Id` bits).
+  auto againstConstant =
+      [&](ResolvedSource constant, auto&& perRowInput,
+          [[maybe_unused]] const SparqlExpression* perRowExpr)
+      -> ExpressionResult {
+    using In = std::decay_t<decltype(perRowInput)>;
+    if constexpr (std::is_same_v<In, ::Variable>) {
+      std::optional<::Variable> exprVar = perRowExpr->getVariableOrNullopt();
+      // The evaluated result IS the (bare) variable, so its column is the
+      // actual input data column that the per-row path would read.
+      const ::Variable& var = perRowInput;
+      std::optional<ColumnIndex> colIdx =
+          context->getColumnIndexForVariable(var);
+      if (exprVar.has_value() && colIdx.has_value() &&
+          !context->_columnsByWhichResultIsSorted.empty() &&
+          colIdx.value() == context->_columnsByWhichResultIsSorted.front()) {
+        return sortedFastPath(constant, colIdx.value());
+      }
+    }
+    return perRowAgainstConstant(constant, AD_FWD(perRowInput));
+  };
+
   // Both sources per-row: materialize both columns, then compute each pair via
   // `fillDistances` (parallel for a large block). `pairDistance` dispatches to
   // the const `VectorIndex::distance` overloads (rowmap lookups + local encode
@@ -475,16 +575,14 @@ ExpressionResult VectorDistanceExpression::evaluate(
           }
           return distance;
         } else if constexpr (isConstantResult<T1>) {
-          return perRowAgainstConstant(
-              resolveSource(in1, vidx, indexName_, context,
-                            SourceMode::Constant),
-              AD_FWD(in2));
+          return againstConstant(resolveSource(in1, vidx, indexName_, context,
+                                               SourceMode::Constant),
+                                 AD_FWD(in2), sources_[1].get());
         } else if constexpr (isConstantResult<T2>) {
           // All supported metrics are symmetric, so the sides may swap.
-          return perRowAgainstConstant(
-              resolveSource(in2, vidx, indexName_, context,
-                            SourceMode::Constant),
-              AD_FWD(in1));
+          return againstConstant(resolveSource(in2, vidx, indexName_, context,
+                                               SourceMode::Constant),
+                                 AD_FWD(in1), sources_[0].get());
         } else {
           return perRowPair(AD_FWD(in1), AD_FWD(in2));
         }
