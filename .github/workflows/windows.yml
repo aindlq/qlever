@@ -141,6 +141,11 @@ jobs:
       # unit tests into one executable: static test exes are large, and one binary
       # keeps the runner's disk in check. _NO_TIMING_TESTS=ON: the sleep-precision
       # timing tests are flaky on the shared-CPU runner (~15.6 ms tick), as on macOS.
+      # COMPILER_SUPPORTS_MARCH_NATIVE=FALSE keeps the shipped binary portable: fsst
+      # (the vocabulary compressor) otherwise compiles with -march=native, targeting
+      # the build runner's CPU, so the artifact SIGILLs on any host with an older ISA
+      # -- e.g. the separate runner the e2e job runs on. Matches the Dockerfile, the
+      # macOS CI, and build-windows.sh.
       - name: Configure CMake
         shell: bash
         run: |
@@ -148,7 +153,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} \
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/build/conan_toolchain.cmake" \
             -DSINGLE_TEST_BINARY=ON \
-            -D_NO_TIMING_TESTS=ON
+            -D_NO_TIMING_TESTS=ON \
+            -DCOMPILER_SUPPORTS_MARCH_NATIVE=FALSE
 
       - name: Build
         shell: bash
