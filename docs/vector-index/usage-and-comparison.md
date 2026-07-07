@@ -1,88 +1,92 @@
-# Vector search in QLever — SPARQL usage & how it differs from PR #3043
+# Vector search in QLever — building, querying, and how it works
 
-Three parts: (1) how you **build** an index — the inputs and the settings config;
-(2) how you **query** it from SPARQL, use case by use case; (3) how the
-storage/query mechanism differs from the in-house embeddings PR
-[ad-freiburg/qlever#3043](https://github.com/ad-freiburg/qlever/pull/3043), and
-why. For more build detail see [`indexing.md`](indexing.md); for the rationale
-see [`index-payload-design.md`](index-payload-design.md).
+Four parts: (1) how you **build** an index; (2) the **runtime** (server-start)
+config; (3) how you **query** it from SPARQL; (4) how it **works** inside. A
+short final section contrasts the design with PR #3043. See also
+[`indexing.md`](indexing.md) and, for the rationale,
+[`index-payload-design.md`](index-payload-design.md).
 
 ## Part 1 — Building an index
 
-Vectors are payload, not RDF, so you don't write them as triples. You point
-`qlever-index` at a **binary bundle** (the vectors) plus a small **config**,
-passed as the `--service-index` JSON. That JSON is `{"vectorSearch": [ … ]}`;
-each array entry builds one named index.
+Vectors are payload, not RDF, so you don't write them as triples. You hand
+`qlever-index` a **`.npy` matrix + a list of entity IRIs**, plus a small config
+in the `--service-index` JSON (`{"vectorSearch": [ … ]}`; each array entry
+builds one named index):
 
 ```bash
 qlever-index -i myindex -f kg.ttl -F ttl \
   --service-index '{"vectorSearch":[
      {"name":"emb","npy":"emb.npy","iris":"emb.iris",
-      "metric":"cosine","scalar":"bf16","hnsw":true}
+      "metric":"dot","scalar":"bf16","hnsw":true}
   ]}'
 ```
 
-This builds the normal QLever index from `kg.ttl`, then the vector index `emb`
-from the bundle. It's reachable in queries as `vidx:emb`
-(= `<…/vectorSearch/index/emb>`), the same IRI you introspect.
+This builds the normal QLever index from `kg.ttl`, then the vector index `emb`.
+It's reachable in queries as `vidx:emb` (= `<…/vectorSearch/index/emb>`), the
+same IRI you introspect.
 
-### Input — exactly one source per index
+### Input
 
-- **`npy`** *(recommended)* — an `N × D` matrix `.npy`, **float32** (`<f4`) or
-  **ml_dtypes bfloat16** (`<V2`), C-order; row *i* is entity *i*'s vector. Paired
-  with `iris`. The bulk path (near-zero-copy for the ×64 dims real models use).
-- **`texts`** — a text file, one item per line; the builder **embeds each line
-  at build time** via `embeddingUrl`/`embeddingModel` — no precompute. Paired
-  with `iris`.
-- **`parquet`** — a Parquet file with a `uri` column and an `embedding` column
-  (opt-in; needs Arrow, `-DQLEVER_VECTOR_SEARCH_PARQUET=ON`). Its `uri` column
-  supplies the IRIs, so `iris` is optional.
+- **`npy`** — an `N × D` matrix `.npy`, **float32** (`<f4`) or **ml_dtypes
+  bfloat16** (`<V2`), C-order; row *i* is entity *i*'s vector. (Near-zero-copy
+  for the ×64 dims real models use.)
+- **`iris`** — one **entity IRI per line** (bare `http://…/doc1` or bracketed
+  `<http://…/doc1>`), row-aligned with the matrix; each IRI must already exist in
+  the KG (otherwise that row is skipped with a warning).
 
-`iris` is one **entity IRI per line** (bare `http://…/doc1` or bracketed
-`<http://…/doc1>`), row-aligned with the matrix; each IRI must already exist in
-the KG (otherwise that row is skipped with a warning).
+Vectors are **precomputed**: embed your corpus offline with any pipeline and
+`np.save` an `fp32` or `ml_dtypes` `bf16` array. (Embedding a *query* at query
+time is a separate, runtime-configured concern — Part 2 — not a build input.)
 
-### Settings keys (one `vectorSearch` entry)
+### Settings keys
 
 | key | default | meaning |
 |---|---|---|
 | `name` | — | index name → `vidx:<name>` in queries |
-| `npy` / `texts` / `parquet` | — | the input source — **exactly one** |
-| `iris` | — | row-aligned entity-IRI list (for `npy`/`texts`) |
+| `npy` | — | the `.npy` matrix (the vectors) |
+| `iris` | — | row-aligned entity-IRI list |
 | `metric` | `cosine` | `cosine` \| `dot` \| `l2` — the space's metric (distance is smaller-is-closer) |
 | `scalar` | `f32` | storage precision `f32` \| `f16` \| `bf16` \| `i8`, **independent** of the `.npy` dtype (an `<f4` file + `scalar:"bf16"` stores 2-byte bf16) |
-| `dimensions` | *(inferred)* | if set, cross-checked against the source → **hard error** on mismatch (handy for matryoshka) |
+| `dimensions` | *(inferred)* | if set, cross-checked against the `.npy` shape → **hard error** on mismatch |
 | `hnsw` | `true` | build the HNSW graph (required for the `SERVICE`; exact brute force works without it) |
 | `hnswConnectivity` | `16` | HNSW graph degree (M) |
 | `hnswExpansionAdd` | `128` | HNSW build-time `ef` |
 | `hnswExpansionSearch` | `64` | HNSW query-time `ef` (recall vs. latency) |
-| `embeddingUrl` | — | query-time embed endpoint: `http(s)://host:port` **or** `unix:/path/to.sock` (client appends `/v1/embeddings`); optional at build for `npy`/`parquet`, persisted if given; can be **set/changed at server start** via `QLEVER_VECTOR_SEARCH_ENDPOINTS` (see below) |
-| `embeddingModel` | — | model name sent to the endpoint; also the **model identity** stamped into the typed query literal (comparability); same build-time optionality and server-start override as `embeddingUrl` |
 | `buildThreads` | `0` (auto) | index-build parallelism |
-| `alignRows` | `false` | pad each row to a 64-byte SIMD boundary (a no-op for ×64 dims) |
-| `preload` | `none` | residency: `none` (mmap) \| `advise` \| `lock` (mlock) \| `aligned` (huge-page copy) — pin a hot, fits-in-RAM index; can be **set/overridden at server start** via `QLEVER_VECTOR_SEARCH_ENDPOINTS` (see below; applied when the index is opened at startup, no rebuild) |
 | `remap` | `false` | on KG rebuild, re-resolve IRIs + rewrite only the id sidecar (keep the matrix) |
 
 For **normalized** embeddings (SigLIP2, Qwen3): use `metric:"dot"` (cosine ≡ dot
 on unit vectors, and dot skips the norm) and `scalar:"bf16"` (half the RAM,
-lossless from the fp32/bf16 input). `embeddingUrl`/`embeddingModel` are needed
-only for query-time `vec:embed` (text/image queries); a vector-only index can
-omit them and query with entity / inline / `vec:vector` sources.
+lossless from the fp32/bf16 input).
 
-Both — and `preload` — can also be **set or changed at server start — no
-rebuild** — via the environment variable `QLEVER_VECTOR_SEARCH_ENDPOINTS`, a
-JSON object keyed by index name with per-index optional
-`embeddingUrl`/`embeddingModel`/`preload` fields, e.g. `{"images":
-{"embeddingUrl": "unix:/siglip2.private", "embeddingModel": "siglip"},
-"metadata": {"preload": "lock"}}`. Only the fields present are overridden, and
-the override is **in-memory only** (the persisted `.meta` is never rewritten),
-so it is reapplied at every server start. A `preload` override
-(`none|advise|lock|aligned`) lets an operator lock an index in RAM without
-rebuilding it; residency is applied when the index is opened at server
-startup, so unlike the endpoint fields it cannot change on a running server
-(and `"none"` cannot downgrade a persisted stronger setting).
+## Part 2 — Runtime (server-start) configuration
 
-## Part 2 — Querying it from SPARQL
+Two things are **serving** concerns, not index data — the query-time embedding
+endpoint and RAM residency — so they are set at **server start**, never at build
+and never persisted in the index. They come from one environment variable,
+`QLEVER_VECTOR_SEARCH_ENDPOINTS`, a JSON object keyed by index name:
+
+```yaml
+# docker-compose
+environment:
+  QLEVER_VECTOR_SEARCH_ENDPOINTS: >
+    {"emb":    {"embeddingUrl":"unix:/qwen3.private","embeddingModel":"qwen3","preload":"lock"},
+     "images": {"embeddingUrl":"http://siglip:8000","embeddingModel":"siglip","preload":"aligned"}}
+```
+
+| field | meaning |
+|---|---|
+| `embeddingUrl` | query-time embed endpoint for `vec:embed`: `http(s)://host:port` **or** `unix:/path/to.sock` (the client POSTs to `/v1/embeddings`) |
+| `embeddingModel` | model name sent to the endpoint; also the **model identity** stamped into the typed query literal (comparability) |
+| `preload` | RAM residency: `none` (mmap) \| `advise` (madvise) \| `lock` (mlock) \| `aligned` (huge-page copy) — pin a hot, fits-in-RAM index |
+
+To move an endpoint or lock an index: edit the env and **restart** the server —
+no rebuild. `preload:"lock"`/`"aligned"` on a large index needs the container
+allowed to lock that much memory (`ulimits: memlock: -1`, or `cap_add:
+[IPC_LOCK]`). An index with no `embeddingUrl` still answers entity / inline /
+`vec:vector` queries — only `vec:embed` needs the endpoint.
+
+## Part 3 — Querying from SPARQL
 
 Every query uses these prefixes:
 
@@ -97,11 +101,24 @@ introspect and the one you search. The three functions:
 | function | meaning |
 |---|---|
 | `vec:distance(vidx:X, S1, S2)` | uniform **smaller-is-closer** distance between two *sources*; each source is an entity (→ its stored vector) or a query vector |
-| `vec:embed(vidx:X, input)` | embed text / an image IRI via index X's configured endpoint → a query vector |
-| `vec:vector(vidx:X, ?e)` | entity `?e`'s stored vector *from index X* as a query vector (for cross-index) |
+| `vec:embed(vidx:X, input)` | embed text / an image IRI via index X's endpoint → a query vector |
+| `vec:vector(vidx:X, ?e)` | entity `?e`'s stored vector *from index X* as a query vector |
 
 The metric (cosine / dot / l2) is a property of the index, so there is **one**
 distance function — you never pass a metric, and every ranking is `ORDER BY ?d ASC`.
+
+**What `vec:embed` and `vec:vector` return** — a **typed float-list literal**,
+the value `vec:distance` consumes (they are never usually projected, but if you
+`SELECT` one you'd see):
+
+```
+vec:embed(vidx:emb, "a red bicycle")  →  "0.13,-0.02, … ,0.08"^^<https://qlever.cs.uni-freiburg.de/vectorSearch/vec/qwen3/bf16>
+vec:vector(vidx:emb, <doc/42>)        →  "0.51,0.09, … ,-0.11"^^<https://qlever.cs.uni-freiburg.de/vectorSearch/vec/qwen3/bf16>
+```
+
+The datatype `…/vec/MODEL/PRECISION` (MODEL = the index's `embeddingModel`,
+PRECISION = its `scalar`) travels with the value, so `vec:distance` can check
+that a query vector belongs to the space it's comparing against.
 
 ### Use case 1 — semantic search by text
 ```sparql
@@ -140,11 +157,18 @@ SELECT ?a ?b ?d WHERE {
 ```
 No embedding, no query vector — both vectors are already in the index.
 
-### Use case 4 — a precomputed query vector (inline)
+### Use case 4 — a precomputed query vector (inline, typed)
 ```sparql
-BIND(vec:distance(vidx:emb, ?e, "0.12,-0.03, … ,0.44") AS ?d)
+BIND(vec:distance(vidx:emb, ?e,
+     "0.12,-0.03, … ,0.44"^^<https://qlever.cs.uni-freiburg.de/vectorSearch/vec/qwen3/bf16>) AS ?d)
 ```
-A comma-separated float string is parsed as the query vector (dimension checked).
+Give the vector as a comma-separated float string **carrying the space datatype**
+`…/vec/MODEL/PRECISION` — the same shape `vec:embed`/`vec:vector` return.
+`vec:distance` validates the datatype's **model + precision** and the **float
+count (dimension)** against the index; a mismatch is UNDEF, not a wrong number.
+(A bare float string with no datatype is still accepted, but then only the
+dimension is checked — you lose the model/precision guard, so prefer the typed
+form.)
 
 ### Use case 5 — cross-index (two indices, same model & precision)
 ```sparql
@@ -156,11 +180,11 @@ SELECT ?a ?p ?d WHERE {
 ```
 `vec:vector(vidx:photo, ?p)` pulls `?p`'s vector out of the *photo* index tagged
 with its model+precision; `vec:distance` checks that against `vidx:artwork`
-(**model + precision + dimension**) → matches compute, a mismatch is UNDEF, not a
-garbage number. (Simplest alternative: if both are the same model, put them in
-**one** index and `vec:distance(vidx:visual, ?a, ?p)`.)
+(**model + precision + dimension**) → matches compute, a mismatch is UNDEF.
+(Simplest alternative: if both are the same model, put them in **one** index and
+`vec:distance(vidx:visual, ?a, ?p)`.)
 
-### Use case 6 — whole-index top-k, exact (no index, no SERVICE)
+### Use case 6 — whole-index top-k, exact (no SERVICE)
 ```sparql
 SELECT ?doc ?d WHERE {
   ?doc <hasEmbedding> ?anything .                     # any pattern that enumerates the members
@@ -168,12 +192,12 @@ SELECT ?doc ?d WHERE {
   FILTER(BOUND(?d))
 } ORDER BY ?d LIMIT 10
 ```
-Search is just `ORDER BY distance LIMIT k`. Fine to a few million vectors.
+Search is just `ORDER BY distance LIMIT k` — exact, brute-force, parallel across
+cores (Part 4). Fine into the millions of vectors.
 
 ### Use case 7 — whole-index top-k, accelerated (HNSW `SERVICE`)
-For huge unfiltered top-k, the opt-in HNSW graph via the `SERVICE` block (exact
-never needs it; HNSW is always explicit). See `indexing.md` for the `hnsw:true`
-build key and the SERVICE shape.
+For a huge *unfiltered* top-k, the opt-in HNSW graph via the `SERVICE` block
+(exact never needs it; HNSW is always explicit). See `indexing.md` for the shape.
 
 ### Use case 8 — introspect an index (it's a real RDF resource)
 ```sparql
@@ -182,81 +206,82 @@ SELECT ?model ?dim ?metric ?count WHERE {
 }
 ```
 
----
+## Part 4 — How it works
 
-## Part 3 — How our mechanism differs from PR #3043, and why
+The *decision* (a vector is searchable **payload**, not RDF) and its rationale
+live in [`index-payload-design.md`](index-payload-design.md); this is the
+mechanism, concisely.
 
-Both projects independently reached the *same core insight* — a vector is a
-first-class thing decoded to a compact sidecar, not re-parsed per query, and the
-embedding "type" is a queryable RDF resource. Where we diverge is **what the
-vector *is*** and **how it's laid out**, and that drives everything else.
+- **Storage.** Each index is one contiguous, fixed-stride, **bytes-only** matrix
+  for a single `(model, dim, precision)` space, `mmap`'d — vectors never enter
+  the vocabulary, permutations, or any triple. Rows are stored in **entity-id
+  order** (the builder sorts by entity id and gathers the matrix in that order).
+  Two small sidecars bridge the two directions: `keys` (row → id, monotonic) and
+  `rowmap` (id → row, id-sorted for `lower_bound`). *Why id-sorted:* a
+  filtered/whole-index scan then reads the matrix **sequentially**
+  (prefetch-friendly), the result stays merge-joinable with QLever's sorted
+  world, and the same matrix backs the HNSW graph.
 
-### Storage
+- **Precision & SIMD.** The stored scalar (`f32`/`f16`/`bf16`/`i8`) is used
+  **as-is** — no up-conversion. Distances run through NumKong kernels that
+  runtime-dispatch to the widest ISA the CPU has (AVX-512 FP16/BF16, AMX, NEON,
+  …), reported once at startup (`Vector search SIMD: …`). *Why:* a brute-force
+  scan is memory-bandwidth-bound, so storing at the target precision (`bf16` = 2
+  bytes) directly halves the bytes read; decoding to fp32 first would throw that
+  away.
+
+- **One distance, exact + ANN.** A single punned metric backs both the exact
+  scan and the HNSW graph, so their distances are identical. Every metric is
+  normalized to **smaller-is-closer** (`cosine → 1−cos`, `dot → 1−dot`, `l2 →
+  distance`).
+
+- **Brute-force query.** `ORDER BY vec:distance(...) LIMIT k` is exact top-k: it
+  scores **every** candidate (the `LIMIT` trims the output, not the work), then
+  sorts. The scan is **parallelized across cores** (OpenMP; bound by the
+  *aggregate* memory bandwidth). When the per-row entity column is the query
+  result's **leading sort key** — the common `?e … BIND(vec:distance)` after a
+  join — it takes a **merge-walk** fast path: one `lower_bound` per chunk then a
+  linear walk of the id-sorted rowmap instead of a binary search per row, and
+  **consecutive duplicate entities are scored once**. Sub-linear HNSW top-k is
+  opt-in via the `SERVICE` only; the planner never silently rewrites an exact
+  `ORDER BY … LIMIT` into an ANN lookup.
+
+- **Query values are transient.** `vec:embed` (text/image → endpoint) and
+  `vec:vector` (an entity's stored vector) both yield a **typed float-list
+  literal** `"…"^^<…/vec/model/precision>` — a value that lives only for the
+  query, never a stored term. `vec:distance` validates that datatype's model +
+  precision + dimension against the index it's called on and returns UNDEF on a
+  mismatch, which is what makes cross-index distance safe.
+
+- **Load & config.** At startup the loader auto-discovers each
+  `‹basename›.vec.‹name›.meta`, `mmap`s the matrix + HNSW, materializes the
+  index's metadata triples (`vec:model/dimension/metric/count`) as delta triples
+  on the `vidx:‹name›` resource, and applies the `QLEVER_VECTOR_SEARCH_ENDPOINTS`
+  env (endpoint + residency) in memory. Nothing about serving is baked into the
+  index — no re-passing of `--service-index` to `qlever-server`.
+
+## Part 5 — How the design differs from PR #3043
+
+Both projects reached the same *native-first* instinct — a vector decoded to a
+compact sidecar, not re-parsed per query, and the embedding "type" as a queryable
+RDF resource. The divergence is **what the vector *is***.
 
 | | **PR #3043** | **Ours (index-payload)** |
 |---|---|---|
-| A vector is… | a first-class **RDF literal** `"[…]"^^emb:fp32Vector` | **index payload** — bytes in a `VectorIndex`, *not* an RDF term |
-| Where it lives | the vocabulary (`EmbeddingVocabulary`) + a `.embvec` sidecar | an **entity-keyed, per-space, contiguous, fixed-stride** array (+ optional HNSW) |
-| Layout | one blob in **vocabulary order**, offset-table addressed | a packed SIMD-aligned matrix per `(model,dim,precision)` space |
-| Per-embedding RDF | reified: `<e> emb:hasEmbedding _:b . _:b emb:asFp32Vector … ; emb:type …` | **none** — vectors never enter the vocab/permutations/triples |
-| Precision | fp32 | f32 / f16 / **bf16** / i8 |
+| A vector is… | a first-class **RDF literal** `"[…]"^^emb:fp32Vector` in the vocabulary | **index payload** — bytes in a per-space matrix, never an RDF term |
+| Per-embedding RDF | reified `<e> emb:hasEmbedding _:b . _:b emb:asFp32Vector … ; emb:type …` | **none** (metadata is once **per index**, not per embedding) |
+| Precision | fp32 | f32 / f16 / **bf16** / i8, stored + scanned as-is |
+| Query vector | a materialised RDF literal you pass in | a **transient** typed value from `vec:embed`/`vec:vector`/inline |
+| Query-time embedding | none — precompute externally | **`vec:embed`** (text/image; http or `unix:` socket) |
+| ANN | none — brute-force only | optional **HNSW** via `SERVICE` (exact is the default) |
+| Comparability | pass the `type` IRI; hard error on mismatch | model+precision in the typed literal, validated → **UNDEF** on mismatch |
 
-**Why not RDF literals.** We pressure-tested exactly #3043's choice and dropped
-it, for three concrete reasons:
-1. **No real use case** for `SELECT`/`CONSTRUCT` of a raw vector — entity-to-entity
-   similarity passes the *entity* (the function looks the vector up), bulk export
-   wants a binary dump not float-text, arithmetic is app-layer.
-2. **The literal wastes storage and negates precision.** The decimal/JSON text is
-   full-precision regardless of storage precision, so an `i8` vector (512 bytes)
-   carries a ~4 KB text twin — ~8× the payload, defeating quantisation.
-3. **Per-embedding reification doesn't scale.** #3043's blank-node modeling is
-   ~3 triples + a blank node per embedding, materialised across all six
-   permutations — ≈ 1.8 B permutation entries at 100 M vectors, versus **zero**
-   for us. The type is a property of the *space*, not the instance.
-
-**Why a contiguous per-space array.** #3043's `.embvec` is one vocabulary-ordered
-blob addressed by an offset table — reading the vectors for a query is a
-**random** positioned read per vector, models interleaved. Ours is a contiguous,
-fixed-stride, SIMD-aligned matrix per space, so a brute-force scan streams
-sequentially through NumKong's per-precision SIMD kernels (and it *is* the HNSW
-graph's backing). That contiguous array is the real "index" — even without ANN.
-
-### Query
-
-| | **PR #3043** | **Ours** |
-|---|---|---|
-| Distance | one `embf:distance(a, b, type)`; metric from the `type` resource | one `vec:distance(<idx>, S1, S2)`; metric from the index |
-| Query vector | a materialised RDF literal you pass in | a *transient* value from `vec:embed`/`vec:vector`/inline — never a stored term |
-| Query-time embedding | **none** — precompute externally (a Python script) | **`vec:embed`** — text/image via a server endpoint (http(s) **or** `unix:` socket) |
-| ANN | **none** — brute-force only | optional **HNSW** via `SERVICE` (brute-force is the default) |
-| Comparability | pass the `type` IRI; **hard error** on mismatch | model+precision carried in the query-side **typed literal**, validated (+ dim) → **UNDEF** on mismatch |
-| Introspection | `emb:type` resource with metric/dim/precision triples | `vidx:X` resource with `vec:model/dimension/metric/count` triples |
-
-**Why these differ.**
-- **Query-time embedding.** #3043 can only rank against a vector you computed
-  offline; you can't "search by text/image" from SPARQL. We embed at query time
-  (`vec:embed`), so a plain text or image query works — and because the endpoint
-  is bound to the index, the query lands in the same space that built it.
-- **HNSW.** #3043 is exact-only. We keep exact brute-force as the default (it's
-  just `ORDER BY distance LIMIT`) and add HNSW as an explicit opt-in for
-  unfiltered top-k over an index too large to scan. Search is never a magic
-  operator; it's the same SPARQL, sub-linear only when you ask.
-- **Comparability via a transient typed literal.** #3043 makes you name the
-  `type` and hard-errors on mismatch. We keep the vector out of RDF, but let the
-  *query-side* value (from `vec:embed`/`vec:vector`) be a transient typed literal
-  `^^<…/vec/model/precision>`; `vec:distance` validates it against the index
-  (model + precision + dim) and returns UNDEF on mismatch — which is what makes
-  **cross-index** distance safe, and is SPARQL-idiomatic (a bad row drops, the
-  query survives).
-- **Introspection — where we converged.** Both make the space a queryable RDF
-  resource. We adopted that idea, but attach the metadata **once per index**
-  (auto-materialised at load) rather than per embedding.
-
-### One-line summary
-#3043 stores vectors *as RDF you can SELECT* and searches them pairwise, exact,
-from precomputed literals. We store vectors *as searchable index payload* — a
-compact per-space SIMD array you never SELECT — reached by one distance function,
-embedded at query time, optionally HNSW-accelerated, with the index as the only
-RDF surface. Same native-first instinct; opposite answer to "is a vector a term
-or a payload," and that choice is what buys the storage, the scan speed, the
-query-time embedding, and the ANN path.
+**Why not RDF literals** (we built and dropped exactly #3043's choice): there is
+no real `SELECT`/`CONSTRUCT` use for a raw vector (entity↔entity passes the
+*entity*; bulk export wants binary, not float-text); the literal is
+full-precision text regardless of storage precision, so an `i8` vector carries a
+~8× text twin and quantisation buys nothing; and per-embedding reification is ~3
+triples + a blank node × six permutations ≈ **1.8 B entries at 100 M vectors**
+versus **zero** for us. Keeping the vector out of RDF is what enables the
+compact, id-sorted, per-precision SIMD matrix — and with it the sequential scan,
+the parallel + merge-walk query path, query-time embedding, and the ANN option.
