@@ -53,10 +53,16 @@ class Bind : public Operation {
   static IdTable cloneSubView(const IdTable& idTable,
                               const std::pair<size_t, size_t>& subrange);
 
-  // Implementation for the binding of arbitrary expressions.
+  // Implementation for the binding of arbitrary expressions. `totalInputSize`
+  // is the number of rows of the WHOLE input this `Bind` runs over (which
+  // differs from `idTable.size()` on the lazy/chunked path, where `idTable` is
+  // just one chunk); it is threaded onto the `EvaluationContext` so an
+  // expression can distinguish a whole-input scan from a chunk. Pass 0 when the
+  // total is unknown (a fully lazy input).
   IdTable computeExpressionBind(
       LocalVocab* localVocab, IdTable idTable,
-      const sparqlExpression::SparqlExpression* expression) const;
+      const sparqlExpression::SparqlExpression* expression,
+      size_t totalInputSize) const;
 
   [[nodiscard]] VariableToColumnMap computeVariableToColumnMap() const override;
 };

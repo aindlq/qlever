@@ -195,6 +195,21 @@ SELECT ?doc ?d WHERE {
 Search is just `ORDER BY distance LIMIT k` — exact, brute-force, parallel across
 cores (Part 4). Fine into the millions of vectors.
 
+**Optional HNSW acceleration (approximate).** A constant non-negative integer
+fourth argument, `vec:distance(vidx:emb, ?doc, Q, k')`, opts the *same* query
+into the index's HNSW graph: it runs one whole-index `searchHnsw(Q, k')` and
+binds a distance only for those ~`k'` nearest entities, so the usual
+`FILTER(BOUND(?d)) ORDER BY ?d LIMIT n` then sorts only ~`k'` rows instead of the
+whole column. This is **guarded to whole-index queries** — it is taken only when
+the input is the entire live set (its row count equals the index's vector count)
+and one side is the constant query `Q`; on a *filtered* subset (or an index
+without an HNSW graph) it **silently falls back to the exact path**, because HNSW
+searches the whole graph and could otherwise miss in-subset entities. It is
+**approximate** (bounded by HNSW recall): larger `k'` trades speed for recall,
+`k' = 0` (or omitting it) is exact. Use it for a huge *unfiltered* top-k where
+exact brute force is too slow; keep the exact form when the enumerator already
+selects a small subset.
+
 ### Use case 7 — whole-index top-k, accelerated (HNSW `SERVICE`)
 For a huge *unfiltered* top-k, the opt-in HNSW graph via the `SERVICE` block
 (exact never needs it; HNSW is always explicit). See `indexing.md` for the shape.

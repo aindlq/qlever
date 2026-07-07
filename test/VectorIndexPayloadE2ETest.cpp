@@ -25,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -476,6 +477,72 @@ QueryExecutionContext* qecWithLargeIndex() {
   for (auto* suffix :
        {".vec.embbig.meta", ".vec.embbig.keys", ".vec.embbig.rowmap",
         ".vec.embbig.data", ".vec.embbig.iris", ".vec.embbig.hnsw",
+        ".input.npy", ".input.iris"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + suffix, ec);
+  }
+  return qec;
+}
+
+// ===========================================================================
+// The HNSW fixture: a small, CLEAN index built WITH the HNSW graph (`"hnsw":
+// true`) at high search-expansion, so approximate recall is exact for these
+// well-separated vectors. It backs the opt-in `vec:distance(idx, ?e, Q, k')`
+// fast path: the six members `<h0>..<h5>` are all enumerated by `<is-a>
+// <HnswItem>` (a whole-index scan -> input rows == numLiveVectors, the guard's
+// size condition), and the four `<h2>..<h5>` additionally carry `<flag>
+// <keep>` so a query that starts from `<flag>` is a strict SUBSET (input rows <
+// numLiveVectors), which must DECLINE HNSW and fall back to exact.
+//
+// With the cosine metric and query [1,0,0]: `<h0>`=[1,0,0] (distance 0), then
+// `<h1>`=[0.9,0.1,0] (~0.006), then `<h5>`=[0.1,0,0.9] (~0.89), then the
+// orthogonal `<h2>..<h4>` (distance 1). So the top-3 set {h0,h1,h5} is
+// unambiguous.
+constexpr std::string_view KG_HNSW =
+    "<h0> <is-a> <HnswItem> . <h1> <is-a> <HnswItem> . "
+    "<h2> <is-a> <HnswItem> . <h3> <is-a> <HnswItem> . "
+    "<h4> <is-a> <HnswItem> . <h5> <is-a> <HnswItem> . "
+    "<h2> <flag> <keep> . <h3> <flag> <keep> . "
+    "<h4> <flag> <keep> . <h5> <flag> <keep> .";
+
+const std::vector<std::pair<std::string, std::vector<float>>>&
+hnswTestVectors() {
+  static const std::vector<std::pair<std::string, std::vector<float>>> vecs{
+      {"<h0>", {1.f, 0.f, 0.f}}, {"<h1>", {0.9f, 0.1f, 0.f}},
+      {"<h2>", {0.f, 1.f, 0.f}}, {"<h3>", {0.f, 0.9f, 0.1f}},
+      {"<h4>", {0.f, 0.f, 1.f}}, {"<h5>", {0.1f, 0.f, 0.9f}},
+  };
+  return vecs;
+}
+
+QueryExecutionContext* qecWithHnswIndex() {
+  QueryExecutionContext* qec = getQec(std::string{KG_HNSW});
+  auto& impl = const_cast<Index&>(qec->getIndex()).getImpl();
+  if (impl.getExtension(std::string{qlever::vector::VECTOR_EXTENSION_NAME}) !=
+      nullptr) {
+    return qec;
+  }
+  std::string basename =
+      (std::filesystem::temp_directory_path() /
+       ("qlever-vecpayloade2e-hnsw-" + std::to_string(::getpid())))
+          .string();
+  std::string npy = basename + ".input.npy";
+  std::string iris = basename + ".input.iris";
+  writeNpyBundle(npy, iris, hnswTestVectors());
+  nlohmann::json spec = nlohmann::json::parse(
+      R"({"vectorSearch":[{"name":"embhnsw","npy":")" + npy + R"(","iris":")" +
+      iris + R"(","metric":"cosine","hnsw":true,"hnswExpansionSearch":200}]})");
+  for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
+    hook(qec->getIndex(), basename, spec);
+  }
+  for (const auto& hook : IndexExtensionRegistry::get().loadHooks()) {
+    hook(impl, basename);
+  }
+  qec->setLocatedTriplesForEvaluation(
+      impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
+  for (auto* suffix :
+       {".vec.embhnsw.meta", ".vec.embhnsw.keys", ".vec.embhnsw.rowmap",
+        ".vec.embhnsw.data", ".vec.embhnsw.iris", ".vec.embhnsw.hnsw",
         ".input.npy", ".input.iris"}) {
     std::error_code ec;
     std::filesystem::remove(basename + suffix, ec);
@@ -1212,4 +1279,183 @@ TEST(VectorIndexPayloadE2E, parallelPerRowScanMatchesSerialReference) {
     EXPECT_EQ(table2(r, eCol), table(r, eCol)) << "row " << r;
     EXPECT_EQ(table2(r, dCol), table(r, dCol)) << "row " << r;
   }
+}
+
+// _____________________________________________________________________________
+// The opt-in HNSW fast path, GUARD PASSES: a whole-index scan (all six members
+// enumerated -> input rows == numLiveVectors) with a constant query and k'=3
+// takes the approximate top-k' path. Only the ~k' nearest entities get a bound
+// distance (every other row is UNDEF), the bound set equals `searchHnsw(Q,k')`
+// with matching distances, and -- recall is exact for this clean fixture -- the
+// `FILTER(BOUND) ORDER BY ?d LIMIT n` ranking matches the EXACT top-n.
+TEST(VectorIndexPayloadE2E, hnswFastPathBindsOnlyTopKForWholeIndex) {
+  auto* qec = qecWithHnswIndex();
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "embhnsw");
+  ASSERT_TRUE(vidx);
+  ASSERT_TRUE(vidx->hasHnsw());
+  ASSERT_EQ(vidx->numLiveVectors(), 6u);
+
+  const std::vector<float> Q = {1.f, 0.f, 0.f};
+  constexpr size_t K = 3;
+  // The reference the expression memoizes internally: the ~k' nearest via HNSW.
+  std::vector<qlever::vector::ScoredEntity> ref = vidx->searchHnsw(Q, K);
+  ASSERT_EQ(ref.size(), K);
+  auto refDistanceOf = [&](uint64_t bits) -> std::optional<double> {
+    for (const auto& hit : ref) {
+      if (hit.entity_.getBits() == bits) {
+        return static_cast<double>(hit.distance_);
+      }
+    }
+    return std::nullopt;
+  };
+
+  // No FILTER(BOUND): every one of the six members is visible, so we can see
+  // exactly which rows the fast path bound and which it left UNDEF.
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <is-a> <HnswItem> . "
+               "BIND(vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 3) AS ?d) }");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  ASSERT_EQ(table.numRows(), 6u);
+
+  size_t numBound = 0;
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    Id d = table(r, dCol);
+    std::optional<double> refDist = refDistanceOf(table(r, eCol).getBits());
+    if (d.isUndefined()) {
+      EXPECT_FALSE(refDist.has_value())
+          << "a top-k' HNSW entity was left UNDEF at row " << r;
+      continue;
+    }
+    ++numBound;
+    ASSERT_TRUE(refDist.has_value())
+        << "row " << r << " was BOUND but is not an HNSW top-k' entity";
+    EXPECT_EQ(d.getDatatype(), Datatype::Double);
+    EXPECT_NEAR(d.getDouble(), refDist.value(), 1e-6) << "row " << r;
+  }
+  // Exactly the ~k' candidates are bound (the rest UNDEF).
+  EXPECT_EQ(numBound, K);
+
+  // The flagship idiom on top of the fast path: sort only the ~k' bound rows.
+  // With exact recall here, the top-2 equal the exact brute-force top-2.
+  std::vector<qlever::vector::ScoredEntity> exact = vidx->searchExact(Q, 2);
+  ASSERT_EQ(exact.size(), 2u);
+  QueryExecutionTree topQet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <is-a> <HnswItem> . "
+               "BIND(vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 3) AS ?d) "
+               "FILTER(BOUND(?d)) } ORDER BY ?d LIMIT 2");
+  auto topResult = topQet.getResult();
+  size_t teCol = topQet.getVariableColumn(Variable{"?e"});
+  const IdTable& topTable = topResult->idTable();
+  // The LIMIT is applied lazily during export, so the ordered table still holds
+  // all ~k' bound rows; the RANKING (first two) is what must match the exact
+  // top-2.
+  ASSERT_GE(topTable.numRows(), 2u);
+  EXPECT_EQ(topTable(0, teCol).getBits(), exact[0].entity_.getBits());
+  EXPECT_EQ(topTable(1, teCol).getBits(), exact[1].entity_.getBits());
+}
+
+// _____________________________________________________________________________
+// The opt-in HNSW fast path, GUARD FAILS: a FILTERED enumerator (only the four
+// `<flag> <keep>` members) makes the total input (4) strictly smaller than
+// numLiveVectors (6), so DESPITE k'=3 the expression declines HNSW and runs the
+// EXACT brute-force path -- every input row is BOUND with its exact per-row
+// distance (HNSW would have left all but its ~k' nearest UNDEF). This is why
+// the fast path is safe: on a subset it silently degrades to exact.
+TEST(VectorIndexPayloadE2E, hnswGuardDeclinesOnFilteredSubset) {
+  auto* qec = qecWithHnswIndex();
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "embhnsw");
+  ASSERT_TRUE(vidx);
+  ASSERT_EQ(vidx->numLiveVectors(), 6u);
+  auto computer = vidx->makeDistanceComputer(std::vector<float>{1.f, 0.f, 0.f});
+
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <flag> <keep> . "
+               "BIND(vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 3) AS ?d) }");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  const IdTable& table = result->idTable();
+  ASSERT_EQ(table.numRows(), 4u);
+  size_t numBound = 0;
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    Id d = table(r, dCol);
+    ASSERT_FALSE(d.isUndefined())
+        << "row " << r << " is UNDEF -> HNSW was wrongly used on a subset";
+    Id expected = qlever::vector::distanceToValueId(computer(table(r, eCol)));
+    EXPECT_EQ(d, expected) << "row " << r << " is not the exact distance";
+    ++numBound;
+  }
+  // The whole (filtered) input is bound, exactly as the exact path does.
+  EXPECT_EQ(numBound, 4u);
+}
+
+// _____________________________________________________________________________
+// `k'=0` and an OMITTED fourth argument are both identical to today's exact
+// brute-force path: every member BOUND with its exact distance, and the two
+// forms bit-identical to each other (the HNSW branch is gated on `k' > 0`).
+TEST(VectorIndexPayloadE2E, hnswKZeroOrAbsentMatchesBruteForce) {
+  auto* qec = qecWithHnswIndex();
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "embhnsw");
+  ASSERT_TRUE(vidx);
+  auto computer = vidx->makeDistanceComputer(std::vector<float>{1.f, 0.f, 0.f});
+
+  auto run = [&](const std::string& distanceCall) {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?e ?d WHERE { ?e <is-a> <HnswItem> . "
+                           "BIND(" +
+                           distanceCall + " AS ?d) }");
+    auto result = qet.getResult();
+    size_t eCol = qet.getVariableColumn(Variable{"?e"});
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    EXPECT_EQ(table.numRows(), 6u);
+    std::vector<std::pair<uint64_t, Id>> byEntity;
+    for (size_t r = 0; r < table.numRows(); ++r) {
+      Id e = table(r, eCol);
+      Id expected = qlever::vector::distanceToValueId(computer(e));
+      EXPECT_EQ(table(r, dCol), expected) << "row " << r;
+      byEntity.emplace_back(e.getBits(), table(r, dCol));
+    }
+    std::sort(byEntity.begin(), byEntity.end());
+    return byEntity;
+  };
+
+  auto absent = run("vec:distance(vidx:embhnsw, ?e, \"1,0,0\")");
+  auto kZero = run("vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 0)");
+  EXPECT_EQ(absent, kZero);
+}
+
+// _____________________________________________________________________________
+// The optional fourth argument is validated at PARSE time: it must be a
+// constant non-negative integer. A variable, a negative value, or a double is
+// rejected with a clear error; a fifth argument is a wrong arity; a valid k'=3
+// four-arg call plans fine.
+TEST(VectorIndexPayloadE2E, hnswFourthArgumentValidation) {
+  auto* qec = qecWithHnswIndex();
+  auto plan = [&](const std::string& distanceCall) {
+    return planQuery(qec, std::string{PREFIX} +
+                              "SELECT ?e ?d WHERE { ?e <is-a> <HnswItem> . "
+                              "BIND(" +
+                              distanceCall + " AS ?d) }");
+  };
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      plan("vec:distance(vidx:embhnsw, ?e, \"1,0,0\", ?k)"),
+      ::testing::HasSubstr("non-negative integer"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      plan("vec:distance(vidx:embhnsw, ?e, \"1,0,0\", -1)"),
+      ::testing::HasSubstr("non-negative integer"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      plan("vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 2.5)"),
+      ::testing::HasSubstr("non-negative integer"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      plan("vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 3, 4)"),
+      ::testing::HasSubstr("three or four arguments"));
+  EXPECT_NO_THROW(plan("vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 3)"));
 }

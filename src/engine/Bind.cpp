@@ -127,9 +127,10 @@ Result Bind::computeResult(bool requestLaziness) {
   std::shared_ptr<const Result> subRes = _subtree->getResult(requestLaziness);
   AD_LOG_DEBUG << "Got input to Bind operation." << std::endl;
 
-  auto applyBind = [this](IdTable idTable, LocalVocab* localVocab) {
+  auto applyBind = [this](IdTable idTable, LocalVocab* localVocab,
+                          size_t totalInputSize) {
     return computeExpressionBind(localVocab, std::move(idTable),
-                                 _bind._expression.getPimpl());
+                                 _bind._expression.getPimpl(), totalInputSize);
   };
 
   if (subRes->isFullyMaterialized()) {
@@ -144,8 +145,12 @@ Result Bind::computeResult(bool requestLaziness) {
         LocalVocab outVocab = subRes->getCopyOfLocalVocab();
         auto start = chunk.front();
         auto end = start + ::ranges::size(chunk);
-        IdTable idTable = applyBind(
-            Bind::cloneSubView(subRes->idTable(), {start, end}), &outVocab);
+        // `subRes` is fully materialized here, so its total row count is known;
+        // pass it so a whole-input expression guard sees the true total (not
+        // this chunk's size).
+        IdTable idTable =
+            applyBind(Bind::cloneSubView(subRes->idTable(), {start, end}),
+                      &outVocab, subRes->idTable().size());
 
         return Result::IdTableVocabPair{std::move(idTable),
                                         std::move(outVocab)};
@@ -159,7 +164,8 @@ Result Bind::computeResult(bool requestLaziness) {
     // via`shared_ptr`s, so the following is also efficient if the BIND adds no
     // new words.
     LocalVocab localVocab = subRes->getCopyOfLocalVocab();
-    IdTable result = applyBind(subRes->idTable().clone(), &localVocab);
+    IdTable result = applyBind(subRes->idTable().clone(), &localVocab,
+                               subRes->idTable().size());
     AD_LOG_DEBUG << "BIND result computation done." << std::endl;
     return {std::move(result), resultSortedOn(), std::move(localVocab)};
   }
@@ -172,8 +178,11 @@ Result Bind::computeResult(bool requestLaziness) {
             // `primaryWordSet` exclusively. We clone the local vocab to enforce
             // this invariant in all cases
             LocalVocab localVocab = idTableAndVocab.localVocab_.clone();
+            // A fully lazy input yields chunks without a known total row count,
+            // so the whole-input size is unknown here (0 disables any
+            // whole-input expression fast path).
             IdTable resultTable =
-                applyBind(std::move(idTableAndVocab.idTable_), &localVocab);
+                applyBind(std::move(idTableAndVocab.idTable_), &localVocab, 0);
             return Result::IdTableVocabPair(std::move(resultTable),
                                             std::move(localVocab));
           })),
@@ -183,11 +192,16 @@ Result Bind::computeResult(bool requestLaziness) {
 // _____________________________________________________________________________
 IdTable Bind::computeExpressionBind(
     LocalVocab* localVocab, IdTable idTable,
-    const sparqlExpression::SparqlExpression* expression) const {
+    const sparqlExpression::SparqlExpression* expression,
+    size_t totalInputSize) const {
   sparqlExpression::EvaluationContext evaluationContext(
       *getExecutionContext(), _subtree->getVariableColumns(), idTable,
       getExecutionContext()->getAllocator(), *localVocab, cancellationHandle_,
       deadline_);
+  // The context's `_inputTable` is just this (possibly chunked) block; record
+  // the whole-input row count so an expression can guard a whole-input fast
+  // path (the `vec:distance` HNSW path). See `computeResult` for the values.
+  evaluationContext._totalInputSize = totalInputSize;
 
   sparqlExpression::ExpressionResult expressionResult =
       expression->evaluate(&evaluationContext);

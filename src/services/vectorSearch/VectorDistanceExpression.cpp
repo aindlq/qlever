@@ -17,6 +17,7 @@
 #include <cmath>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -254,9 +255,11 @@ Id pairDistance(const ResolvedSource& a, const ResolvedSource& b,
 
 // _____________________________________________________________________________
 VectorDistanceExpression::VectorDistanceExpression(std::string indexName,
-                                                   Ptr source1, Ptr source2)
+                                                   Ptr source1, Ptr source2,
+                                                   size_t hnswK)
     : indexName_{std::move(indexName)},
-      sources_{std::move(source1), std::move(source2)} {}
+      sources_{std::move(source1), std::move(source2)},
+      hnswK_{hnswK} {}
 
 // _____________________________________________________________________________
 VectorDistanceExpression::~VectorDistanceExpression() {
@@ -551,43 +554,176 @@ ExpressionResult VectorDistanceExpression::evaluate(
   ExpressionResult result2 = sources_[1]->evaluate(context);
 
   // Time ONLY the distance computation below (row resolution + the
-  // `DistanceComputer`/SIMD kernel calls) -- the child evaluation above (e.g.
-  // a `vec:embed`) is timed and logged separately.
+  // `DistanceComputer`/SIMD kernel calls, or the one HNSW search) -- the child
+  // evaluation above (e.g. a `vec:embed`) is timed and logged separately.
   ad_utility::Timer distanceTimer{ad_utility::Timer::Started};
+
+  // OPT-IN approximate HNSW fast path (4th argument `k' > 0`), taken ONLY for a
+  // genuine WHOLE-INDEX query: the total input row count equals the index's
+  // live-vector count (so the input is not a selective subset -- HNSW searches
+  // the whole graph, and on a subset its global top-k' could contain too few
+  // in-subset entities), the index has an HNSW graph, and exactly one source is
+  // the CONSTANT query point `q` while the other is a bare per-row entity
+  // variable. Then run `searchHnsw(q, k')` ONCE (memoized across the per-chunk
+  // `evaluate()` calls, since `q` is constant), and bind a distance only for
+  // the ~k' returned entities; every other row stays UNDEF. Falls through to
+  // the EXACT path below when any of these do not hold (a subset, no HNSW
+  // graph, a per-row/per-row pair, a non-bare-variable entity side, or a query
+  // point without a vector).
+
+  // Build (or reuse) the memoized `entity -> distanceId` map for the constant
+  // query point `q` (an entity `Id` or a parsed float vector). Returns false if
+  // `q` has no vector (then the exact constant path already yields UNDEF for
+  // every row, so we defer to it).
+  auto buildHnswMemo = [&](const ResolvedSource& q) -> bool {
+    if (std::holds_alternative<std::monostate>(q)) {
+      return false;
+    }
+    const bool isEntity = std::holds_alternative<Id>(q);
+    std::string key =
+        isEntity
+            ? absl::StrCat("e", std::get<Id>(q).getBits())
+            : absl::StrCat("v", std::string_view{
+                                    reinterpret_cast<const char*>(
+                                        std::get<std::vector<float>>(q).data()),
+                                    std::get<std::vector<float>>(q).size() *
+                                        sizeof(float)});
+    if (hnswMemo_.has_value() && hnswMemoKey_ == key) {
+      return true;  // Same constant as a previous chunk -> reuse.
+    }
+    // One whole-index HNSW search; poll the cancellation handle while it waits
+    // for a search slot (the single call is otherwise atomic to us).
+    auto checkInterrupt = [&] {
+      context->cancellationHandle_->throwIfCancelled();
+    };
+    std::vector<qlever::vector::ScoredEntity> hits =
+        isEntity ? vidx.searchHnswByEntity(std::get<Id>(q), hnswK_,
+                                           std::nullopt, checkInterrupt)
+                 : vidx.searchHnsw(std::get<std::vector<float>>(q), hnswK_,
+                                   std::nullopt, checkInterrupt);
+    ad_utility::HashMap<Id, Id> map;
+    map.reserve(hits.size());
+    for (const auto& hit : hits) {
+      // Reuse `distanceToValueId` so the HNSW distances land on the EXACT same
+      // scale as the brute-force path's.
+      map.emplace(hit.entity_, toDistanceId(hit.distance_));
+    }
+    hnswMemo_ = std::move(map);
+    hnswMemoKey_ = std::move(key);
+    return true;
+  };
+
+  // Produce the output column for the HNSW path: for each row of the per-row
+  // entity `var`, its distance `Id` from the memoized map, or UNDEF if the
+  // entity is not among the ~k' nearest. Returns `nullopt` (-> exact fallback)
+  // if `var` is not a resolvable column or `q` has no vector.
+  auto hnswAgainstColumn =
+      [&](const ResolvedSource& q,
+          const ::Variable& var) -> std::optional<ExpressionResult> {
+    std::optional<ColumnIndex> colIdx = context->getColumnIndexForVariable(var);
+    if (!colIdx.has_value() || !buildHnswMemo(q)) {
+      return std::nullopt;
+    }
+    ql::span<const Id> completeColumn =
+        context->_inputTable.getColumn(colIdx.value());
+    AD_CORRECTNESS_CHECK(context->_beginIndex <= context->_endIndex &&
+                         context->_endIndex <= completeColumn.size());
+    ql::span<const Id> column{completeColumn.begin() + context->_beginIndex,
+                              completeColumn.begin() + context->_endIndex};
+    AD_CORRECTNESS_CHECK(column.size() == resultSize);
+    const ad_utility::HashMap<Id, Id>& map = hnswMemo_.value();
+    VectorWithMemoryLimit<Id> out{context->_allocator};
+    out.resize(resultSize, Id::makeUndefined());
+    context->cancellationHandle_->throwIfCancelled();
+    size_t produced = 0;
+    size_t sinceCheck = 0;
+    for (size_t i = 0; i < resultSize; ++i) {
+      auto it = map.find(column[i]);
+      if (it != map.end()) {
+        out[i] = it->second;
+        ++produced;
+      }
+      if (++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+        sinceCheck = 0;
+        context->cancellationHandle_->throwIfCancelled();
+      }
+    }
+    numDistances += produced;
+    return ExpressionResult{std::move(out)};
+  };
+
+  // The HNSW path applies only for a whole-index scan (the size guard) on an
+  // index that actually has an HNSW graph. A `_totalInputSize` of 0 means the
+  // total is unknown (a fully lazy input), which disables the path.
+  std::optional<ExpressionResult> hnswResult;
+  if (hnswK_ > 0 && vidx.hasHnsw() && context->_totalInputSize != 0 &&
+      context->_totalInputSize == vidx.numLiveVectors()) {
+    hnswResult = std::visit(
+        [&](const auto& in1,
+            const auto& in2) -> std::optional<ExpressionResult> {
+          using T1 = std::decay_t<decltype(in1)>;
+          using T2 = std::decay_t<decltype(in2)>;
+          // Exactly one side must be the constant query point, the other a bare
+          // per-row entity variable (metrics are symmetric, so either order).
+          if constexpr (isConstantResult<T1> &&
+                        std::is_same_v<T2, ::Variable>) {
+            return hnswAgainstColumn(
+                resolveSource(in1, vidx, indexName_, context,
+                              SourceMode::Constant),
+                in2);
+          } else if constexpr (isConstantResult<T2> &&
+                               std::is_same_v<T1, ::Variable>) {
+            return hnswAgainstColumn(
+                resolveSource(in2, vidx, indexName_, context,
+                              SourceMode::Constant),
+                in1);
+          } else {
+            return std::nullopt;
+          }
+        },
+        result1, result2);
+  }
 
   // Branch on constness: the expression framework yields a CONSTANT result
   // for a constant sub-expression, so a constant source (an inline float
   // list, a constant entity IRI, a `vec:embed` of constants, ...) is
-  // parsed/looked up/encoded exactly once, never per row.
-  ExpressionResult result = std::visit(
-      [&](auto&& in1, auto&& in2) -> ExpressionResult {
-        using T1 = std::decay_t<decltype(in1)>;
-        using T2 = std::decay_t<decltype(in2)>;
-        if constexpr (isConstantResult<T1> && isConstantResult<T2>) {
-          // Both constant -> a single constant distance.
-          ResolvedSource a = resolveSource(in1, vidx, indexName_, context,
-                                           SourceMode::Constant);
-          ResolvedSource b = resolveSource(in2, vidx, indexName_, context,
-                                           SourceMode::Constant);
-          Id distance = pairDistance(a, b, vidx);
-          if (!distance.isUndefined()) {
-            ++numDistances;
-          }
-          return distance;
-        } else if constexpr (isConstantResult<T1>) {
-          return againstConstant(resolveSource(in1, vidx, indexName_, context,
-                                               SourceMode::Constant),
-                                 AD_FWD(in2), sources_[1].get());
-        } else if constexpr (isConstantResult<T2>) {
-          // All supported metrics are symmetric, so the sides may swap.
-          return againstConstant(resolveSource(in2, vidx, indexName_, context,
-                                               SourceMode::Constant),
-                                 AD_FWD(in1), sources_[0].get());
-        } else {
-          return perRowPair(AD_FWD(in1), AD_FWD(in2));
-        }
-      },
-      std::move(result1), std::move(result2));
+  // parsed/looked up/encoded exactly once, never per row. Skipped entirely when
+  // the HNSW fast path above produced a result.
+  ExpressionResult result =
+      hnswResult.has_value()
+          ? std::move(hnswResult).value()
+          : std::visit(
+                [&](auto&& in1, auto&& in2) -> ExpressionResult {
+                  using T1 = std::decay_t<decltype(in1)>;
+                  using T2 = std::decay_t<decltype(in2)>;
+                  if constexpr (isConstantResult<T1> && isConstantResult<T2>) {
+                    // Both constant -> a single constant distance.
+                    ResolvedSource a = resolveSource(
+                        in1, vidx, indexName_, context, SourceMode::Constant);
+                    ResolvedSource b = resolveSource(
+                        in2, vidx, indexName_, context, SourceMode::Constant);
+                    Id distance = pairDistance(a, b, vidx);
+                    if (!distance.isUndefined()) {
+                      ++numDistances;
+                    }
+                    return distance;
+                  } else if constexpr (isConstantResult<T1>) {
+                    return againstConstant(
+                        resolveSource(in1, vidx, indexName_, context,
+                                      SourceMode::Constant),
+                        AD_FWD(in2), sources_[1].get());
+                  } else if constexpr (isConstantResult<T2>) {
+                    // All supported metrics are symmetric, so the sides may
+                    // swap.
+                    return againstConstant(
+                        resolveSource(in2, vidx, indexName_, context,
+                                      SourceMode::Constant),
+                        AD_FWD(in1), sources_[0].get());
+                  } else {
+                    return perRowPair(AD_FWD(in1), AD_FWD(in2));
+                  }
+                },
+                std::move(result1), std::move(result2));
   // Accumulate into the per-operation totals that the destructor logs as ONE
   // summary line (`evaluate()` runs once per input chunk, so logging here
   // would spam a line per block). Microseconds, so summing many fast blocks
@@ -609,7 +745,7 @@ std::string VectorDistanceExpression::getCacheKey(
     const VariableToColumnMap& varColMap) const {
   return absl::StrCat("VEC_DISTANCE(", indexName_, "|",
                       sources_[0]->getCacheKey(varColMap), "|",
-                      sources_[1]->getCacheKey(varColMap), ")");
+                      sources_[1]->getCacheKey(varColMap), "|k", hnswK_, ")");
 }
 
 // _____________________________________________________________________________
@@ -636,21 +772,46 @@ std::string parseVectorIndexIriArgument(const SparqlExpression* arg,
       "clip>, ...)."));
 }
 
+namespace {
+// Parse the OPTIONAL 4th argument of `vec:distance`: it must be a CONSTANT
+// non-negative integer literal (the HNSW top-k'). A numeric integer literal is
+// parsed by the SPARQL grammar into an `IdExpression` holding an `Int`
+// `ValueId` (see `SparqlQleverVisitor`), so a non-constant (e.g. a variable),
+// non-integer (e.g. a double), or negative value is rejected with a clear
+// user-facing error -- exactly like the index-IRI argument is validated.
+size_t parseVectorHnswKArgument(const SparqlExpression* arg) {
+  if (const auto* idExpr = dynamic_cast<const IdExpression*>(arg)) {
+    ValueId value = idExpr->value();
+    if (value.getDatatype() == Datatype::Int && value.getInt() >= 0) {
+      return static_cast<size_t>(value.getInt());
+    }
+  }
+  AD_THROW(
+      "vec:distance: the optional fourth argument k' must be a CONSTANT "
+      "non-negative integer literal -- the HNSW top-k' selecting the "
+      "approximate fast path (0 or absent keeps the exact brute-force path). A "
+      "non-constant, non-integer, or negative value is not allowed.");
+}
+}  // namespace
+
 // _____________________________________________________________________________
 SparqlExpression::Ptr makeVectorDistanceExpression(
     std::vector<SparqlExpression::Ptr> args) {
-  if (args.size() != 3) {
+  if (args.size() != 3 && args.size() != 4) {
     AD_THROW(absl::StrCat(
-        "vec:distance takes three arguments: the index IRI (",
+        "vec:distance takes three or four arguments: the index IRI (",
         qlever::vector::VECTOR_METADATA_SUBJECT_PREFIX,
-        "NAME>) and two vector sources, each of which is an entity with a "
-        "stored vector or a comma-separated float-list string; got ",
+        "NAME>), two vector sources (each an entity with a stored vector or a "
+        "comma-separated float-list string), and an OPTIONAL constant "
+        "non-negative integer k' selecting the approximate HNSW top-k' fast "
+        "path (0 or absent = exact brute force); got ",
         args.size(), "."));
   }
   std::string indexName =
       parseVectorIndexIriArgument(args[0].get(), "vec:distance");
+  size_t hnswK = args.size() == 4 ? parseVectorHnswKArgument(args[3].get()) : 0;
   return std::make_unique<VectorDistanceExpression>(
-      std::move(indexName), std::move(args[1]), std::move(args[2]));
+      std::move(indexName), std::move(args[1]), std::move(args[2]), hnswK);
 }
 
 }  // namespace sparqlExpression

@@ -180,6 +180,17 @@ struct EvaluationContext {
   size_t _beginIndex = 0;
   size_t _endIndex = _inputTable.size();
 
+  /// The TOTAL number of input rows across ALL evaluation blocks of one
+  /// operation. In `Bind`'s lazy path `_inputTable` is only the current
+  /// ~10K-row chunk, so `_inputTable.size()` is NOT the whole-input size;
+  /// `Bind::computeExpressionBind` sets this to the real total (and to 0 when
+  /// the total is unknown, e.g. a fully lazy input). Defaults to
+  /// `_inputTable.size()`, which is already the true total for a
+  /// fully-materialized input. Currently read only by the `vec:distance` HNSW
+  /// fast path, whose whole-index guard is `_totalInputSize ==
+  /// numLiveVectors()`; a value of 0 means "unknown" and disables that path.
+  size_t _totalInputSize = _inputTable.size();
+
   /// The input is sorted on these columns. This information can be used to
   /// perform efficient relational operations like `equal` or `less than`
   std::vector<ColumnIndex> _columnsByWhichResultIsSorted;

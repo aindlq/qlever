@@ -380,7 +380,7 @@ TEST(VectorSearchService, vecDistanceErrors) {
   // Wrong arity (parse time).
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, selectBind("vec:distance(vidx:clip, ?e)")),
-      HasSubstr("three arguments"));
+      HasSubstr("three or four arguments"));
   // First argument not an IRI at all (parse time).
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, selectBind("vec:distance(?e, ?e, \"1,0,0,0\")")),
