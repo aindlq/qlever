@@ -136,6 +136,10 @@ struct VectorIndex::Impl {
   // `AlignedCopy`). When set, `base()` reads from it (with the padded
   // `stride_`) instead of the memory-mapped file.
   std::unique_ptr<char, AlignedFree> alignedBuf_;
+  // The residency strategy `makeResident` last applied (best-effort; see
+  // `VectorIndex::residency()`). Stays `None` when the request was skipped by
+  // the fits-in-RAM gate.
+  Residency residency_ = Residency::None;
   // Sticky safety net for the sequential-read hint of the merge-join gather.
   // The gather emits rows in non-decreasing order iff the store is genuinely
   // id-sorted (the normal case). If a gather is ever observed to emit rows out
@@ -208,16 +212,15 @@ struct VectorIndex::Impl {
   }
 };
 
-namespace {
-// Map the persisted `preload` metadata string to a `Residency`. An unknown
-// value (should not happen -- validated at build time) falls back to `None`.
-VectorIndex::Residency residencyFromString(const std::string& s) {
-  if (s == "advise") return VectorIndex::Residency::Advise;
-  if (s == "lock") return VectorIndex::Residency::Lock;
-  if (s == "aligned") return VectorIndex::Residency::AlignedCopy;
-  return VectorIndex::Residency::None;
+// Map a `preload` string to a `Residency`. An unknown value (should not
+// happen -- validated at build time and by the runtime-override parser) falls
+// back to `None`.
+VectorIndex::Residency VectorIndex::residencyFromString(const std::string& s) {
+  if (s == "advise") return Residency::Advise;
+  if (s == "lock") return Residency::Lock;
+  if (s == "aligned") return Residency::AlignedCopy;
+  return Residency::None;
 }
-}  // namespace
 
 // ____________________________________________________________________________
 VectorIndex::VectorIndex() : impl_{std::make_unique<Impl>()} {}
@@ -387,6 +390,7 @@ void VectorIndex::makeResident(Residency residency) {
                 << std::endl;
     return;
   }
+  impl.residency_ = residency;
 
   switch (residency) {
     case Residency::None:
@@ -436,6 +440,11 @@ void VectorIndex::makeResident(Residency residency) {
       break;
     }
   }
+}
+
+// ____________________________________________________________________________
+VectorIndex::Residency VectorIndex::residency() const {
+  return impl_->residency_;
 }
 
 // ____________________________________________________________________________

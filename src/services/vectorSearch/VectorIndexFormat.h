@@ -214,7 +214,11 @@ struct VectorIndexConfig {
   // prefault), "lock" (also mlock -- fault-free, non-evictable), or "aligned"
   // (a huge-page-backed, 64-byte-aligned RAM copy). Persisted so the index
   // author can pick a default; gated on fits-in-RAM at load time. An explicit
-  // `open(..., residency)` argument overrides this.
+  // `open(..., residency)` argument overrides this -- the load hook passes
+  // one for a per-index "preload" runtime override from the
+  // `QLEVER_VECTOR_SEARCH_ENDPOINTS` environment variable (see
+  // `VectorIndexExtension.h`), so residency can be changed at server start
+  // without a rebuild.
   std::string preload_ = "none";
 
   // Optional embedding endpoint, bound to this index so that query-time

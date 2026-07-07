@@ -143,26 +143,36 @@ inline std::optional<std::string> indexNameFromMetadataIri(
   return std::string{iri};
 }
 
-// The environment variable through which the embedding endpoints persisted in
-// the per-index `.meta` files can be set or changed AT SERVER START, without
-// rebuilding the index: a JSON object keyed by index name, each value an
-// object with the optional string keys "embeddingUrl" and "embeddingModel",
-// e.g.
+// The environment variable through which the embedding endpoints and the RAM
+// residency (`preload`) persisted in the per-index `.meta` files can be set
+// or changed AT SERVER START, without rebuilding the index: a JSON object
+// keyed by index name, each value an object with the optional string keys
+// "embeddingUrl", "embeddingModel", and "preload"
+// ("none"|"advise"|"lock"|"aligned"), e.g.
 //   QLEVER_VECTOR_SEARCH_ENDPOINTS='{
 //     "images":   {"embeddingUrl": "unix:/siglip2.private",
 //                  "embeddingModel": "siglip"},
-//     "metadata": {"embeddingUrl": "unix:/qwen3.private"}}'
+//     "metadata": {"embeddingUrl": "unix:/qwen3.private",
+//                  "preload": "lock"}}'
 // Only the fields present are overridden. The load hook applies the override
 // IN MEMORY on every server start; the on-disk `.meta` is never rewritten, so
-// starting without the variable falls back to the persisted endpoints.
+// starting without the variable falls back to the persisted values. The
+// endpoint fields mutate the already-opened index; "preload" must be decided
+// WHEN the index is opened, so the load hook threads it into
+// `VectorIndex::open(..., residency)` as the residency override.
 inline constexpr const char* VECTOR_SEARCH_ENDPOINTS_ENV_VAR =
     "QLEVER_VECTOR_SEARCH_ENDPOINTS";
 
 // One per-index override parsed from the environment variable above; a
-// `nullopt` field keeps the persisted value.
+// `nullopt` field keeps the persisted value. `preload_` is validated to be
+// one of "none"|"advise"|"lock"|"aligned" and overrides the persisted RAM
+// residency at `open` time. NOTE: `open` treats `Residency::None` as "use the
+// persisted `preload`", so an explicit `"preload": "none"` cannot downgrade a
+// persisted stronger setting (the load hook warns about that).
 struct EmbeddingEndpointOverride {
   std::optional<std::string> embeddingUrl_;
   std::optional<std::string> embeddingModel_;
+  std::optional<std::string> preload_;
 };
 using EmbeddingEndpointOverrides =
     ad_utility::HashMap<std::string, EmbeddingEndpointOverride>;
@@ -171,9 +181,9 @@ using EmbeddingEndpointOverrides =
 // overrides. NEVER throws -- a bad value must not prevent the server from
 // starting: an empty value yields an empty map, malformed JSON (or a
 // non-object top level) logs a warning and yields an empty map, and a
-// malformed entry (non-object value, unknown key, non-string field, or no
-// fields at all) logs a warning and is skipped ENTIRELY, so a typo cannot
-// half-apply an override.
+// malformed entry (non-object value, unknown key, non-string field, an
+// invalid "preload" value, or no fields at all) logs a warning and is skipped
+// ENTIRELY, so a typo cannot half-apply an override.
 inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
     std::string_view json) {
   EmbeddingEndpointOverrides overrides;
@@ -199,7 +209,7 @@ inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
       AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
                   << " entry for vector index '" << name
                   << "': expected an object with the optional string keys "
-                     "\"embeddingUrl\" and \"embeddingModel\"."
+                     "\"embeddingUrl\", \"embeddingModel\", and \"preload\"."
                   << std::endl;
       continue;
     }
@@ -210,24 +220,38 @@ inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
         endpointOverride.embeddingUrl_ = field.get<std::string>();
       } else if (key == "embeddingModel" && field.is_string()) {
         endpointOverride.embeddingModel_ = field.get<std::string>();
+      } else if (key == "preload" && field.is_string()) {
+        std::string preload = field.get<std::string>();
+        if (preload != "none" && preload != "advise" && preload != "lock" &&
+            preload != "aligned") {
+          AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                      << " entry for vector index '" << name
+                      << "': \"preload\" must be one of \"none\", \"advise\", "
+                         "\"lock\", or \"aligned\" (got \""
+                      << preload << "\")." << std::endl;
+          ok = false;
+          break;
+        }
+        endpointOverride.preload_ = std::move(preload);
       } else {
         AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
                     << " entry for vector index '" << name << "': the key \""
                     << key
                     << "\" is unknown or not a string (known keys: "
-                       "\"embeddingUrl\", \"embeddingModel\")."
+                       "\"embeddingUrl\", \"embeddingModel\", \"preload\")."
                     << std::endl;
         ok = false;
         break;
       }
     }
     if (!endpointOverride.embeddingUrl_.has_value() &&
-        !endpointOverride.embeddingModel_.has_value()) {
+        !endpointOverride.embeddingModel_.has_value() &&
+        !endpointOverride.preload_.has_value()) {
       if (ok) {
         AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
                     << " entry for vector index '" << name
-                    << "': it overrides neither \"embeddingUrl\" nor "
-                       "\"embeddingModel\"."
+                    << "': it overrides none of \"embeddingUrl\", "
+                       "\"embeddingModel\", and \"preload\"."
                     << std::endl;
       }
       continue;

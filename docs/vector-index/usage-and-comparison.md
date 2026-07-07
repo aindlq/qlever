@@ -60,7 +60,7 @@ the KG (otherwise that row is skipped with a warning).
 | `embeddingModel` | — | model name sent to the endpoint; also the **model identity** stamped into the typed query literal (comparability); same build-time optionality and server-start override as `embeddingUrl` |
 | `buildThreads` | `0` (auto) | index-build parallelism |
 | `alignRows` | `false` | pad each row to a 64-byte SIMD boundary (a no-op for ×64 dims) |
-| `preload` | `none` | residency: `none` (mmap) \| `advise` \| `lock` (mlock) \| `aligned` (huge-page copy) — pin a hot, fits-in-RAM index |
+| `preload` | `none` | residency: `none` (mmap) \| `advise` \| `lock` (mlock) \| `aligned` (huge-page copy) — pin a hot, fits-in-RAM index; can be **set/overridden at server start** via `QLEVER_VECTOR_SEARCH_ENDPOINTS` (see below; applied when the index is opened at startup, no rebuild) |
 | `remap` | `false` | on KG rebuild, re-resolve IRIs + rewrite only the id sidecar (keep the matrix) |
 
 For **normalized** embeddings (SigLIP2, Qwen3): use `metric:"dot"` (cosine ≡ dot
@@ -69,14 +69,18 @@ lossless from the fp32/bf16 input). `embeddingUrl`/`embeddingModel` are needed
 only for query-time `vec:embed` (text/image queries); a vector-only index can
 omit them and query with entity / inline / `vec:vector` sources.
 
-Both can also be **set or changed at server start — no rebuild** — via the
-environment variable `QLEVER_VECTOR_SEARCH_ENDPOINTS`, a JSON object keyed by
-index name with per-index optional `embeddingUrl`/`embeddingModel` fields,
-e.g. `{"images": {"embeddingUrl": "unix:/siglip2.private", "embeddingModel":
-"siglip"}, "metadata": {"embeddingUrl": "unix:/qwen3.private"}}`. Only the
-fields present are overridden, and the override is **in-memory only** (the
-persisted `.meta` is never rewritten), so it is reapplied at every server
-start.
+Both — and `preload` — can also be **set or changed at server start — no
+rebuild** — via the environment variable `QLEVER_VECTOR_SEARCH_ENDPOINTS`, a
+JSON object keyed by index name with per-index optional
+`embeddingUrl`/`embeddingModel`/`preload` fields, e.g. `{"images":
+{"embeddingUrl": "unix:/siglip2.private", "embeddingModel": "siglip"},
+"metadata": {"preload": "lock"}}`. Only the fields present are overridden, and
+the override is **in-memory only** (the persisted `.meta` is never rewritten),
+so it is reapplied at every server start. A `preload` override
+(`none|advise|lock|aligned`) lets an operator lock an index in RAM without
+rebuilding it; residency is applied when the index is opened at server
+startup, so unlike the endpoint fields it cannot change on a running server
+(and `"none"` cannot downgrade a persisted stronger setting).
 
 ## Part 2 — Querying it from SPARQL
 

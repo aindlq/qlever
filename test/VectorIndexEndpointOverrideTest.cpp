@@ -6,10 +6,11 @@
 // which can be found in the `LICENSE` file at the root of the QLever project.
 
 // Tests for the `QLEVER_VECTOR_SEARCH_ENDPOINTS` runtime override of an
-// index's persisted embedding endpoint: the env-JSON parsing
-// (`parseEmbeddingEndpointOverrides` / `embeddingEndpointOverridesFromEnv`,
-// the exact code path of the load hook) and the in-memory-only
-// `VectorIndex::setEmbeddingEndpoint` mutator it drives.
+// index's persisted embedding endpoint and RAM residency (`preload`): the
+// env-JSON parsing (`parseEmbeddingEndpointOverrides` /
+// `embeddingEndpointOverridesFromEnv`, the exact code path of the load hook),
+// the in-memory-only `VectorIndex::setEmbeddingEndpoint` mutator it drives,
+// and the `preload` -> `VectorIndex::open(..., residency)` path.
 
 #include <gtest/gtest.h>
 
@@ -113,6 +114,44 @@ TEST(VectorIndexEndpointOverride, parseValidOverrides) {
   EXPECT_FALSE(overrides.at("metadata").embeddingModel_.has_value());
   EXPECT_FALSE(overrides.at("texts").embeddingUrl_.has_value());
   EXPECT_EQ(overrides.at("texts").embeddingModel_, "qwen3");
+}
+
+// _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, parsePreloadOverride) {
+  // `preload` parses alone and alongside the endpoint fields; all four valid
+  // values are accepted (including the -- ineffective, see the load hook --
+  // explicit "none").
+  auto overrides = parseEmbeddingEndpointOverrides(
+      R"({"images": {"preload": "lock"},)"
+      R"( "texts": {"embeddingUrl": "unix:/x.sock", "preload": "advise"},)"
+      R"( "a": {"preload": "none"}, "b": {"preload": "aligned"}})");
+  ASSERT_EQ(overrides.size(), 4u);
+  EXPECT_EQ(overrides.at("images").preload_, "lock");
+  EXPECT_FALSE(overrides.at("images").embeddingUrl_.has_value());
+  EXPECT_FALSE(overrides.at("images").embeddingModel_.has_value());
+  EXPECT_EQ(overrides.at("texts").preload_, "advise");
+  EXPECT_EQ(overrides.at("texts").embeddingUrl_, "unix:/x.sock");
+  EXPECT_EQ(overrides.at("a").preload_, "none");
+  EXPECT_EQ(overrides.at("b").preload_, "aligned");
+  // An endpoint-only entry has no preload override.
+  auto endpointOnly =
+      parseEmbeddingEndpointOverrides(R"({"images": {"embeddingModel": "m"}})");
+  ASSERT_EQ(endpointOnly.size(), 1u);
+  EXPECT_FALSE(endpointOnly.at("images").preload_.has_value());
+}
+
+// _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, parseInvalidPreloadSkipsWholeEntry) {
+  // An invalid `preload` value poisons the ENTIRE entry -- even the valid
+  // `embeddingUrl` next to it must not half-apply -- while well-formed
+  // entries in the same object still parse. A non-string `preload` is
+  // likewise a malformed entry.
+  auto overrides = parseEmbeddingEndpointOverrides(
+      R"({"images": {"embeddingUrl": "unix:/x.sock", "preload": "locked"},)"
+      R"( "nonString": {"preload": 1},)"
+      R"( "good": {"preload": "aligned"}})");
+  ASSERT_EQ(overrides.size(), 1u);
+  EXPECT_EQ(overrides.at("good").preload_, "aligned");
 }
 
 // _____________________________________________________________________________
@@ -233,6 +272,52 @@ TEST(VectorIndexEndpointOverride, overrideSetsEndpointOnVectorOnlyIndex) {
                            std::move(it->second.embeddingModel_));
   EXPECT_EQ(idx.metadata().config_.embeddingUrl_, "unix:/qwen3.private");
   EXPECT_EQ(idx.metadata().config_.embeddingModel_, "qwen3");
+  EXPECT_EQ(readFile(metaPath), metaBefore);
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, residencyFromString) {
+  using R = VectorIndex::Residency;
+  EXPECT_EQ(VectorIndex::residencyFromString("none"), R::None);
+  EXPECT_EQ(VectorIndex::residencyFromString("advise"), R::Advise);
+  EXPECT_EQ(VectorIndex::residencyFromString("lock"), R::Lock);
+  EXPECT_EQ(VectorIndex::residencyFromString("aligned"), R::AlignedCopy);
+  // Unknown values (never produced by the validated parsers) fall back to
+  // `None`, i.e. "use the persisted `preload`".
+  EXPECT_EQ(VectorIndex::residencyFromString("bogus"), R::None);
+  EXPECT_EQ(VectorIndex::residencyFromString(""), R::None);
+}
+
+// _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, preloadOverrideAppliesResidencyAtOpen) {
+  // The persisted `preload` of this index is the builder default, "none".
+  auto b = buildTmpIndex("", "");
+  const std::string metaPath = vectorMetaFile(b.basename, b.name);
+  const std::string metaBefore = readFile(metaPath);
+
+  // Without an override the persisted value wins: mmap-only.
+  {
+    VectorIndex idx;
+    idx.open(b.basename, b.name);
+    EXPECT_EQ(idx.metadata().config_.preload_, "none");
+    EXPECT_EQ(idx.residency(), VectorIndex::Residency::None);
+  }
+
+  // Drive the exact load-hook path: env var -> parse -> map via
+  // `residencyFromString` -> thread the residency into `open`. The index now
+  // reports the overriding residency although its persisted `preload` (both
+  // on disk and in the loaded metadata) still says "none".
+  EndpointsEnvGuard guard{R"({"images": {"preload": "lock"}})"};
+  auto overrides = embeddingEndpointOverridesFromEnv();
+  auto it = overrides.find(b.name);
+  ASSERT_NE(it, overrides.end());
+  ASSERT_TRUE(it->second.preload_.has_value());
+  VectorIndex idx;
+  idx.open(b.basename, b.name,
+           VectorIndex::residencyFromString(it->second.preload_.value()));
+  EXPECT_EQ(idx.residency(), VectorIndex::Residency::Lock);
+  EXPECT_EQ(idx.metadata().config_.preload_, "none");
   EXPECT_EQ(readFile(metaPath), metaBefore);
   cleanup(b);
 }

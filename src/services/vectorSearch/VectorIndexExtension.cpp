@@ -743,12 +743,13 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
   }
   auto collection = std::make_shared<VectorIndexCollection>();
   std::vector<IndexMetadataFields> metadataFields;
-  // Runtime override of the persisted embedding endpoints (see
-  // `VECTOR_SEARCH_ENDPOINTS_ENV_VAR` in `VectorIndexExtension.h`): applied
-  // IN MEMORY to every matching index below and never written back to the
-  // `.meta` files, so it has to be (and is) reapplied at every server start.
-  // Applied entries are erased, so what remains afterwards is a typo/stale
-  // name to warn about.
+  // Runtime override of the persisted embedding endpoints and RAM residency
+  // (see `VECTOR_SEARCH_ENDPOINTS_ENV_VAR` in `VectorIndexExtension.h`):
+  // applied IN MEMORY to every matching index below -- the "preload" field at
+  // `open` time, the endpoint fields to the opened index -- and never written
+  // back to the `.meta` files, so it has to be (and is) reapplied at every
+  // server start. Applied entries are erased, so what remains afterwards is a
+  // typo/stale name to warn about.
   EmbeddingEndpointOverrides endpointOverrides =
       embeddingEndpointOverridesFromEnv();
   bool any = false;
@@ -760,9 +761,35 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
     }
     const std::string name =
         fn.substr(prefix.size(), fn.size() - prefix.size() - suffix.size());
+    // A "preload" override must be decided AT open time -- residency is
+    // applied when the index is opened -- unlike the embedding-endpoint
+    // fields below, which mutate the already-opened index. `open` treats
+    // `Residency::None` as "use the persisted `preload`", so with no override
+    // (and for an explicit `"preload": "none"`) the persisted value wins. The
+    // entry is NOT erased here: the endpoint fields still apply below, and an
+    // entry for an index that fails to open must survive for the leftover
+    // warning at the end.
+    VectorIndex::Residency residency = VectorIndex::Residency::None;
+    if (auto it = endpointOverrides.find(name);
+        it != endpointOverrides.end() && it->second.preload_.has_value()) {
+      const std::string& preload = it->second.preload_.value();
+      residency = VectorIndex::residencyFromString(preload);
+      if (residency != VectorIndex::Residency::None) {
+        AD_LOG_INFO << "Vector index '" << name
+                    << "': RAM residency overridden to '" << preload
+                    << "' at startup (" << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                    << ")" << std::endl;
+      } else {
+        AD_LOG_WARN << "Vector index '" << name
+                    << "': the \"preload\": \"none\" override keeps the "
+                       "persisted `preload` setting (a runtime override "
+                       "cannot downgrade residency)."
+                    << std::endl;
+      }
+    }
     VectorIndex idx;
     try {
-      idx.open(basename, name);
+      idx.open(basename, name, residency);
     } catch (const std::exception& e) {
       AD_LOG_WARN << "Skipping vector index '" << name << "': " << e.what()
                   << std::endl;
@@ -814,15 +841,20 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                 << ", dim " << idx.dimensions()
                 << ", HNSW=" << (idx.hasHnsw() ? "yes" : "no") << ")"
                 << std::endl;
-    // Apply the environment override BEFORE the metadata fields are collected,
-    // so the `vec:model` metadata triple reflects the effective model.
+    // Apply the endpoint fields of the environment override BEFORE the
+    // metadata fields are collected, so the `vec:model` metadata triple
+    // reflects the effective model. (The "preload" field was already applied
+    // at `open` above.)
     if (auto it = endpointOverrides.find(name); it != endpointOverrides.end()) {
-      idx.setEmbeddingEndpoint(std::move(it->second.embeddingUrl_),
-                               std::move(it->second.embeddingModel_));
+      if (it->second.embeddingUrl_.has_value() ||
+          it->second.embeddingModel_.has_value()) {
+        idx.setEmbeddingEndpoint(std::move(it->second.embeddingUrl_),
+                                 std::move(it->second.embeddingModel_));
+        AD_LOG_INFO << "Vector index '" << name
+                    << "': embedding endpoint overridden from "
+                    << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << std::endl;
+      }
       endpointOverrides.erase(it);
-      AD_LOG_INFO << "Vector index '" << name
-                  << "': embedding endpoint overridden from "
-                  << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << std::endl;
     }
     const VectorIndexConfig& config = idx.metadata().config_;
     metadataFields.push_back({name, config.dimensions_,

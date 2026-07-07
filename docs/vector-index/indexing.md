@@ -146,11 +146,12 @@ to the index in the build spec:
   are persisted in the index's `.meta` file when given. They can also be
   **set or changed at server start — no rebuild needed** — via the environment
   variable `QLEVER_VECTOR_SEARCH_ENDPOINTS`: a JSON object keyed by index
-  name, each value with optional `embeddingUrl`/`embeddingModel` fields:
+  name, each value with optional `embeddingUrl`/`embeddingModel`/`preload`
+  fields:
 
   ```bash
   QLEVER_VECTOR_SEARCH_ENDPOINTS='{"images": {"embeddingUrl": "unix:/siglip2.private", "embeddingModel": "siglip"},
-                                   "metadata": {"embeddingUrl": "unix:/qwen3.private"}}' \
+                                   "metadata": {"embeddingUrl": "unix:/qwen3.private", "preload": "lock"}}' \
     qlever-server -i myindex -p 7001
   ```
 
@@ -158,8 +159,17 @@ to the index in the build spec:
   persisted model, and vice versa). The override is **in-memory only** — the
   on-disk `.meta` is never rewritten — so it is reapplied on every server
   start, and starting without the variable falls back to the persisted
-  endpoint. A malformed value is logged as a warning and ignored; it never
+  values. A malformed value is logged as a warning and ignored; it never
   prevents the server from starting.
+
+- The same variable also overrides the index's **RAM residency**: a `preload`
+  field (`none` | `advise` | `lock` | `aligned`, e.g.
+  `{"metadata": {"preload": "lock"}}`) replaces the `preload` build option
+  persisted in the `.meta`, so an operator can pin a hot index in memory —
+  or prefault a cold one — **without rebuilding it**. Residency is applied
+  when the index is opened at server startup (unlike the endpoint fields, it
+  cannot change on a running server), and `"preload": "none"` cannot
+  downgrade a persisted stronger setting.
 
 ## 4. Serve and query
 
