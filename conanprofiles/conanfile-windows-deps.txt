@@ -1,17 +1,58 @@
 # Conan dependencies for the native Windows (MinGW) build.
 #
-# Same versions as the top-level conanfile.txt, but WITHOUT Boost: on MinGW
-# Boost is built from source (the Conan Boost recipe runs `b2`, which hits a
-# MinGW static-archive bug — see WINDOWS.md). zlib and bzip2 are listed
-# explicitly here because on Linux/macOS they come in transitively via Boost.
-# Iostreams, whereas the Windows build needs them for the spatialjoin
-# dependency. Keep the icu/openssl/zstd versions in sync with conanfile.txt.
+# Same versions as the top-level conanfile.txt. Unlike Linux/macOS, Boost and
+# jemalloc are built through Conan here too. The boost component set is restricted
+# to what QLever links (url, iostreams, program_options, container; the recipe
+# additionally pulls in random/regex/system) because the recipe's default
+# all-component build fails on MinGW in a component QLever does not use. zlib and
+# bzip2 are listed explicitly because on Linux/macOS they arrive transitively via
+# Boost.Iostreams, whereas the Windows build also needs them directly for
+# spatialjoin. Keep the icu/openssl/zstd versions in sync with conanfile.txt.
 [requires]
+boost/1.83.0
 icu/76.1
 openssl/3.1.1
 zstd/1.5.5
 zlib/1.3.2
 bzip2/1.0.8
+jemalloc/5.3.0
+
+[options]
+# jemalloc: keep the je_ prefix so plain malloc/free stay UNexported. The default
+# prefix="" exports C malloc/free and creates the mixed-heap hazard QLever avoids
+# on Windows; prefix=je_ leaves only the (unprefixable) C++ operator new/delete
+# interposed, matching the safe partition in the CMakeLists jemalloc block.
+jemalloc/*:prefix=je_
+# boost: build only the components QLever links. Do NOT disable random/regex/
+# system -- the recipe enforces iostreams->random,regex and random->system, so
+# disabling any of them fails validation. zlib/bzip2 stay at their default (on),
+# which wires the Boost.Iostreams backends against the pinned zlib/bzip2.
+boost/*:numa=False
+boost/*:without_atomic=True
+boost/*:without_chrono=True
+boost/*:without_context=True
+boost/*:without_contract=True
+boost/*:without_coroutine=True
+boost/*:without_date_time=True
+boost/*:without_exception=True
+boost/*:without_fiber=True
+boost/*:without_filesystem=True
+boost/*:without_graph=True
+boost/*:without_graph_parallel=True
+boost/*:without_json=True
+boost/*:without_locale=True
+boost/*:without_log=True
+boost/*:without_math=True
+boost/*:without_mpi=True
+boost/*:without_nowide=True
+boost/*:without_python=True
+boost/*:without_serialization=True
+boost/*:without_stacktrace=True
+boost/*:without_test=True
+boost/*:without_thread=True
+boost/*:without_timer=True
+boost/*:without_type_erasure=True
+boost/*:without_wave=True
 
 [generators]
 CMakeDeps

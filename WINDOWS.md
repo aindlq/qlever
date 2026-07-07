@@ -11,12 +11,11 @@ Reference toolchain (pin fixed versions):
 
 - **Compiler:** [winlibs](https://winlibs.com/) GCC 13.3.0 (UCRT, POSIX threads,
   SEH) — bundles a matching CMake + Ninja.
-- **Libraries via [Conan](https://conan.io/):** ICU, OpenSSL, zstd, zlib, bzip2.
-- **Boost 1.83 from source** (`url`, `iostreams`, `program_options`,
-  `container`; `stacktrace` excluded). On MinGW, b2's `gcc.jam` archive action
-  needs a one-line fix (it backslash-escapes object paths in the `ar` response
-  file, which GNU `ar` strips).
-- **jemalloc** (optional, static) — see the table below.
+- **Libraries via [Conan](https://conan.io/):** ICU, OpenSSL, zstd, zlib, bzip2,
+  Boost 1.83 (`url`, `iostreams`, `program_options`, `container`; `stacktrace`
+  excluded), and jemalloc 5.3.0 (`prefix=je_`; see the table below). The Conan
+  Boost recipe pulls a newer b2 that already carries the one-line MinGW `gcc.jam`
+  archive fix, so the only profile requirement is absolute compiler paths.
 
 With the toolchain on `PATH`:
 
@@ -24,8 +23,7 @@ With the toolchain on `PATH`:
 git config --global core.autocrlf false   # CRLF corrupts binary test data
 git clone https://github.com/ad-freiburg/qlever.git && cd qlever
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_TOOLCHAIN_FILE=/path/to/conan_toolchain.cmake \
-    -DCMAKE_PREFIX_PATH=/path/to/boost-1.83-install
+    -DCMAKE_TOOLCHAIN_FILE=/path/to/conan_toolchain.cmake
 cmake --build build -j 6
 ctest --test-dir build -j 8
 ```
@@ -75,7 +73,7 @@ once and `#undef` the macros that collide with SPARQL/QLever identifiers
 | Coarse sleeps | The ~15.6 ms timer tick makes `sleep_for` too coarse for timeouts/watchdogs. | `--wrap nanosleep64` → high-resolution waitable timer + microsecond residual spin, so `elapsed >= requested`. |
 | Coroutine codegen | GCC-13/MinGW miscompiles SEH unwind tables for some C++20 coroutine frames → crash on unwind (GCC PR 101736/103274). | `-fno-reorder-blocks-and-partition` build-wide. |
 | Open-file limit | The 512-`FILE*` CRT cap breaks the billion-triple vocabulary merge. | `_setmaxstdio(8192)`. |
-| jemalloc | jemalloc can't interpose the CRT `malloc` on MinGW (its C API is `je_`-prefixed by design). | Static `libjemalloc.a` + `-static-libstdc++` routes C++ `new`/`delete` (where QLever's allocation traffic is) through jemalloc; C `malloc` stays on the UCRT heap. |
+| jemalloc | jemalloc can't interpose the CRT `malloc` on MinGW (its C API is `je_`-prefixed by design). | Pulled via Conan with `prefix=je_`; linking the static archive with `-static-libstdc++` routes C++ `new`/`delete` (where QLever's allocation traffic is) through jemalloc, while C `malloc` stays on the UCRT heap — so the shipped binary is fully static. |
 
 ### Vocabulary reads
 
