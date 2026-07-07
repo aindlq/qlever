@@ -15,12 +15,12 @@ concurrency:
   cancel-in-progress: true
 
 # The Windows port is built against a PINNED toolchain that matches the Linux CI
-# (GCC 13.3, Boost 1.83), reproduced from scratch the first time and then served
-# from the caches below. See WINDOWS.md for the rationale.
+# (GCC 13.3), reproduced from scratch the first time and then served from the
+# caches below. See WINDOWS.md for the rationale.
 #
 #   - winlibs MinGW-w64 GCC 13.3.0 (UCRT, posix, seh)  -> cached in C:\winlibs13
-#   - Conan builds ICU/OpenSSL/zstd/zlib/bzip2 from source -> cached in CONAN_HOME
-#   - Boost 1.83 built from source with the b2 archive fix -> cached in BOOST_INSTALL
+#   - Conan builds ICU/OpenSSL/zstd/zlib/bzip2/Boost/jemalloc from source
+#     -> cached in CONAN_HOME
 #
 # A cold cache pays the full ~60 min build once; warm runs restore the prebuilt
 # dependencies and only compile QLever + run the tests.
@@ -29,14 +29,8 @@ env:
   WINLIBS_VERSION: "13.3.0posix-11.0.1-ucrt-r1"
   WINLIBS_URL: "https://github.com/brechtsanders/winlibs_mingw/releases/download/13.3.0posix-11.0.1-ucrt-r1/winlibs-x86_64-posix-seh-gcc-13.3.0-mingw-w64ucrt-11.0.1-r1.zip"
   WINLIBS_DIR: "C:\\winlibs13"
-  BOOST_VERSION: "1.83.0"
-  BOOST_INSTALL: "C:\\boost-1.83"
   # Pin the Conan home so the cache path is stable.
   CONAN_HOME: "C:\\conan2"
-  # jemalloc — QLever's default allocator (Linux links it too). Built static with
-  # C++ support so its unprefixed operator new/delete serve QLever's C++ heap.
-  JEMALLOC_VERSION: "5.3.0"
-  JEMALLOC_INSTALL: "C:\\jemalloc"
 
 jobs:
   build:
@@ -92,71 +86,15 @@ jobs:
         shell: bash
         run: g++ --version && cmake --version && ninja --version
 
-      # --- MSYS2 tools needed by the autotools-based Conan deps (OpenSSL, ICU)
-      # and the jemalloc build (gawk, for its private-symbol generation) --------
+      # --- MSYS2 tools needed by the autotools-based Conan deps (OpenSSL, ICU,
+      # jemalloc): make/perl/autoconf, plus gawk for jemalloc's symbol generation.
       # windows-2022 ships MSYS2 at C:\msys64; make sure make/perl/autotools/gawk exist.
       - name: Install MSYS2 build tools (make, perl, autoconf, gawk)
         shell: pwsh
         run: |
           C:\msys64\usr\bin\pacman.exe -S --noconfirm --needed make perl autoconf automake libtool tar gawk
 
-      # --- jemalloc (cached): QLever's default allocator. Built BEFORE Conan/Boost
-      # because it depends only on winlibs + MSYS2 — so iterating on jemalloc never
-      # invalidates or rebuilds the expensive Conan/Boost caches. ---------------
-      - name: Cache jemalloc (restore)
-        id: cache-jemalloc
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.JEMALLOC_INSTALL }}
-          key: jemalloc-${{ env.JEMALLOC_VERSION }}-windows-gcc13-v2
-
-      - name: Build jemalloc from source
-        if: steps.cache-jemalloc.outputs.cache-hit != 'true'
-        # MSYS2 bash, NOT the default Git bash: jemalloc's Makefile uses $(SHELL)
-        # unquoted, and Git's sh lives under "C:/Program Files/Git/..." — the space
-        # splits the command ("C:/Program: No such file or directory", Error 127).
-        # MSYS2's sh is at C:\msys64 (no space), like the Conan autotools deps use.
-        shell: 'C:\msys64\usr\bin\bash.exe -eo pipefail {0}'
-        run: |
-          set -e
-          # winlibs gcc/nm + the MSYS2 toolset (sh/make/gawk/tar) on PATH.
-          export PATH="/c/winlibs13/mingw64/bin:/usr/bin:/bin:/c/Windows/System32:$PATH"
-          # On MinGW (pecoff) jemalloc's C API is je_-prefixed by design, so plain
-          # malloc/free stay on the UCRT heap, but its C++ operator new/delete are
-          # exported UNPREFIXED, so linking the static archive routes all of QLever's
-          # C++ allocations through jemalloc (see CMakeLists QLEVER-MINGW-JEMALLOC).
-          # --enable-cxx is the default. jemalloc's pecoff build names the static lib
-          # jemalloc_s.lib, but QLever's find_library expects libjemalloc.a, so we
-          # install it under that name.
-          curl.exe -sL -o jemalloc.tar.bz2 "https://github.com/jemalloc/jemalloc/releases/download/${JEMALLOC_VERSION}/jemalloc-${JEMALLOC_VERSION}.tar.bz2"
-          tar xjf jemalloc.tar.bz2
-          cd "jemalloc-${JEMALLOC_VERSION}"
-          # Force the native mingw triplet: under MSYS2 bash config.guess reports
-          # x86_64-pc-msys, which jemalloc rejects ("Unsupported operating system")
-          # and which drags in a broken pthread path (pthread_create undeclared).
-          # --host/--build pin native mingw (pecoff) so the je_-prefixed C API and
-          # the unprefixed C++ operators get built. CC=gcc keeps winlibs' gcc.
-          ./configure --build=x86_64-w64-mingw32 --host=x86_64-w64-mingw32 \
-            CC=gcc CXX=g++ --disable-shared --enable-static
-          make -j4 build_lib_static
-          JDST="${JEMALLOC_INSTALL//\\//}"
-          mkdir -p "$JDST/lib" "$JDST/include"
-          A=$(find lib \( -name 'jemalloc_s.lib' -o -name 'libjemalloc.a' \) | head -1)
-          cp "$A" "$JDST/lib/libjemalloc.a"
-          strip --strip-debug "$JDST/lib/libjemalloc.a" || true
-          cp -r include/jemalloc "$JDST/include/"
-          # Fail loudly if the C++ override isn't present (LLP64: operator new == _Znwy).
-          nm "$JDST/lib/libjemalloc.a" | grep -q ' T _Znwy' \
-            || { echo "ERROR: jemalloc built without C++ operators"; exit 1; }
-
-      - name: Cache jemalloc (save)
-        if: steps.cache-jemalloc.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.JEMALLOC_INSTALL }}
-          key: jemalloc-${{ env.JEMALLOC_VERSION }}-windows-gcc13-v2
-
-      # --- Conan dependencies (ICU/OpenSSL/zstd/zlib/bzip2, cached) -------------
+      # --- Conan dependencies (ICU/OpenSSL/zstd/zlib/bzip2/Boost/jemalloc, cached) -------------
       - name: Install Conan
         shell: bash
         run: |
@@ -171,7 +109,7 @@ jobs:
           path: ${{ env.CONAN_HOME }}
           key: conan-windows-gcc13-${{ hashFiles('conanprofiles/gcc-13-windows', 'conanprofiles/conanfile-windows-deps.txt') }}
 
-      - name: Conan install (dependencies except Boost)
+      - name: Conan install (all dependencies)
         shell: bash
         run: |
           conan install conanprofiles/conanfile-windows-deps.txt \
@@ -185,87 +123,20 @@ jobs:
           path: ${{ env.CONAN_HOME }}
           key: conan-windows-gcc13-${{ hashFiles('conanprofiles/gcc-13-windows', 'conanprofiles/conanfile-windows-deps.txt') }}
 
-      # --- Boost 1.83 from source with the b2 archive fix (cached) -------------
-      - name: Cache Boost install (restore)
-        id: cache-boost
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.BOOST_INSTALL }}
-          key: boost-${{ env.BOOST_VERSION }}-windows-gcc13-v2
-
-      - name: Build Boost from source
-        if: steps.cache-boost.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -e
-          # Boost.Iostreams only compiles its zlib/bzip2 backends if b2 finds those
-          # libraries at build time. The windows-2022 runner happens to have an
-          # ambient zlib so it auto-detects one, but that is fragile and may not be
-          # the zlib the rest of QLever links; on a clean toolchain it finds none
-          # and silently builds Iostreams WITHOUT zlib, so linking qlever-server
-          # later fails with "undefined reference to boost::iostreams::detail::
-          # zlib_base::*". Point b2 explicitly at the pinned Conan zlib/bzip2 (same
-          # packages spatialjoin uses) so the backends are always built. The lib
-          # dir is the include's sibling; the static libs are libz.a / libbz2.a.
-          ZINC=$(grep -rhoiE 'C:/[^";]*zlib[^";]*/include' build | head -1)
-          BINC=$(grep -rhoiE 'C:/[^";]*bzip2[^";]*/include' build | head -1)
-          ZLIB_LIB="${ZINC%/include}/lib"; BZ2_LIB="${BINC%/include}/lib"
-          BV_US=${BOOST_VERSION//./_}
-          curl.exe -sL -o boost.tar.gz "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BV_US}.tar.gz"
-          tar xzf boost.tar.gz
-          cd "boost_${BV_US}"
-          # MinGW b2 archive fix: the static-library archive action writes object
-          # paths into the `ar` response file with native backslashes, which GNU
-          # `ar` treats as escapes and strips. Make it use forward-slash, target-
-          # relative paths like b2's own link actions already do ($(>) -> $(>:T)).
-          sed -i 's/:E="$(>)"/:E="$(>:T)"/' tools/build/src/tools/gcc.jam
-          ./bootstrap.bat gcc
-          # Only the compiled Boost libraries QLever links; stacktrace excluded.
-          ./b2 toolset=gcc address-model=64 variant=release link=static \
-            threading=multi runtime-link=shared \
-            --with-url --with-iostreams --with-program_options --with-container \
-            -sZLIB_INCLUDE="$ZINC" -sZLIB_LIBPATH="$ZLIB_LIB" -sZLIB_BINARY=z \
-            -sBZIP2_INCLUDE="$BINC" -sBZIP2_LIBPATH="$BZ2_LIB" -sBZIP2_BINARY=bz2 \
-            --prefix="${BOOST_INSTALL}" -j2 install
-
-      - name: Cache Boost install (save)
-        if: steps.cache-boost.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.BOOST_INSTALL }}
-          key: boost-${{ env.BOOST_VERSION }}-windows-gcc13-v2
-
-      # Fail loudly (fresh OR cached Boost) if Boost.Iostreams was built WITHOUT
-      # the zlib backend — b2 silently omits it when it can't find zlib, and the
-      # only later symptom is an opaque link error ("undefined reference to
-      # boost::iostreams::detail::zlib_base::*") when qlever-server links.
-      - name: Verify Boost.Iostreams has the zlib backend
-        shell: bash
-        run: |
-          IOS_LIB=$(ls "${BOOST_INSTALL//\\//}"/lib/libboost_iostreams*.a | head -1)
-          if [ -z "$IOS_LIB" ] || ! nm "$IOS_LIB" | grep -q 'zlib_base'; then
-            echo "ERROR: Boost.Iostreams (${IOS_LIB:-not found}) has no zlib backend."
-            echo "b2 silently built it without zlib; qlever-server would fail to link."
-            exit 1
-          fi
-          echo "OK: Boost.Iostreams contains the zlib backend ($IOS_LIB)."
-
-      # --- spatialjoin needs zlib/bzip2 headers; the jemalloc test needs its header
-      - name: Export include paths (zlib/bzip2 for spatialjoin, jemalloc for the test)
+      # --- spatialjoin needs zlib/bzip2 headers via CPLUS_INCLUDE_PATH ----------
+      - name: Export include paths (zlib/bzip2 for spatialjoin)
         shell: bash
         run: |
           ZINC=$(grep -rhoiE 'C:/[^";]*zlib[^";]*/include' build | head -1)
           BINC=$(grep -rhoiE 'C:/[^";]*bzip2[^";]*/include' build | head -1)
-          JINC="${JEMALLOC_INSTALL//\\//}/include"
           echo "Using zlib include:     $ZINC"
           echo "Using bzip2 include:    $BINC"
-          echo "Using jemalloc include: $JINC"
-          echo "CPLUS_INCLUDE_PATH=${ZINC};${BINC};${JINC}" >> $GITHUB_ENV
+          echo "CPLUS_INCLUDE_PATH=${ZINC};${BINC}" >> $GITHUB_ENV
           echo "C_INCLUDE_PATH=${ZINC};${BINC}" >> $GITHUB_ENV
 
       # --- Configure / build / test (one static + jemalloc build) ---------------
-      # jemalloc is found via CMAKE_PREFIX_PATH, so the jemalloc block links it and
-      # makes the whole build fully static (see CMakeLists QLEVER-MINGW-JEMALLOC) —
+      # jemalloc is found via the Conan toolchain file, so the jemalloc block links
+      # it and makes the whole build fully static (see CMakeLists QLEVER-MINGW-JEMALLOC) —
       # which is also exactly the binary we ship. SINGLE_TEST_BINARY=ON links all
       # unit tests into one executable: static test exes are large, and one binary
       # keeps the runner's disk in check. _NO_TIMING_TESTS=ON: the sleep-precision
@@ -276,7 +147,6 @@ jobs:
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} \
             -DCMAKE_TOOLCHAIN_FILE="$(pwd)/build/conan_toolchain.cmake" \
-            -DCMAKE_PREFIX_PATH="${BOOST_INSTALL//\\//};${JEMALLOC_INSTALL//\\//}" \
             -DSINGLE_TEST_BINARY=ON \
             -D_NO_TIMING_TESTS=ON
 
