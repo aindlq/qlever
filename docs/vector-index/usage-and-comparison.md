@@ -1,12 +1,75 @@
 # Vector search in QLever — SPARQL usage & how it differs from PR #3043
 
-Two parts: (1) how an end user drives it from SPARQL, use case by use case;
-(2) how the storage/query mechanism differs from the in-house embeddings PR
+Three parts: (1) how you **build** an index — the inputs and the settings config;
+(2) how you **query** it from SPARQL, use case by use case; (3) how the
+storage/query mechanism differs from the in-house embeddings PR
 [ad-freiburg/qlever#3043](https://github.com/ad-freiburg/qlever/pull/3043), and
-why. For building indices see [`indexing.md`](indexing.md); for the rationale
+why. For more build detail see [`indexing.md`](indexing.md); for the rationale
 see [`index-payload-design.md`](index-payload-design.md).
 
-## Part 1 — Using it from SPARQL
+## Part 1 — Building an index
+
+Vectors are payload, not RDF, so you don't write them as triples. You point
+`qlever-index` at a **binary bundle** (the vectors) plus a small **config**,
+passed as the `--service-index` JSON. That JSON is `{"vectorSearch": [ … ]}`;
+each array entry builds one named index.
+
+```bash
+qlever-index -i myindex -f kg.ttl -F ttl \
+  --service-index '{"vectorSearch":[
+     {"name":"emb","npy":"emb.npy","iris":"emb.iris",
+      "metric":"cosine","scalar":"bf16","hnsw":true}
+  ]}'
+```
+
+This builds the normal QLever index from `kg.ttl`, then the vector index `emb`
+from the bundle. It's reachable in queries as `vidx:emb`
+(= `<…/vectorSearch/index/emb>`), the same IRI you introspect.
+
+### Input — exactly one source per index
+
+- **`npy`** *(recommended)* — an `N × D` matrix `.npy`, **float32** (`<f4`) or
+  **ml_dtypes bfloat16** (`<V2`), C-order; row *i* is entity *i*'s vector. Paired
+  with `iris`. The bulk path (near-zero-copy for the ×64 dims real models use).
+- **`texts`** — a text file, one item per line; the builder **embeds each line
+  at build time** via `embeddingUrl`/`embeddingModel` — no precompute. Paired
+  with `iris`.
+- **`parquet`** — a Parquet file with a `uri` column and an `embedding` column
+  (opt-in; needs Arrow, `-DQLEVER_VECTOR_SEARCH_PARQUET=ON`). Its `uri` column
+  supplies the IRIs, so `iris` is optional.
+
+`iris` is one **entity IRI per line** (bare `http://…/doc1` or bracketed
+`<http://…/doc1>`), row-aligned with the matrix; each IRI must already exist in
+the KG (otherwise that row is skipped with a warning).
+
+### Settings keys (one `vectorSearch` entry)
+
+| key | default | meaning |
+|---|---|---|
+| `name` | — | index name → `vidx:<name>` in queries |
+| `npy` / `texts` / `parquet` | — | the input source — **exactly one** |
+| `iris` | — | row-aligned entity-IRI list (for `npy`/`texts`) |
+| `metric` | `cosine` | `cosine` \| `dot` \| `l2` — the space's metric (distance is smaller-is-closer) |
+| `scalar` | `f32` | storage precision `f32` \| `f16` \| `bf16` \| `i8`, **independent** of the `.npy` dtype (an `<f4` file + `scalar:"bf16"` stores 2-byte bf16) |
+| `dimensions` | *(inferred)* | if set, cross-checked against the source → **hard error** on mismatch (handy for matryoshka) |
+| `hnsw` | `true` | build the HNSW graph (required for the `SERVICE`; exact brute force works without it) |
+| `hnswConnectivity` | `16` | HNSW graph degree (M) |
+| `hnswExpansionAdd` | `128` | HNSW build-time `ef` |
+| `hnswExpansionSearch` | `64` | HNSW query-time `ef` (recall vs. latency) |
+| `embeddingUrl` | — | query-time embed endpoint: `http(s)://host:port` **or** `unix:/path/to.sock` (client appends `/v1/embeddings`) |
+| `embeddingModel` | — | model name sent to the endpoint; also the **model identity** stamped into the typed query literal (comparability) |
+| `buildThreads` | `0` (auto) | index-build parallelism |
+| `alignRows` | `false` | pad each row to a 64-byte SIMD boundary (a no-op for ×64 dims) |
+| `preload` | `none` | residency: `none` (mmap) \| `advise` \| `lock` (mlock) \| `aligned` (huge-page copy) — pin a hot, fits-in-RAM index |
+| `remap` | `false` | on KG rebuild, re-resolve IRIs + rewrite only the id sidecar (keep the matrix) |
+
+For **normalized** embeddings (SigLIP2, Qwen3): use `metric:"dot"` (cosine ≡ dot
+on unit vectors, and dot skips the norm) and `scalar:"bf16"` (half the RAM,
+lossless from the fp32/bf16 input). `embeddingUrl`/`embeddingModel` are needed
+only for query-time `vec:embed` (text/image queries); a vector-only index can
+omit them and query with entity / inline / `vec:vector` sources.
+
+## Part 2 — Querying it from SPARQL
 
 Every query uses these prefixes:
 
@@ -106,15 +169,9 @@ SELECT ?model ?dim ?metric ?count WHERE {
 }
 ```
 
-### Getting vectors in (one line)
-No RDF for the vectors — a `.npy` matrix (fp32 or ml_dtypes bf16) + a bare-IRI
-`.iris` list, fed to `qlever-index --service-index '{"vectorSearch":[{…}]}'`
-(keys: `name, npy, iris, metric, scalar, hnsw, embeddingUrl, embeddingModel`).
-For normalized embeddings (SigLIP2, Qwen3): `metric:"dot"`, `scalar:"bf16"`.
-
 ---
 
-## Part 2 — How our mechanism differs from PR #3043, and why
+## Part 3 — How our mechanism differs from PR #3043, and why
 
 Both projects independently reached the *same core insight* — a vector is a
 first-class thing decoded to a compact sidecar, not re-parsed per query, and the
