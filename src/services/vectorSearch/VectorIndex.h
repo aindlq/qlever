@@ -101,8 +101,8 @@ class VectorIndex {
   void makeResident(Residency residency);
 
   // The RAM-residency strategy most recently applied (best-effort) to the
-  // flat store: the persisted `preload` or the `open(..., residency)`
-  // override. `None` if nothing was requested, the store is empty, or the
+  // flat store: the `open(..., residency)` argument (the "preload" serving
+  // setting). `None` if nothing was requested, the store is empty, or the
   // fits-in-RAM gate skipped the request; degradation WITHIN a level (mlock
   // denied, aligned-copy allocation failure) still reports the requested
   // level, matching the warnings `makeResident` logs. Observational only
@@ -111,10 +111,9 @@ class VectorIndex {
 
   // Map a `preload` configuration string ("advise", "lock", "aligned") to the
   // corresponding `Residency`; anything else (including "none") maps to
-  // `Residency::None`. Used for the persisted `preload` metadata value at
-  // `open()` and for the per-index `preload` runtime override from the
-  // `QLEVER_VECTOR_SEARCH_ENDPOINTS` environment variable (see
-  // `VectorIndexExtension.h`).
+  // `Residency::None`. Used for the per-index `preload` serving setting from
+  // the `QLEVER_VECTOR_SEARCH_ENDPOINTS` environment variable (see
+  // `VectorIndexExtension.h`), which the load hook threads into `open()`.
   static Residency residencyFromString(const std::string& s);
 
   // Metadata accessors.

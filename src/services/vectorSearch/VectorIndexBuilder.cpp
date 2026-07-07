@@ -10,7 +10,6 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <numeric>
@@ -227,14 +226,11 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   perm.shrink_to_fit();
   const size_t n = rows.size();
 
-  // Byte stride between consecutive rows in the flat store. With `alignRows_`
-  // every row starts at a 64-byte boundary (the mmap base is page-aligned, so
-  // `base + i*stride` is 64-byte aligned when `stride % 64 == 0`), which the
-  // SIMD distance kernels prefer. The pad tail `[rowBytes_, stride)` is never
-  // read by the metric (it reads only `dimensions` scalars); it is zero-filled
-  // for determinism. Without `alignRows_` the stride equals the raw row length,
-  // so the output is byte-identical to an unpadded (v4-style) build.
-  const size_t stride = config_.alignRows_ ? alignUp(rowBytes_) : rowBytes_;
+  // Byte stride between consecutive rows in the flat store: the natural row
+  // byte length. Real embedding dimensions are multiples of 64, so this is
+  // already 64-byte aligned; the NumKong distance kernels use unaligned loads
+  // with masked tails regardless, so alignment never affects correctness.
+  const size_t stride = rowBytes_;
 
   const size_t numThreads =
       config_.buildThreads_ > 0
@@ -262,11 +258,6 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     data.open(n * stride, tmp(dataPath));
     ad_utility::File spill{vecSpillPath_.c_str(), "r"};
     char* dataBegin = n > 0 ? &data[0] : nullptr;
-    // Zero the pad tails once up front (only when padding is present); the
-    // per-row reads below overwrite the leading `rowBytes_` of every stride.
-    if (stride != rowBytes_ && dataBegin != nullptr) {
-      std::memset(dataBegin, 0, n * stride);
-    }
     parallelOverRows(
         n, numThreads, [&](size_t, size_t first, size_t last, auto& stop) {
           for (size_t i = first; i < last; ++i) {

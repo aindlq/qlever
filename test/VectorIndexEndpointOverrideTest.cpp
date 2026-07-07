@@ -61,10 +61,10 @@ struct BuiltIndex {
   std::string name = "images";
 };
 
-// Build a tiny on-disk vector index whose persisted config carries the given
-// embedding endpoint (either may be empty, as for the `npy`/`parquet` build
-// sources).
-BuiltIndex buildTmpIndex(std::string url, std::string model) {
+// Build a tiny on-disk vector index. Endpoints and residency are serving
+// concerns and are never persisted, so a freshly built index is always
+// vector-only until an override is applied at load.
+BuiltIndex buildTmpIndex() {
   BuiltIndex b;
   b.basename = uniqueTmpBasename();
   VectorIndexConfig cfg;
@@ -72,8 +72,6 @@ BuiltIndex buildTmpIndex(std::string url, std::string model) {
   cfg.dimensions_ = 4;
   cfg.metric_ = VectorMetric::Cosine;
   cfg.buildHnsw_ = false;
-  cfg.embeddingUrl_ = std::move(url);
-  cfg.embeddingModel_ = std::move(model);
   VectorIndexBuilder builder{b.basename, cfg};
   std::vector<float> v{1.f, 0.f, 0.f, 0.f};
   builder.add(Id::makeFromVocabIndex(VocabIndex::make(42)), "<http://ex/42>",
@@ -193,14 +191,15 @@ TEST(VectorIndexEndpointOverride, envVarRoundTrip) {
 
 // _____________________________________________________________________________
 TEST(VectorIndexEndpointOverride, overrideIsInMemoryOnly) {
-  auto b = buildTmpIndex("http://build-time:8080", "clip");
+  auto b = buildTmpIndex();
   const std::string metaPath = vectorMetaFile(b.basename, b.name);
   const std::string metaBefore = readFile(metaPath);
 
   VectorIndex idx;
   idx.open(b.basename, b.name);
-  EXPECT_EQ(idx.metadata().config_.embeddingUrl_, "http://build-time:8080");
-  EXPECT_EQ(idx.metadata().config_.embeddingModel_, "clip");
+  // The endpoint is never persisted, so a freshly built index is vector-only.
+  EXPECT_TRUE(idx.metadata().config_.embeddingUrl_.empty());
+  EXPECT_TRUE(idx.metadata().config_.embeddingModel_.empty());
 
   // Apply the override exactly as the load hook does: read the env var, look
   // up the opened index's name, and mutate the in-memory config.
@@ -215,23 +214,25 @@ TEST(VectorIndexEndpointOverride, overrideIsInMemoryOnly) {
   EXPECT_EQ(idx.metadata().config_.embeddingUrl_, "unix:/siglip2.private");
   EXPECT_EQ(idx.metadata().config_.embeddingModel_, "siglip");
 
-  // The persisted `.meta` is byte-identical, and a fresh open (a server start
-  // without the env var) still reports the build-time endpoint: the override
-  // never reached the disk.
+  // The `.meta` is byte-identical (the override never reached the disk), and a
+  // fresh open (a server start without the env var) is vector-only again.
   EXPECT_EQ(readFile(metaPath), metaBefore);
   VectorIndex reopened;
   reopened.open(b.basename, b.name);
-  EXPECT_EQ(reopened.metadata().config_.embeddingUrl_,
-            "http://build-time:8080");
-  EXPECT_EQ(reopened.metadata().config_.embeddingModel_, "clip");
+  EXPECT_TRUE(reopened.metadata().config_.embeddingUrl_.empty());
+  EXPECT_TRUE(reopened.metadata().config_.embeddingModel_.empty());
   cleanup(b);
 }
 
 // _____________________________________________________________________________
 TEST(VectorIndexEndpointOverride, partialOverrideKeepsOtherField) {
-  auto b = buildTmpIndex("http://build-time:8080", "clip");
+  auto b = buildTmpIndex();
   VectorIndex idx;
   idx.open(b.basename, b.name);
+  // Establish an in-memory baseline endpoint (as a full override would).
+  idx.setEmbeddingEndpoint("http://build-time:8080", "clip");
+  EXPECT_EQ(idx.metadata().config_.embeddingUrl_, "http://build-time:8080");
+  EXPECT_EQ(idx.metadata().config_.embeddingModel_, "clip");
 
   // URL only: the model stays.
   idx.setEmbeddingEndpoint("unix:/new.sock", std::nullopt);
@@ -252,9 +253,9 @@ TEST(VectorIndexEndpointOverride, partialOverrideKeepsOtherField) {
 
 // _____________________________________________________________________________
 TEST(VectorIndexEndpointOverride, overrideSetsEndpointOnVectorOnlyIndex) {
-  // An index built WITHOUT an endpoint (the optional `npy`/`parquet` case)
-  // can be given one at server start.
-  auto b = buildTmpIndex("", "");
+  // A vector-only index (the only kind the builder produces, since endpoints
+  // are never persisted) can be given an endpoint at server start.
+  auto b = buildTmpIndex();
   const std::string metaPath = vectorMetaFile(b.basename, b.name);
   const std::string metaBefore = readFile(metaPath);
 
@@ -291,12 +292,12 @@ TEST(VectorIndexEndpointOverride, residencyFromString) {
 
 // _____________________________________________________________________________
 TEST(VectorIndexEndpointOverride, preloadOverrideAppliesResidencyAtOpen) {
-  // The persisted `preload` of this index is the builder default, "none".
-  auto b = buildTmpIndex("", "");
+  // With no override the residency is the default, "none" (mmap-only).
+  auto b = buildTmpIndex();
   const std::string metaPath = vectorMetaFile(b.basename, b.name);
   const std::string metaBefore = readFile(metaPath);
 
-  // Without an override the persisted value wins: mmap-only.
+  // Without an override the default wins: mmap-only.
   {
     VectorIndex idx;
     idx.open(b.basename, b.name);
@@ -306,8 +307,8 @@ TEST(VectorIndexEndpointOverride, preloadOverrideAppliesResidencyAtOpen) {
 
   // Drive the exact load-hook path: env var -> parse -> map via
   // `residencyFromString` -> thread the residency into `open`. The index now
-  // reports the overriding residency although its persisted `preload` (both
-  // on disk and in the loaded metadata) still says "none".
+  // reports the requested residency; the `preload` config field (never
+  // persisted, so always its default) still reads "none".
   EndpointsEnvGuard guard{R"({"images": {"preload": "lock"}})"};
   auto overrides = embeddingEndpointOverridesFromEnv();
   auto it = overrides.find(b.name);

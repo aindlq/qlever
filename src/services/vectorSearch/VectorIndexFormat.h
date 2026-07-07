@@ -53,10 +53,12 @@ namespace qlever::vector {
 // `vocabSize` fingerprint; 3 = row-keyed graph-only `.hnsw`, `.iris` +
 // `.rowmap` sidecars, tombstones (cheap remapping after a KG re-index);
 // 4 = `.data` holds the configured scalar type (f32/f16/i8) as raw bytes;
-// 5 = added an explicit per-row byte STRIDE (`rowStrideBytes_`) so that rows
-//     can be padded to a 64-byte SIMD-friendly boundary (opt-in; when unpadded
-//     the stride equals the row's raw byte length, so v5 is otherwise identical
-//     to v4). Version 4 indices still load unchanged (their stride is derived).
+// 5 = added an explicit per-row byte STRIDE (`rowStrideBytes_`); it always
+//     equals the natural row byte length `dimensions * bytesPerScalar`, so v5
+//     is otherwise identical to v4. (Historically v5 also allowed opt-in
+//     64-byte row padding; that build option was removed and the stride is now
+//     always the natural length.) Version 4 indices still load unchanged
+//     (their stride is derived).
 inline constexpr uint32_t VECTOR_INDEX_VERSION = 5;
 
 // The set of on-disk versions this binary can still read. A v4 index (no
@@ -202,49 +204,38 @@ struct VectorIndexConfig {
   // Build-time only (not persisted).
   uint32_t buildThreads_ = 0;
 
-  // If true, pad every stored row up to a 64-byte (AVX-512 / cache-line)
-  // boundary so that the SIMD distance kernels load each vector from an aligned
-  // address (avoids split-cache-line/-page penalties on the sequential scan).
-  // Off by default so unpadded builds stay byte-identical. Build-time only; the
-  // resulting per-row stride is persisted as `rowStrideBytes_`.
-  bool alignRows_ = false;
-
   // RAM-residency preference for the flat store, applied by the loader at
   // `open()`: "none" (mmap, paged on demand), "advise" (MADV_WILLNEED
   // prefault), "lock" (also mlock -- fault-free, non-evictable), or "aligned"
-  // (a huge-page-backed, 64-byte-aligned RAM copy). Persisted so the index
-  // author can pick a default; gated on fits-in-RAM at load time. An explicit
-  // `open(..., residency)` argument overrides this -- the load hook passes
-  // one for a per-index "preload" runtime override from the
+  // (a huge-page-backed, 64-byte-aligned RAM copy). Gated on fits-in-RAM at
+  // load time. NOT persisted: this is a serving concern, set solely IN MEMORY
+  // at server start from the per-index "preload" field of the
   // `QLEVER_VECTOR_SEARCH_ENDPOINTS` environment variable (see
-  // `VectorIndexExtension.h`), so residency can be changed at server start
-  // without a rebuild.
+  // `VectorIndexExtension.h`), which the load hook threads into
+  // `open(..., residency)`. Defaults to "none" and stays "none" when unset.
   std::string preload_ = "none";
 
-  // Optional embedding endpoint, bound to this index so that query-time
-  // embedding always uses the SAME model that produced the index.
+  // Query-time embedding endpoint of this index (what `vec:embed` POSTs to,
+  // and the model identity stamped into the typed query-vector literal).
   // `embeddingUrl_` is an OpenAI-compatible base URL (the client appends
-  // `/v1/embeddings`); empty means the index is vector-only (no
-  // `vec:queryText`).
+  // `/v1/embeddings`); empty means the index is vector-only (no `vec:embed`).
+  // NOT persisted: like `preload_`, a serving concern set solely IN MEMORY at
+  // server start from `QLEVER_VECTOR_SEARCH_ENDPOINTS` (see
+  // `setEmbeddingEndpoint`). Both default to empty.
   std::string embeddingUrl_;
   std::string embeddingModel_;
 };
 
 // One vector index to build during `qlever index`: its configuration plus the
-// input files (a `.npy` float matrix + a row-aligned IRI list, a texts file to
-// embed, or a Parquet file). Each input IRI is resolved against the freshly
-// built knowledge-graph vocabulary; rows whose IRI is unknown are skipped.
+// input files -- a precomputed `.npy` float matrix and a row-aligned IRI list.
+// Each input IRI is resolved against the freshly built knowledge-graph
+// vocabulary; rows whose IRI is unknown are skipped.
 struct VectorIndexBuildSpec {
   VectorIndexConfig config_;
-  // Row-aligned IRI list (not used for the Parquet input, which carries the
-  // URIs itself).
+  // Row-aligned entity-IRI list, one per matrix row.
   std::string irisPath_;
-  // Exactly one source of vectors:
-  std::string npyPath_;      // precomputed vectors in a .npy matrix, or
-  std::string textsPath_;    // a row-aligned file of texts to embed at index
-                             // time (requires `config_.embeddingUrl_`), or
-  std::string parquetPath_;  // a Parquet file with `uri` + `embedding` columns
-                             // (requires -DQLEVER_VECTOR_SEARCH_PARQUET=ON).
+  // The precomputed vectors as an N x D `.npy` matrix.
+  std::string npyPath_;
   // If true, do not build anything: re-resolve the existing index's `.iris`
   // against the (re-indexed) knowledge graph and rewrite `.keys`/`.rowmap`.
   bool remap_ = false;
@@ -265,11 +256,9 @@ struct VectorIndexMetadata {
   // vocabulary and skips (with a warning suggesting a remap) any vector index
   // that does not match.
   uint64_t vocabSize_ = 0;
-  // Byte stride between consecutive rows in `.data` (>= the raw row byte
-  // length `dimensions * bytesPerScalar`). 0 means "not stored" (a v4 index),
-  // in which case the loader derives it as the raw row byte length. When rows
-  // are 64-byte aligned this is the padded stride; the distance kernels still
-  // read only `dimensions` scalars, so the pad tail is never touched.
+  // Byte stride between consecutive rows in `.data`. Always the natural row
+  // byte length `dimensions * bytesPerScalar`. 0 means "not stored" (a v4
+  // index), in which case the loader derives it as the raw row byte length.
   uint64_t rowStrideBytes_ = 0;
   // Fingerprint of the knowledge-graph vocabulary's collation
   // (`LocaleManager::getCollationIdentifier()`) at (re)mapping time. The
@@ -321,13 +310,15 @@ inline void to_json(nlohmann::json& j, const VectorIndexMetadata& m) {
                      {"hnswConnectivity", m.config_.hnswConnectivity_},
                      {"hnswExpansionAdd", m.config_.hnswExpansionAdd_},
                      {"hnswExpansionSearch", m.config_.hnswExpansionSearch_},
-                     {"embeddingUrl", m.config_.embeddingUrl_},
-                     {"embeddingModel", m.config_.embeddingModel_},
                      {"version", m.version_},
                      {"vocabSize", m.vocabSize_},
                      {"rowStrideBytes", m.rowStrideBytes_},
-                     {"preload", m.config_.preload_},
                      {"collationLocale", m.collationLocale_}};
+  // NOTE: `embeddingUrl`/`embeddingModel`/`preload` are deliberately NOT
+  // persisted -- they are serving concerns set at server start from the
+  // `QLEVER_VECTOR_SEARCH_ENDPOINTS` environment variable (see
+  // `VectorIndexExtension.h`). Older `.meta` files may still carry those keys;
+  // `from_json` simply ignores them.
 }
 
 inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
@@ -341,14 +332,14 @@ inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
   j.at("hnswConnectivity").get_to(m.config_.hnswConnectivity_);
   j.at("hnswExpansionAdd").get_to(m.config_.hnswExpansionAdd_);
   j.at("hnswExpansionSearch").get_to(m.config_.hnswExpansionSearch_);
-  m.config_.embeddingUrl_ = j.value("embeddingUrl", std::string{});
-  m.config_.embeddingModel_ = j.value("embeddingModel", std::string{});
   j.at("version").get_to(m.version_);
   m.vocabSize_ = j.value("vocabSize", uint64_t{0});
   // Absent in v4 (0 => the loader derives the raw row byte length).
   m.rowStrideBytes_ = j.value("rowStrideBytes", uint64_t{0});
-  // Load-time residency preference; absent => "none" (plain mmap).
-  m.config_.preload_ = j.value("preload", std::string{"none"});
+  // `embeddingUrl`/`embeddingModel`/`preload` are intentionally NOT read: they
+  // are serving concerns set at server start (see `to_json`). Older `.meta`
+  // files that still carry those keys load fine -- the extra keys are ignored,
+  // and the in-memory fields keep their defaults (empty / "none").
   // Absent before the collation guard existed ("" => the load hook skips the
   // collation check for this index).
   m.collationLocale_ = j.value("collationLocale", std::string{});

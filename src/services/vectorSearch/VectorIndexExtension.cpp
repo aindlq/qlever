@@ -50,7 +50,6 @@
 #include "parser/TripleComponent.h"
 #include "rdfTypes/Iri.h"
 #include "rdfTypes/Literal.h"
-#include "services/vectorSearch/EmbeddingClient.h"
 #include "services/vectorSearch/VectorIndexBuilder.h"
 #include "services/vectorSearch/VectorIndexFormat.h"
 #include "services/vectorSearch/VectorInputReader.h"
@@ -138,10 +137,8 @@ class RemapTmpCleanup {
   std::vector<std::string> paths_;
 };
 
-// How many input rows are read, resolved, and (for the texts input) embedded
-// per batch.
+// How many input rows are read and resolved per batch.
 constexpr size_t RESOLVE_BATCH_SIZE = 16384;
-constexpr size_t EMBED_BATCH_SIZE = 64;
 
 // The size of the loaded knowledge-graph vocabulary; used as the fingerprint
 // that binds a vector index to the main-index build it was created from.
@@ -204,8 +201,6 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
   static constexpr std::array knownKeys{"name",
                                         "iris",
                                         "npy",
-                                        "texts",
-                                        "parquet",
                                         "dimensions",
                                         "metric",
                                         "scalar",
@@ -214,29 +209,29 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
                                         "hnswExpansionAdd",
                                         "hnswExpansionSearch",
                                         "buildThreads",
-                                        "embeddingUrl",
-                                        "embeddingModel",
-                                        "alignRows",
-                                        "preload",
                                         "remap"};
   for (const auto& [key, value] : obj.items()) {
     if (ql::ranges::find(knownKeys, key) == knownKeys.end()) {
       AD_THROW("Unknown key \"" + key +
                "\" in a vectorSearch build spec. Known keys: name, iris, npy, "
-               "texts, parquet, dimensions, metric, scalar, hnsw, "
-               "hnswConnectivity, hnswExpansionAdd, hnswExpansionSearch, "
-               "buildThreads, embeddingUrl, embeddingModel, alignRows, "
-               "preload, remap.");
+               "dimensions, metric, scalar, hnsw, hnswConnectivity, "
+               "hnswExpansionAdd, hnswExpansionSearch, buildThreads, remap. "
+               "(The query-time embedding endpoint/model and the RAM "
+               "residency are serving concerns, set at server start via the "
+               "QLEVER_VECTOR_SEARCH_ENDPOINTS environment variable, not at "
+               "build time.)");
     }
   }
+  // The only vector input is a `.npy` matrix plus its row-aligned `iris`
+  // sidecar; both are required.
+  if (!obj.contains("npy") || !obj.contains("iris")) {
+    AD_THROW(
+        "Each vectorSearch build spec needs both an `npy` matrix and a "
+        "row-aligned `iris` list.");
+  }
   try {
-    spec.parquetPath_ = obj.value("parquet", std::string{});
-    // Parquet carries the URIs itself; the other inputs need the sidecar.
-    spec.irisPath_ = spec.parquetPath_.empty()
-                         ? obj.at("iris").get<std::string>()
-                         : obj.value("iris", std::string{});
-    spec.npyPath_ = obj.value("npy", std::string{});
-    spec.textsPath_ = obj.value("texts", std::string{});
+    spec.irisPath_ = obj.at("iris").get<std::string>();
+    spec.npyPath_ = obj.at("npy").get<std::string>();
     spec.config_.dimensions_ = obj.value("dimensions", uint32_t{0});
     spec.config_.metric_ =
         vectorMetricFromString(obj.value("metric", std::string{"cosine"}));
@@ -250,29 +245,8 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
     spec.config_.hnswExpansionSearch_ =
         obj.value("hnswExpansionSearch", uint32_t{64});
     spec.config_.buildThreads_ = obj.value("buildThreads", uint32_t{0});
-    spec.config_.embeddingUrl_ = obj.value("embeddingUrl", std::string{});
-    spec.config_.embeddingModel_ = obj.value("embeddingModel", std::string{});
-    spec.config_.alignRows_ = obj.value("alignRows", false);
-    spec.config_.preload_ = obj.value("preload", std::string{"none"});
   } catch (const nlohmann::json::exception& e) {
     AD_THROW(std::string{"Malformed vectorSearch build spec: "} + e.what());
-  }
-  // Validate the residency preference now (rather than at load time, on a
-  // machine that may differ), so a typo is caught during `qlever index`.
-  if (spec.config_.preload_ != "none" && spec.config_.preload_ != "advise" &&
-      spec.config_.preload_ != "lock" && spec.config_.preload_ != "aligned") {
-    AD_THROW(
-        "`preload` must be one of \"none\", \"advise\", \"lock\", or "
-        "\"aligned\" (got \"" +
-        spec.config_.preload_ + "\").");
-  }
-  int numInputs = static_cast<int>(!spec.npyPath_.empty()) +
-                  static_cast<int>(!spec.textsPath_.empty()) +
-                  static_cast<int>(!spec.parquetPath_.empty());
-  if (numInputs != 1) {
-    AD_THROW(
-        "Each vector index needs exactly one of `npy`, `texts`, or "
-        "`parquet`.");
   }
   // The `i8` store rescales every vector to a common magnitude (usearch's
   // dot-product-oriented int8 cast), which destroys the magnitude information
@@ -353,11 +327,10 @@ std::vector<std::optional<Id>> resolveBatch(
   return out;
 }
 
-// Shared by the .npy and Parquet inputs: stream `(iri, vector)` rows from
-// `reader` into a builder, resolving the IRIs in parallel batches. Readers
-// may yield IRIs bare or as `<...>` irirefs; bare ones are bracketed here, so
-// the builder always stores (and `resolveBatch` always sees) the `<...>`
-// form.
+// Stream `(iri, vector)` rows from `reader` (the `.npy` input) into a builder,
+// resolving the IRIs in parallel batches. Readers may yield IRIs bare or as
+// `<...>` irirefs; bare ones are bracketed here, so the builder always stores
+// (and `resolveBatch` always sees) the `<...>` form.
 VectorIndexMetadata buildFromReader(const Index& index,
                                     const std::string& basename,
                                     VectorIndexConfig config,
@@ -382,10 +355,9 @@ VectorIndexMetadata buildFromReader(const Index& index,
         done = true;
         break;
       }
-      // Guard against a reader that reports a per-row length disagreeing with
-      // the configured dimension (e.g. a Parquet `list` column whose actual
-      // dimension the reader could not check up front) -- otherwise the row
-      // would be silently mis-sliced into the wrong entity's vector.
+      // Guard against a reader that yields a per-row length disagreeing with
+      // the configured dimension -- otherwise the row would be silently
+      // mis-sliced into the wrong entity's vector.
       if (vec.size() != dim) {
         AD_THROW("Row " + std::to_string(lineNumber + iris.size()) +
                  " of the input has dimension " + std::to_string(vec.size()) +
@@ -413,36 +385,6 @@ VectorIndexMetadata buildFromReader(const Index& index,
   return builder.build();
 }
 
-#ifdef QLEVER_WITH_PARQUET
-VectorIndexMetadata buildFromParquet(const Index& index,
-                                     const std::string& basename,
-                                     const VectorIndexBuildSpec& spec,
-                                     uint64_t& resolved, uint64_t& skipped) {
-  ParquetVectorInputReader reader{spec.parquetPath_};
-  VectorIndexConfig config = spec.config_;
-  // For `list` columns the dimension is only known after the first row; peek
-  // is not needed -- validate against the config where given, else infer.
-  if (config.dimensions_ == 0 && reader.dimensions() == 0) {
-    // Streamed inference: read the first row through a small detour.
-    std::string iri;
-    std::vector<float> vec;
-    ParquetVectorInputReader probe{spec.parquetPath_};
-    if (!probe.next(iri, vec)) {
-      AD_THROW("The Parquet input " + spec.parquetPath_ + " is empty.");
-    }
-    config.dimensions_ = static_cast<uint32_t>(vec.size());
-  } else if (config.dimensions_ == 0) {
-    config.dimensions_ = reader.dimensions();
-  } else if (reader.dimensions() != 0 &&
-             config.dimensions_ != reader.dimensions()) {
-    AD_THROW("The configured dimension (" + std::to_string(config.dimensions_) +
-             ") does not match the Parquet file (" +
-             std::to_string(reader.dimensions()) + ").");
-  }
-  return buildFromReader(index, basename, config, reader, resolved, skipped);
-}
-#endif  // QLEVER_WITH_PARQUET
-
 VectorIndexMetadata buildFromNpy(const Index& index,
                                  const std::string& basename,
                                  const VectorIndexBuildSpec& spec,
@@ -458,113 +400,6 @@ VectorIndexMetadata buildFromNpy(const Index& index,
              std::to_string(reader.dimensions()) + ").");
   }
   return buildFromReader(index, basename, config, reader, resolved, skipped);
-}
-
-VectorIndexMetadata buildFromTexts(const Index& index,
-                                   const std::string& basename,
-                                   const VectorIndexBuildSpec& spec,
-                                   uint64_t& resolved, uint64_t& skipped) {
-  VectorIndexConfig config = spec.config_;
-  if (config.embeddingUrl_.empty()) {
-    AD_THROW("Building a vector index from texts requires `embeddingUrl`.");
-  }
-  std::ifstream irisIn{spec.irisPath_};
-  std::ifstream textsIn{spec.textsPath_};
-  if (!irisIn.is_open()) {
-    AD_THROW("Could not open the IRI list file " + spec.irisPath_);
-  }
-  if (!textsIn.is_open()) {
-    AD_THROW("Could not open the texts file " + spec.textsPath_);
-  }
-  auto handle =
-      std::make_shared<ad_utility::SharedCancellationHandle::element_type>();
-  auto trim = [](std::string& s) {
-    while (!s.empty() &&
-           (s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) {
-      s.pop_back();
-    }
-  };
-  const size_t numThreads = effectiveThreads(config.buildThreads_);
-  std::optional<VectorIndexBuilder> builder;
-  std::string iri;
-  std::string text;
-  uint64_t lineNumber = 0;
-  bool done = false;
-  // Rows are embedded in batches: one request per row would make the index
-  // build latency-bound on the embedding endpoint.
-  std::vector<std::string> batchIris;
-  std::vector<std::string> batchTexts;
-  auto flushBatch = [&]() {
-    if (batchIris.empty()) {
-      return;
-    }
-    uint64_t firstLine = lineNumber - batchIris.size() + 1;
-    auto ids = resolveBatch(index, batchIris, firstLine, numThreads);
-    std::vector<std::string> toEmbed;
-    std::vector<size_t> toEmbedIdx;
-    for (size_t i = 0; i < batchIris.size(); ++i) {
-      if (ids[i].has_value()) {
-        toEmbed.push_back(batchTexts[i]);
-        toEmbedIdx.push_back(i);
-      } else {
-        ++skipped;
-      }
-    }
-    if (toEmbed.empty()) {
-      batchIris.clear();
-      batchTexts.clear();
-      return;
-    }
-    std::vector<std::vector<float>> embeddings = embedBatchOpenAI(
-        config.embeddingUrl_, config.embeddingModel_, toEmbed, handle);
-    for (size_t j = 0; j < toEmbed.size(); ++j) {
-      size_t i = toEmbedIdx[j];
-      const std::vector<float>& vec = embeddings[j];
-      if (!builder.has_value()) {
-        if (config.dimensions_ == 0) {
-          config.dimensions_ = static_cast<uint32_t>(vec.size());
-        }
-        builder.emplace(basename, config);
-        builder->setVocabSize(vocabFingerprint(index.getImpl()));
-        builder->setCollationLocale(collationFingerprint(index.getImpl()));
-      }
-      builder->add(ids[i].value(), batchIris[i], vec);
-      ++resolved;
-    }
-    batchIris.clear();
-    batchTexts.clear();
-  };
-  while (!done) {
-    if (!std::getline(irisIn, iri)) {
-      done = true;
-    } else {
-      ++lineNumber;
-      if (!std::getline(textsIn, text)) {
-        AD_THROW("The texts file has fewer lines than the IRI list (" +
-                 std::to_string(lineNumber - 1) + " vs. at least " +
-                 std::to_string(lineNumber) + ").");
-      }
-      trim(iri);
-      trim(text);
-      batchIris.push_back(iri);
-      batchTexts.push_back(text);
-    }
-    if (done || batchIris.size() >= EMBED_BATCH_SIZE) {
-      flushBatch();
-    }
-  }
-  if (std::getline(textsIn, text)) {
-    trim(text);
-    if (!text.empty()) {
-      AD_THROW("The texts file has more (non-empty) lines than the IRI list (" +
-               std::to_string(lineNumber) + ").");
-    }
-  }
-  if (!builder.has_value()) {
-    AD_THROW("No input rows could be embedded/resolved for vector index \"" +
-             config.name_ + "\".");
-  }
-  return builder->build();
 }
 
 // BUILD hook: build (or remap) every vector index requested under the
@@ -591,21 +426,8 @@ void buildHook(const Index& index, const std::string& basename,
     }
     uint64_t resolved = 0;
     uint64_t skipped = 0;
-    VectorIndexMetadata meta;
-    if (!spec.parquetPath_.empty()) {
-#ifdef QLEVER_WITH_PARQUET
-      meta = buildFromParquet(index, basename, spec, resolved, skipped);
-#else
-      AD_THROW(
-          "This QLever build has no Parquet support; rebuild with "
-          "-DQLEVER_VECTOR_SEARCH_PARQUET=ON (requires Apache "
-          "Arrow/Parquet), or use the `npy` input.");
-#endif
-    } else if (!spec.textsPath_.empty()) {
-      meta = buildFromTexts(index, basename, spec, resolved, skipped);
-    } else {
-      meta = buildFromNpy(index, basename, spec, resolved, skipped);
-    }
+    VectorIndexMetadata meta =
+        buildFromNpy(index, basename, spec, resolved, skipped);
     AD_LOG_INFO << "Vector index '" << spec.config_.name_ << "': indexed "
                 << resolved << " vectors, skipped " << skipped
                 << " (IRI not in the knowledge graph), HNSW="
@@ -743,12 +565,12 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
   }
   auto collection = std::make_shared<VectorIndexCollection>();
   std::vector<IndexMetadataFields> metadataFields;
-  // Runtime override of the persisted embedding endpoints and RAM residency
-  // (see `VECTOR_SEARCH_ENDPOINTS_ENV_VAR` in `VectorIndexExtension.h`):
-  // applied IN MEMORY to every matching index below -- the "preload" field at
-  // `open` time, the endpoint fields to the opened index -- and never written
-  // back to the `.meta` files, so it has to be (and is) reapplied at every
-  // server start. Applied entries are erased, so what remains afterwards is a
+  // Runtime configuration of the embedding endpoints and RAM residency (see
+  // `VECTOR_SEARCH_ENDPOINTS_ENV_VAR` in `VectorIndexExtension.h`): applied IN
+  // MEMORY to every matching index below -- the "preload" field at `open`
+  // time, the endpoint fields to the opened index. These are serving concerns
+  // that are never persisted, so they are reapplied fresh at every server
+  // start. Applied entries are erased, so what remains afterwards is a
   // typo/stale name to warn about.
   EmbeddingEndpointOverrides endpointOverrides =
       embeddingEndpointOverridesFromEnv();
@@ -761,30 +583,22 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
     }
     const std::string name =
         fn.substr(prefix.size(), fn.size() - prefix.size() - suffix.size());
-    // A "preload" override must be decided AT open time -- residency is
-    // applied when the index is opened -- unlike the embedding-endpoint
-    // fields below, which mutate the already-opened index. `open` treats
-    // `Residency::None` as "use the persisted `preload`", so with no override
-    // (and for an explicit `"preload": "none"`) the persisted value wins. The
-    // entry is NOT erased here: the endpoint fields still apply below, and an
-    // entry for an index that fails to open must survive for the leftover
-    // warning at the end.
+    // A "preload" setting must be decided AT open time -- residency is applied
+    // when the index is opened -- unlike the embedding-endpoint fields below,
+    // which mutate the already-opened index. No setting (and an explicit
+    // "preload": "none") leaves the store mmap-only, the default. The entry is
+    // NOT erased here: the endpoint fields still apply below, and an entry for
+    // an index that fails to open must survive for the leftover warning at the
+    // end.
     VectorIndex::Residency residency = VectorIndex::Residency::None;
     if (auto it = endpointOverrides.find(name);
         it != endpointOverrides.end() && it->second.preload_.has_value()) {
       const std::string& preload = it->second.preload_.value();
       residency = VectorIndex::residencyFromString(preload);
       if (residency != VectorIndex::Residency::None) {
-        AD_LOG_INFO << "Vector index '" << name
-                    << "': RAM residency overridden to '" << preload
-                    << "' at startup (" << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
-                    << ")" << std::endl;
-      } else {
-        AD_LOG_WARN << "Vector index '" << name
-                    << "': the \"preload\": \"none\" override keeps the "
-                       "persisted `preload` setting (a runtime override "
-                       "cannot downgrade residency)."
-                    << std::endl;
+        AD_LOG_INFO << "Vector index '" << name << "': RAM residency set to '"
+                    << preload << "' at startup ("
+                    << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << ")" << std::endl;
       }
     }
     VectorIndex idx;

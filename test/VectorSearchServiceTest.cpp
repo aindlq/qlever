@@ -935,36 +935,24 @@ TEST(VectorSearchService, buildAndLoadHookRoundTrip) {
               "\",\"iris\":\"" + iris +
               "\",\"scalar\":\"i8\",\"metric\":\"l2sq\"}]}")),
       HasSubstr("cosine"));
-  // An invalid `preload` value is rejected at build time.
-  AD_EXPECT_THROW_WITH_MESSAGE(
-      IndexExtensionRegistry::get().buildHooks().front()(
-          index, base, spec(",\"preload\":\"bogus\"")),
-      HasSubstr("preload"));
-
-  // A build with `alignRows` + `preload` round-trips: rows are 64-byte aligned,
-  // the residency preference persists, and results are identical.
-  auto alignedSpec = nlohmann::json::parse(
-      "{\"vectorSearch\":[{\"name\":\"docsA\",\"npy\":\"" + npy +
-      "\",\"iris\":\"" + iris +
-      "\",\"metric\":\"cosine\",\"alignRows\":true,\"preload\":\"advise\"}]}");
-  for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
-    hook(index, base, alignedSpec);
+  // The serving concerns (`embeddingUrl`/`embeddingModel`/`preload`) and the
+  // removed `alignRows` option are no longer accepted in a build spec: they are
+  // rejected as unknown keys.
+  for (const char* runtimeKey :
+       {",\"preload\":\"advise\"", ",\"embeddingUrl\":\"unix:/x.sock\"",
+        ",\"embeddingModel\":\"clip\"", ",\"alignRows\":true"}) {
+    AD_EXPECT_THROW_WITH_MESSAGE(
+        IndexExtensionRegistry::get().buildHooks().front()(index, base,
+                                                           spec(runtimeKey)),
+        HasSubstr("Unknown key"));
   }
-  qlever::vector::VectorIndex aligned;
-  aligned.open(base,
-               "docsA");  // Residency::None -> applies persisted "advise".
-  EXPECT_EQ(aligned.metadata().config_.preload_, "advise");
-  EXPECT_EQ(aligned.metadata().rowStrideBytes_ % 64, 0u);
-  auto resA = aligned.searchExact(std::vector<float>{1.f, 0.f, 0.f, 0.f}, 2);
-  ASSERT_EQ(resA.size(), 2u);
-  EXPECT_EQ(resA[0].entity_, getId("<a0>"));
-  EXPECT_EQ(resA[1].entity_, getId("<a1>"));
 
-  for (auto* suffix :
-       {".vec.docs.meta", ".vec.docs.keys", ".vec.docs.rowmap",
-        ".vec.docs.data", ".vec.docs.iris", ".vec.docs.hnsw", ".vec.docsA.meta",
-        ".vec.docsA.keys", ".vec.docsA.rowmap", ".vec.docsA.data",
-        ".vec.docsA.iris", ".vec.docsA.hnsw", ".input.npy", ".input.iris"}) {
+  // The stored per-row stride is the natural row byte length.
+  EXPECT_EQ(vidx->metadata().rowStrideBytes_, 4u * sizeof(float));
+
+  for (auto* suffix : {".vec.docs.meta", ".vec.docs.keys", ".vec.docs.rowmap",
+                       ".vec.docs.data", ".vec.docs.iris", ".vec.docs.hnsw",
+                       ".input.npy", ".input.iris"}) {
     std::error_code ec;
     std::filesystem::remove(base + suffix, ec);
   }

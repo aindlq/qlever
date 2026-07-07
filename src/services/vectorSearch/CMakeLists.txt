@@ -90,30 +90,6 @@ else ()
     target_compile_definitions(vectorStorage PUBLIC USEARCH_USE_NUMKONG=0)
 endif ()
 
-if (QLEVER_VECTOR_SEARCH_PARQUET)
-    # Prefer upstream Arrow's own CMake config (targets Parquet::parquet_*);
-    # fall back to a conan-generated "Arrow" config, whose arrow::arrow target
-    # bundles the Parquet component.
-    find_package(Parquet CONFIG QUIET)
-    if (TARGET Parquet::parquet_shared)
-        set(_qleverParquetTarget Parquet::parquet_shared)
-    elseif (TARGET Parquet::parquet_static)
-        set(_qleverParquetTarget Parquet::parquet_static)
-    else ()
-        find_package(Arrow CONFIG REQUIRED)
-        if (TARGET arrow::arrow)
-            set(_qleverParquetTarget arrow::arrow)
-        else ()
-            message(FATAL_ERROR "Found Arrow, but no usable Parquet target; "
-                    "install Arrow with the Parquet component enabled.")
-        endif ()
-    endif ()
-    message(STATUS "QLever vector search: Parquet ingest enabled via "
-            "${_qleverParquetTarget}")
-    qlever_target_link_libraries(vectorStorage ${_qleverParquetTarget})
-    target_compile_definitions(vectorStorage PUBLIC QLEVER_WITH_PARQUET=1)
-endif ()
-
 add_library(service_vectorSearch OBJECT
         VectorSearch.cpp
         VectorSearchJoin.cpp

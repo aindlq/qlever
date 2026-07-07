@@ -21,6 +21,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -347,25 +348,34 @@ QueryExecutionContext* qecWithCrossIndexes() {
                  {{"<b1>", {1.f, 0.f, 0.f}}, {"<b2>", {0.f, 1.f, 0.f}}});
   writeNpyBundle(basename + ".o.npy", basename + ".o.iris",
                  {{"<o1>", {1.f, 0.f, 0.f}}});
-  auto entry = [&](const std::string& name, const std::string& input,
-                   const std::string& model) {
+  auto entry = [&](const std::string& name, const std::string& input) {
     return nlohmann::json{{"name", name},
                           {"npy", basename + "." + input + ".npy"},
                           {"iris", basename + "." + input + ".iris"},
                           {"metric", "cosine"},
-                          {"hnsw", false},
-                          {"embeddingModel", model}};
+                          {"hnsw", false}};
   };
-  nlohmann::json spec{{"vectorSearch", nlohmann::json::array(
-                                           {entry("idxa", "a", "clip"),
-                                            entry("idxb", "b", "clip"),
-                                            entry("idxother", "o", "other")})}};
+  nlohmann::json spec{
+      {"vectorSearch",
+       nlohmann::json::array(
+           {entry("idxa", "a"), entry("idxb", "b"), entry("idxother", "o")})}};
   for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
     hook(qec->getIndex(), basename, spec);
   }
+  // The embedding model is a serving concern, set at server start rather than
+  // baked into the index. Give idxa/idxb model "clip" and idxother model
+  // "other" via the endpoints env override so the load hook stamps each
+  // index's query-vector datatype (which drives cross-index comparability in
+  // the tests below).
+  ::setenv(qlever::vector::VECTOR_SEARCH_ENDPOINTS_ENV_VAR,
+           R"({"idxa":{"embeddingModel":"clip"},)"
+           R"("idxb":{"embeddingModel":"clip"},)"
+           R"("idxother":{"embeddingModel":"other"}})",
+           /*overwrite=*/1);
   for (const auto& hook : IndexExtensionRegistry::get().loadHooks()) {
     hook(impl, basename);
   }
+  ::unsetenv(qlever::vector::VECTOR_SEARCH_ENDPOINTS_ENV_VAR);
   qec->setLocatedTriplesForEvaluation(
       impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
   for (std::string_view name : {"idxa", "idxb", "idxother"}) {

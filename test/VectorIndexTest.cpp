@@ -857,9 +857,7 @@ TEST(VectorIndex, hugeKIsClamped) {
 }
 
 // _____________________________________________________________________________
-// Helper: build an index with an arbitrary dimension and the `alignRows_` flag,
-// returning the basename. Uses `dim` deliberately chosen so that the raw row
-// byte length is NOT already a multiple of 64 (so padding is observable).
+// Helper: build an index with an arbitrary dimension, returning the basename.
 namespace {
 struct AlignBuilt {
   std::string basename;
@@ -868,8 +866,7 @@ struct AlignBuilt {
   std::vector<Id> ids;
 };
 
-AlignBuilt buildAligned(size_t dim, bool alignRows, bool withHnsw,
-                        const std::string& tag) {
+AlignBuilt buildAligned(size_t dim, bool withHnsw, const std::string& tag) {
   AlignBuilt b;
   b.basename = uniqueTmpBasename() + "-" + tag;
   std::mt19937 rng{9876};
@@ -880,7 +877,6 @@ AlignBuilt buildAligned(size_t dim, bool alignRows, bool withHnsw,
   cfg.metric_ = VectorMetric::Cosine;
   cfg.buildHnsw_ = withHnsw;
   cfg.hnswExpansionSearch_ = 200;
-  cfg.alignRows_ = alignRows;
   VectorIndexBuilder builder{b.basename, cfg};
   for (size_t i = 0; i < NUM_VECTORS; ++i) {
     std::vector<float> v(dim);
@@ -910,50 +906,32 @@ void cleanupBase(const std::string& basename, const std::string& name) {
 }  // namespace
 
 // _____________________________________________________________________________
-// `alignRows_` pads every row up to a 64-byte SIMD boundary (persisted as
-// `rowStrideBytes_`), while leaving results bit-identical to an unpadded build.
-TEST(VectorIndex, alignedRowsStridePaddingAndParity) {
-  constexpr size_t dim = 10;  // raw row bytes = 40, not a multiple of 64
+// The stored per-row stride is always the natural row byte length (`dimensions
+// * bytesPerScalar`), persisted as `rowStrideBytes_`.
+TEST(VectorIndex, naturalRowStride) {
+  constexpr size_t dim = 10;  // raw row bytes = 40, NOT a multiple of 64
   constexpr size_t rawRowBytes = dim * sizeof(float);
-  auto unaligned = buildAligned(dim, /*alignRows=*/false, false, "unal");
-  auto aligned = buildAligned(dim, /*alignRows=*/true, false, "al");
-
-  VectorIndex idxU;
-  idxU.open(unaligned.basename, unaligned.name);
-  VectorIndex idxA;
-  idxA.open(aligned.basename, aligned.name);
-
-  // Unpadded stride == raw row length; padded stride is the next multiple
-  // of 64.
-  EXPECT_EQ(idxU.metadata().rowStrideBytes_, rawRowBytes);
-  EXPECT_EQ(idxA.metadata().rowStrideBytes_, 64u);
-  EXPECT_EQ(idxA.metadata().rowStrideBytes_ % 64u, 0u);
-  // The padded `.data` file is correspondingly larger.
-  EXPECT_GE(std::filesystem::file_size(aligned.basename + ".vec.al.data"),
-            NUM_VECTORS * 64u);
-
-  // Bit-exact top-k parity between the aligned and unaligned stores (the pad
-  // tail is never read by the metric).
-  for (size_t q = 0; q < NUM_VECTORS; q += 17) {
-    auto ru = idxU.searchExact(unaligned.vecs[q], 10);
-    auto ra = idxA.searchExact(aligned.vecs[q], 10);
-    ASSERT_EQ(ru.size(), ra.size());
-    for (size_t i = 0; i < ru.size(); ++i) {
-      EXPECT_EQ(ru[i].entity_, ra[i].entity_);
-      EXPECT_EQ(ru[i].distance_, ra[i].distance_);  // bit-exact
-    }
-  }
-  cleanupBase(unaligned.basename, unaligned.name);
-  cleanupBase(aligned.basename, aligned.name);
+  auto built = buildAligned(dim, false, "stride");
+  VectorIndex idx;
+  idx.open(built.basename, built.name);
+  // The stride is the natural row byte length -- no 64-byte padding.
+  EXPECT_EQ(idx.metadata().rowStrideBytes_, rawRowBytes);
+  // The `.data` file holds the raw payload (plus an MmapVector trailer), well
+  // below what a 64-byte-padded store would occupy.
+  const auto dataSize =
+      std::filesystem::file_size(built.basename + ".vec.al.data");
+  EXPECT_GE(dataSize, NUM_VECTORS * rawRowBytes);
+  EXPECT_LT(dataSize, NUM_VECTORS * 64u);
+  cleanupBase(built.basename, built.name);
 }
 
 // _____________________________________________________________________________
-// `makeResident(AlignedCopy)` builds a 64-byte-aligned RAM copy of an UNPADDED
-// (v4-style) store and serves searches from it with identical results. Also
-// exercises `Advise`/`Lock` (best-effort, must never change results).
+// `makeResident(AlignedCopy)` builds a 64-byte-aligned RAM copy of the
+// (natural-stride) store and serves searches from it with identical results.
+// Also exercises `Advise`/`Lock` (best-effort, must never change results).
 TEST(VectorIndex, makeResidentAlignedCopyMatches) {
-  constexpr size_t dim = 10;  // unpadded rows on disk
-  auto b = buildAligned(dim, /*alignRows=*/false, /*withHnsw=*/true, "res");
+  constexpr size_t dim = 10;
+  auto b = buildAligned(dim, /*withHnsw=*/true, "res");
 
   // Baseline results from the plain mmap path.
   VectorIndex ref;
@@ -990,7 +968,7 @@ TEST(VectorIndex, makeResidentAlignedCopyMatches) {
 // Back-compat: a legacy v4 metadata (no `rowStrideBytes`, version 4) must still
 // load, deriving the stride as the raw row byte length, with unchanged results.
 TEST(VectorIndex, loadsLegacyV4Metadata) {
-  auto b = buildAligned(10, /*alignRows=*/false, /*withHnsw=*/false, "v4");
+  auto b = buildAligned(10, /*withHnsw=*/false, "v4");
   VectorIndex ref;
   ref.open(b.basename, b.name);
   auto expected = ref.searchExact(b.vecs[5], 10);
@@ -1022,14 +1000,13 @@ TEST(VectorIndex, loadsLegacyV4Metadata) {
 
 // _____________________________________________________________________________
 // Micro-benchmark (disabled by default): brute-force scan latency for
-// {unaligned-cold, unaligned-resident, aligned-resident}. Run with:
+// {cold, advise-resident, aligned-resident}. Run with:
 //   --gtest_also_run_disabled_tests --gtest_filter='*scanResidencyBenchmark*'
 TEST(VectorIndex, DISABLED_scanResidencyBenchmark) {
   const char* nEnv = std::getenv("QLEVER_BENCH_N");
   const size_t n = nEnv ? std::stoull(nEnv) : 200'000;
-  constexpr size_t dim = 100;  // 400 raw bytes -> padded to 448
-  auto run = [&](bool alignRows, VectorIndex::Residency residency,
-                 const char* label) {
+  constexpr size_t dim = 100;  // 400 raw bytes per row
+  auto run = [&](VectorIndex::Residency residency, const char* label) {
     std::string basename = uniqueTmpBasename() + "-bench";
     std::mt19937 rng{7};
     std::normal_distribution<float> g{0.f, 1.f};
@@ -1038,7 +1015,6 @@ TEST(VectorIndex, DISABLED_scanResidencyBenchmark) {
     cfg.dimensions_ = dim;
     cfg.metric_ = VectorMetric::Cosine;
     cfg.buildHnsw_ = false;
-    cfg.alignRows_ = alignRows;
     VectorIndexBuilder builder{basename, cfg};
     std::vector<float> v(dim);
     for (size_t i = 0; i < n; ++i) {
@@ -1065,87 +1041,12 @@ TEST(VectorIndex, DISABLED_scanResidencyBenchmark) {
     cleanupBase(basename, "bench");
     return nsPerVec;
   };
-  double cold = run(false, VectorIndex::Residency::None, "unaligned-cold");
-  double resident =
-      run(false, VectorIndex::Residency::Advise, "unaligned-resident");
-  double aligned =
-      run(true, VectorIndex::Residency::AlignedCopy, "aligned-resident");
+  double cold = run(VectorIndex::Residency::None, "cold");
+  double resident = run(VectorIndex::Residency::Advise, "advise-resident");
+  double aligned = run(VectorIndex::Residency::AlignedCopy, "aligned-resident");
   std::cout << "[scan-bench] cold=" << cold << " resident=" << resident
             << " aligned=" << aligned << " ns/vector" << std::endl;
 }
-
-#ifdef QLEVER_WITH_PARQUET
-#include <arrow/api.h>
-#include <arrow/io/file.h>
-#include <parquet/arrow/writer.h>
-
-// _____________________________________________________________________________
-// The Parquet ingest: a file with `uri` (string) and `embedding`
-// (list<float32>) columns round-trips through `ParquetVectorInputReader`.
-TEST(VectorIndex, parquetInputReader) {
-  std::string path = uniqueTmpBasename() + ".parquet";
-  auto* pool = arrow::default_memory_pool();
-  arrow::StringBuilder uriBuilder{pool};
-  auto valueBuilder = std::make_shared<arrow::FloatBuilder>(pool);
-  arrow::ListBuilder listBuilder{pool, valueBuilder};
-  constexpr size_t numRows = 10;
-  constexpr size_t dim = 4;
-  for (size_t i = 0; i < numRows; ++i) {
-    // Both bare URIs and bracketed IRIs occur in the wild; the reader passes
-    // them through as-is (the build hook normalizes).
-    std::string uri = i % 2 == 0 ? "http://ex/" + std::to_string(i)
-                                 : "<http://ex/" + std::to_string(i) + ">";
-    ASSERT_TRUE(uriBuilder.Append(uri).ok());
-    ASSERT_TRUE(listBuilder.Append().ok());
-    for (size_t j = 0; j < dim; ++j) {
-      ASSERT_TRUE(valueBuilder->Append(static_cast<float>(i * dim + j)).ok());
-    }
-  }
-  std::shared_ptr<arrow::Array> uriArray;
-  std::shared_ptr<arrow::Array> embeddingArray;
-  ASSERT_TRUE(uriBuilder.Finish(&uriArray).ok());
-  ASSERT_TRUE(listBuilder.Finish(&embeddingArray).ok());
-  auto schema =
-      arrow::schema({arrow::field("uri", arrow::utf8()),
-                     arrow::field("embedding", arrow::list(arrow::float32()))});
-  auto table = arrow::Table::Make(schema, {uriArray, embeddingArray});
-  auto outResult = arrow::io::FileOutputStream::Open(path);
-  ASSERT_TRUE(outResult.ok());
-  ASSERT_TRUE(
-      parquet::arrow::WriteTable(*table, pool, outResult.ValueUnsafe(), 1024)
-          .ok());
-
-  ParquetVectorInputReader reader{path};
-  EXPECT_EQ(reader.numRows(), numRows);
-  std::string iri;
-  std::vector<float> vec;
-  size_t count = 0;
-  while (reader.next(iri, vec)) {
-    ASSERT_EQ(vec.size(), dim);
-    EXPECT_FLOAT_EQ(vec[0], static_cast<float>(count * dim));
-    EXPECT_TRUE(iri.find("http://ex/" + std::to_string(count)) !=
-                std::string::npos);
-    ++count;
-  }
-  EXPECT_EQ(count, numRows);
-  EXPECT_EQ(reader.dimensions(), dim);
-
-  // A file without the expected columns is rejected with a clear error.
-  std::string badPath = uniqueTmpBasename() + "-bad.parquet";
-  auto badSchema = arrow::schema({arrow::field("uri", arrow::utf8())});
-  auto badTable = arrow::Table::Make(badSchema, {uriArray});
-  auto badOut = arrow::io::FileOutputStream::Open(badPath);
-  ASSERT_TRUE(badOut.ok());
-  ASSERT_TRUE(
-      parquet::arrow::WriteTable(*badTable, pool, badOut.ValueUnsafe(), 1024)
-          .ok());
-  EXPECT_THROW(ParquetVectorInputReader{badPath}, std::exception);
-
-  std::error_code ec;
-  std::filesystem::remove(path, ec);
-  std::filesystem::remove(badPath, ec);
-}
-#endif  // QLEVER_WITH_PARQUET
 
 // _____________________________________________________________________________
 // Manual scale/performance smoke check (excluded from regular runs; it builds

@@ -364,12 +364,11 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
   }
 
   // 5. Optionally make the flat store resident / SIMD-aligned in RAM. Purely a
-  //    paging/throughput optimisation applied after a successful open. An
-  //    explicit `residency` argument overrides the per-index persisted
-  //    `preload` preference (the default `None` falls back to it).
-  makeResident(residency != Residency::None
-                   ? residency
-                   : residencyFromString(impl.meta_.config_.preload_));
+  //    paging/throughput optimisation applied after a successful open. The
+  //    `residency` argument (the "preload" serving setting the load hook
+  //    threads in from `QLEVER_VECTOR_SEARCH_ENDPOINTS`, default `None` =
+  //    mmap-only) is authoritative -- residency is never persisted.
+  makeResident(residency);
 }
 
 // ____________________________________________________________________________

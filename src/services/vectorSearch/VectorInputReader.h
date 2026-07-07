@@ -10,7 +10,6 @@
 
 #include <cstdint>
 #include <fstream>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -36,9 +35,8 @@ class VectorInputReader {
 // `ml_dtypes.bfloat16` serializes as) together with a sidecar text file of
 // `N` IRIs, one per line (bare or wrapped in angle brackets; `next` yields
 // the bare form), where line `i` labels row `i` of the matrix. This is the
-// dependency-free default ingest format (`ParquetVectorInputReader` below is
-// the alternative for large production inputs). `np.save("vectors.npy", arr)`
-// plus writing the IRIs to a text file is all it takes to produce.
+// sole ingest format: `np.save("vectors.npy", arr)` plus writing the IRIs to a
+// text file is all it takes to produce.
 class NpyVectorInputReader : public VectorInputReader {
  public:
   NpyVectorInputReader(const std::string& npyPath, const std::string& irisPath);
@@ -58,28 +56,6 @@ class NpyVectorInputReader : public VectorInputReader {
   std::ifstream npy_;
   std::ifstream iris_;
 };
-
-#ifdef QLEVER_WITH_PARQUET
-// Streams rows from a Parquet file with a string column `uri` (alias `iri`;
-// with or without angle brackets) and a column `embedding` (alias `vector`)
-// holding `list`/`large_list`/`fixed_size_list` of float32 or float64. This is
-// the recommended bulk format for large inputs (one self-contained file,
-// column compression). Only available when QLever was configured with
-// `-DQLEVER_VECTOR_SEARCH_PARQUET=ON` (requires Apache Arrow/Parquet).
-class ParquetVectorInputReader : public VectorInputReader {
- public:
-  explicit ParquetVectorInputReader(const std::string& parquetPath);
-  ~ParquetVectorInputReader() override;
-
-  uint32_t dimensions() const override;
-  uint64_t numRows() const override;
-  bool next(std::string& iri, std::vector<float>& vector) override;
-
- private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
-};
-#endif  // QLEVER_WITH_PARQUET
 
 }  // namespace qlever::vector
 
