@@ -1,9 +1,7 @@
 # Conan profile for the native Windows port: winlibs MinGW-w64 GCC 13.3 (UCRT,
-# posix threads, SEH) — the same GCC major as the Linux CI. Used to build the C
-# dependencies (ICU, OpenSSL, zstd, zlib, bzip2) from source on Windows. Boost
-# is NOT built through Conan here (see conanfile-windows-deps.txt and WINDOWS.md):
-# Conan's Boost recipe runs `b2`, which hits a MinGW archive bug, so Boost is
-# built from source separately in the CI workflow.
+# posix threads, SEH) — the same GCC major as the Linux CI. Used to build all of
+# the dependencies from source on Windows (ICU, OpenSSL, zstd, zlib, bzip2, Boost,
+# jemalloc). See conanfile-windows-deps.txt and WINDOWS.md.
 [settings]
 os=Windows
 arch=x86_64
@@ -21,7 +19,11 @@ compiler.threads=posix
 compiler.exception=seh
 
 [conf]
-tools.build:compiler_executables={"c": "gcc", "cpp": "g++"}
+# Absolute paths, not bare "gcc"/"g++": Boost's b2 writes `using gcc : : "g++" ;`
+# into user-config.jam and its find-compiler cannot resolve a bare/quoted command
+# on Windows, so a bare-name profile dies at b2 toolset init. Point at the winlibs
+# toolchain explicitly (adjust the prefix if winlibs is installed elsewhere).
+tools.build:compiler_executables={"c": "C:/winlibs13/mingw64/bin/gcc.exe", "cpp": "C:/winlibs13/mingw64/bin/g++.exe"}
 # Autotools-based dependencies (OpenSSL, ICU) need a Unix shell + make; route
 # them through the runner's MSYS2 bash.
 tools.microsoft.bash:subsystem=msys2

@@ -297,43 +297,35 @@ find_package(ICU 60 REQUIRED COMPONENTS uc i18n)
 # roughly halves index-build time).
 option(QLEVER_REQUIRE_JEMALLOC "Fail the build if jemalloc is not found" OFF)
 
-if (MINGW) # QLEVER-MINGW-JEMALLOC
-    # On Windows, jemalloc's C API is je_-prefixed by design (configure.ac
-    # sets JEMALLOC_PREFIX="je_" for pecoff), so plain malloc/free are NOT
-    # interposed. However, the C++ `operator new/delete` symbols cannot be
-    # prefixed and ARE exported unprefixed, so linking the static archive
-    # routes all C++ allocations (containers, strings, IdTables, ...)
-    # through jemalloc. -static-libstdc++ ensures exactly one operator
-    # new/delete program-wide. C `malloc` stays on the UCRT heap; this split
-    # is the safe partition on MinGW, where jemalloc cannot interpose the CRT
-    # allocator (cf. Mozilla bug 1420350 for why full replacement is hazardous).
-    # NOTE: the C++ override is silently a no-op if libjemalloc.a was built
-    # without C++ support (--disable-cxx).
-    find_library(JEMALLOC_MINGW_STATIC NAMES libjemalloc.a)
-    if (JEMALLOC_MINGW_STATIC)
-        message(STATUS "MinGW: linking static jemalloc (${JEMALLOC_MINGW_STATIC}); C++ operator new/delete served by jemalloc")
-        link_libraries(${JEMALLOC_MINGW_STATIC})
-        # Full `-static`, not just `-static-lib{stdc++,gcc}`: jemalloc's override
-        # only fully works with a STATIC libstdc++ (PE has no cross-module symbol
-        # interposition, so a libstdc++ DLL would call its own new/delete), and on
-        # winlibs `-static-libstdc++` WITHOUT `-static` collides libstdc++.a vs
-        # libstdc++.dll.a ("multiple definition of std::..."). So jemalloc implies a
-        # fully static binary here — which is also what we ship.
-        add_link_options(-static -static-libgcc -static-libstdc++)
-    elseif (QLEVER_REQUIRE_JEMALLOC)
-        message(FATAL_ERROR "MinGW: jemalloc not found but QLEVER_REQUIRE_JEMALLOC is ON. Point CMAKE_PREFIX_PATH at the jemalloc install that provides libjemalloc.a.")
-    else ()
-        message(WARNING "MinGW: jemalloc not found, using default allocator")
-    endif ()
-endif ()
-
 # JEMALLOC
 ###################################
 
 find_package(jemalloc QUIET)
 if (TARGET jemalloc::jemalloc)
     MESSAGE(STATUS "Use jemalloc that was installed via conan")
-    link_libraries(jemalloc::jemalloc)
+    if (MINGW)
+        # jemalloc's C API is je_-prefixed by design on pecoff, so C malloc/free
+        # stay on the UCRT heap; but its C++ operator new/delete are exported
+        # UNPREFIXED, so linking jemalloc routes all C++ allocations (containers,
+        # strings, IdTables, ...) through it. jemalloc and libstdc++ BOTH export a
+        # strong operator new/delete, and link ORDER decides the winner (jemalloc
+        # has no plain-malloc fallback, so if it loses it is bypassed entirely).
+        # Link the archive BY PATH, not the imported target: a raw lib in
+        # link_libraries() lands at the FRONT of the link, ahead of the -lstdc++
+        # that ICU's Conan usage-requirements inject, so jemalloc's operators are
+        # scanned first and win (and libstdc++'s new_op.o is never pulled -> no
+        # "multiple definition"). The imported target gets reordered after
+        # -lstdc++ and loses, silently dropping jemalloc. Path via Conan's data
+        # vars (Release-only, which is all the Windows port builds).
+        # The override also needs a fully STATIC libstdc++: PE has no cross-module
+        # symbol interposition, and `-static-libstdc++` without `-static` collides
+        # libstdc++.a vs .dll.a. So jemalloc implies a fully static binary here,
+        # which is also what we ship.
+        link_libraries("${jemalloc_LIB_DIRS_RELEASE}/lib${jemalloc_LIBS_RELEASE}.a")
+        add_link_options(-static -static-libgcc -static-libstdc++)
+    else ()
+        link_libraries(jemalloc::jemalloc)
+    endif ()
 
 elseif (${JEMALLOC_MANUALLY_INSTALLED})
     link_libraries(jemalloc)
