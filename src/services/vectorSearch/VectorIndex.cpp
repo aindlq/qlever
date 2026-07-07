@@ -442,6 +442,16 @@ void VectorIndex::makeResident(Residency residency) {
 const VectorIndexMetadata& VectorIndex::metadata() const {
   return impl_->meta_;
 }
+// ____________________________________________________________________________
+void VectorIndex::setEmbeddingEndpoint(std::optional<std::string> url,
+                                       std::optional<std::string> model) {
+  if (url.has_value()) {
+    impl_->meta_.config_.embeddingUrl_ = std::move(url.value());
+  }
+  if (model.has_value()) {
+    impl_->meta_.config_.embeddingModel_ = std::move(model.value());
+  }
+}
 size_t VectorIndex::dimensions() const { return impl_->dim(); }
 size_t VectorIndex::numVectors() const { return impl_->meta_.numVectors_; }
 size_t VectorIndex::numLiveVectors() const { return impl_->numLive(); }

@@ -215,6 +215,10 @@ addLinkAndDiscoverTest(MmapVectorTest)
 if (QLEVER_WITH_VECTOR_SEARCH)
     addLinkAndDiscoverTest(VectorIndexTest vectorStorage)
 
+    # The `QLEVER_VECTOR_SEARCH_ENDPOINTS` runtime override of the persisted
+    # embedding endpoints (env parsing + the in-memory-only mutator).
+    addLinkAndDiscoverTest(VectorIndexEndpointOverrideTest vectorStorage)
+
     # End-to-end tests of the vector-search magic SERVICE (parsing, planning,
     # operations); needs the service's self-registration, hence the OBJECT lib.
     addLinkAndDiscoverTest(VectorSearchServiceTest engine service_vectorSearch)

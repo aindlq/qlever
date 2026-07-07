@@ -10,6 +10,7 @@
 
 #include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -20,6 +21,8 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "util/Exception.h"
 #include "util/HashMap.h"
+#include "util/Log.h"
+#include "util/json.h"
 
 class Index;
 
@@ -138,6 +141,111 @@ inline std::optional<std::string> indexNameFromMetadataIri(
     return std::nullopt;
   }
   return std::string{iri};
+}
+
+// The environment variable through which the embedding endpoints persisted in
+// the per-index `.meta` files can be set or changed AT SERVER START, without
+// rebuilding the index: a JSON object keyed by index name, each value an
+// object with the optional string keys "embeddingUrl" and "embeddingModel",
+// e.g.
+//   QLEVER_VECTOR_SEARCH_ENDPOINTS='{
+//     "images":   {"embeddingUrl": "unix:/siglip2.private",
+//                  "embeddingModel": "siglip"},
+//     "metadata": {"embeddingUrl": "unix:/qwen3.private"}}'
+// Only the fields present are overridden. The load hook applies the override
+// IN MEMORY on every server start; the on-disk `.meta` is never rewritten, so
+// starting without the variable falls back to the persisted endpoints.
+inline constexpr const char* VECTOR_SEARCH_ENDPOINTS_ENV_VAR =
+    "QLEVER_VECTOR_SEARCH_ENDPOINTS";
+
+// One per-index override parsed from the environment variable above; a
+// `nullopt` field keeps the persisted value.
+struct EmbeddingEndpointOverride {
+  std::optional<std::string> embeddingUrl_;
+  std::optional<std::string> embeddingModel_;
+};
+using EmbeddingEndpointOverrides =
+    ad_utility::HashMap<std::string, EmbeddingEndpointOverride>;
+
+// Parse the JSON value of `QLEVER_VECTOR_SEARCH_ENDPOINTS` into per-index
+// overrides. NEVER throws -- a bad value must not prevent the server from
+// starting: an empty value yields an empty map, malformed JSON (or a
+// non-object top level) logs a warning and yields an empty map, and a
+// malformed entry (non-object value, unknown key, non-string field, or no
+// fields at all) logs a warning and is skipped ENTIRELY, so a typo cannot
+// half-apply an override.
+inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
+    std::string_view json) {
+  EmbeddingEndpointOverrides overrides;
+  if (json.empty()) {
+    return overrides;
+  }
+  nlohmann::json parsed;
+  try {
+    parsed = nlohmann::json::parse(json);
+  } catch (const std::exception& e) {
+    AD_LOG_WARN << "Ignoring " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                << ": its value is not valid JSON: " << e.what() << std::endl;
+    return overrides;
+  }
+  if (!parsed.is_object()) {
+    AD_LOG_WARN << "Ignoring " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                << ": expected a JSON object keyed by vector index name."
+                << std::endl;
+    return overrides;
+  }
+  for (const auto& [name, value] : parsed.items()) {
+    if (!value.is_object()) {
+      AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                  << " entry for vector index '" << name
+                  << "': expected an object with the optional string keys "
+                     "\"embeddingUrl\" and \"embeddingModel\"."
+                  << std::endl;
+      continue;
+    }
+    EmbeddingEndpointOverride endpointOverride;
+    bool ok = true;
+    for (const auto& [key, field] : value.items()) {
+      if (key == "embeddingUrl" && field.is_string()) {
+        endpointOverride.embeddingUrl_ = field.get<std::string>();
+      } else if (key == "embeddingModel" && field.is_string()) {
+        endpointOverride.embeddingModel_ = field.get<std::string>();
+      } else {
+        AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                    << " entry for vector index '" << name << "': the key \""
+                    << key
+                    << "\" is unknown or not a string (known keys: "
+                       "\"embeddingUrl\", \"embeddingModel\")."
+                    << std::endl;
+        ok = false;
+        break;
+      }
+    }
+    if (!endpointOverride.embeddingUrl_.has_value() &&
+        !endpointOverride.embeddingModel_.has_value()) {
+      if (ok) {
+        AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                    << " entry for vector index '" << name
+                    << "': it overrides neither \"embeddingUrl\" nor "
+                       "\"embeddingModel\"."
+                    << std::endl;
+      }
+      continue;
+    }
+    if (ok) {
+      overrides.insert_or_assign(name, std::move(endpointOverride));
+    }
+  }
+  return overrides;
+}
+
+// Read and parse `QLEVER_VECTOR_SEARCH_ENDPOINTS` from the environment (a
+// no-op empty map if it is unset or empty). The load hook and the unit tests
+// share this exact code path.
+inline EmbeddingEndpointOverrides embeddingEndpointOverridesFromEnv() {
+  const char* value = std::getenv(VECTOR_SEARCH_ENDPOINTS_ENV_VAR);
+  return parseEmbeddingEndpointOverrides(
+      value == nullptr ? std::string_view{} : std::string_view{value});
 }
 
 // All vector indices of a database, keyed by name. This is the object stored as

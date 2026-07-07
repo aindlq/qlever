@@ -669,6 +669,14 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
   }
   auto collection = std::make_shared<VectorIndexCollection>();
   std::vector<IndexMetadataFields> metadataFields;
+  // Runtime override of the persisted embedding endpoints (see
+  // `VECTOR_SEARCH_ENDPOINTS_ENV_VAR` in `VectorIndexExtension.h`): applied
+  // IN MEMORY to every matching index below and never written back to the
+  // `.meta` files, so it has to be (and is) reapplied at every server start.
+  // Applied entries are erased, so what remains afterwards is a typo/stale
+  // name to warn about.
+  EmbeddingEndpointOverrides endpointOverrides =
+      embeddingEndpointOverridesFromEnv();
   bool any = false;
   for (const auto& entry : fs::directory_iterator(dir, ec)) {
     const std::string fn = entry.path().filename().string();
@@ -732,6 +740,16 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                 << ", dim " << idx.dimensions()
                 << ", HNSW=" << (idx.hasHnsw() ? "yes" : "no") << ")"
                 << std::endl;
+    // Apply the environment override BEFORE the metadata fields are collected,
+    // so the `vec:model` metadata triple reflects the effective model.
+    if (auto it = endpointOverrides.find(name); it != endpointOverrides.end()) {
+      idx.setEmbeddingEndpoint(std::move(it->second.embeddingUrl_),
+                               std::move(it->second.embeddingModel_));
+      endpointOverrides.erase(it);
+      AD_LOG_INFO << "Vector index '" << name
+                  << "': embedding endpoint overridden from "
+                  << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << std::endl;
+    }
     const VectorIndexConfig& config = idx.metadata().config_;
     metadataFields.push_back({name, config.dimensions_,
                               toString(config.metric_),
@@ -739,6 +757,16 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                               config.embeddingModel_});
     collection->add(name, std::move(idx));
     any = true;
+  }
+  // Warn about override names that matched no loaded index (a typo, or an
+  // index that was skipped above), so a silently ineffective override is
+  // visible in the log.
+  for (const auto& entry : endpointOverrides) {
+    AD_LOG_WARN << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << " names vector index '"
+                << entry.first
+                << "', but no vector index of that name was loaded; the "
+                   "override has no effect."
+                << std::endl;
   }
   if (any) {
     impl.setExtension(std::string{VECTOR_EXTENSION_NAME},

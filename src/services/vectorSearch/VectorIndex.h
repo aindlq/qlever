@@ -92,6 +92,15 @@ class VectorIndex {
 
   // Metadata accessors.
   const VectorIndexMetadata& metadata() const;
+  // Override the IN-MEMORY embedding endpoint of this index (what query-time
+  // `vec:embed` and the SERVICE's text/image query points use): a `nullopt`
+  // field keeps its current value. This never rewrites the on-disk `.meta`,
+  // so it is a pure runtime override that has to be reapplied after every
+  // `open()` -- the load hook does exactly that from the
+  // `QLEVER_VECTOR_SEARCH_ENDPOINTS` environment variable (see
+  // `VectorIndexExtension.h`).
+  void setEmbeddingEndpoint(std::optional<std::string> url,
+                            std::optional<std::string> model);
   size_t dimensions() const;
   // Number of rows in the flat store (including tombstoned rows).
   size_t numVectors() const;

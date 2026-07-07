@@ -141,6 +141,25 @@ to the index in the build spec:
 - Without `embeddingUrl`, the index is fully usable with explicit query
   vectors and entity↔entity distances; only `vec:embed` (and the SERVICE's
   text/image query points) error with "has no embeddingUrl configured".
+- Both keys are **optional at build time for the `npy`/`parquet` inputs**
+  (only the `texts` input needs `embeddingUrl`, to embed at build time) and
+  are persisted in the index's `.meta` file when given. They can also be
+  **set or changed at server start — no rebuild needed** — via the environment
+  variable `QLEVER_VECTOR_SEARCH_ENDPOINTS`: a JSON object keyed by index
+  name, each value with optional `embeddingUrl`/`embeddingModel` fields:
+
+  ```bash
+  QLEVER_VECTOR_SEARCH_ENDPOINTS='{"images": {"embeddingUrl": "unix:/siglip2.private", "embeddingModel": "siglip"},
+                                   "metadata": {"embeddingUrl": "unix:/qwen3.private"}}' \
+    qlever-server -i myindex -p 7001
+  ```
+
+  Only the fields present are overridden (a URL-only override keeps the
+  persisted model, and vice versa). The override is **in-memory only** — the
+  on-disk `.meta` is never rewritten — so it is reapplied on every server
+  start, and starting without the variable falls back to the persisted
+  endpoint. A malformed value is logged as a warning and ignored; it never
+  prevents the server from starting.
 
 ## 4. Serve and query
 
