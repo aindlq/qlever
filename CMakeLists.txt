@@ -303,19 +303,26 @@ option(QLEVER_REQUIRE_JEMALLOC "Fail the build if jemalloc is not found" OFF)
 find_package(jemalloc QUIET)
 if (TARGET jemalloc::jemalloc)
     MESSAGE(STATUS "Use jemalloc that was installed via conan")
-    link_libraries(jemalloc::jemalloc)
     if (MINGW)
-        # On Windows, jemalloc's C API is je_-prefixed by design (pecoff), so
-        # plain malloc/free are NOT interposed, but the C++ operator new/delete
-        # symbols are exported unprefixed, so linking jemalloc routes all C++
-        # allocations (containers, strings, IdTables, ...) through it. That
-        # override only works with a fully STATIC libstdc++: PE has no
-        # cross-module symbol interposition, so a libstdc++ DLL would call its
-        # own new/delete; and on winlibs `-static-libstdc++` without `-static`
-        # collides libstdc++.a vs libstdc++.dll.a. So jemalloc implies a fully
-        # static binary here — which is also what we ship. C `malloc` stays on
-        # the UCRT heap (cf. Mozilla bug 1420350).
+        # On Windows, jemalloc's C API is je_-prefixed by design (pecoff), so plain
+        # malloc/free stay on the UCRT heap, but its C++ operator new/delete are
+        # exported UNPREFIXED, so linking jemalloc routes all C++ allocations
+        # (containers, strings, IdTables, ...) through it. Both jemalloc and
+        # libstdc++ define operator new/delete as strong symbols, so link jemalloc
+        # with WHOLE_ARCHIVE: that pulls jemalloc's operators in ahead of libstdc++,
+        # so libstdc++'s new_op.o is never referenced. Without it, archive pull-order
+        # decides per target — most link cleanly (jemalloc wins) but a few (e.g. the
+        # single test binary) pull libstdc++'s operator new first and fail with
+        # "multiple definition". WHOLE_ARCHIVE makes jemalloc the allocator in EVERY
+        # target, so the tests exercise the same allocator as the shipped binaries.
+        # The override also needs a fully STATIC libstdc++: PE has no cross-module
+        # symbol interposition (a libstdc++ DLL would call its own new/delete), and
+        # `-static-libstdc++` without `-static` collides libstdc++.a vs .dll.a. So
+        # jemalloc implies a fully static binary here — which is also what we ship.
+        link_libraries("$<LINK_LIBRARY:WHOLE_ARCHIVE,jemalloc::jemalloc>")
         add_link_options(-static -static-libgcc -static-libstdc++)
+    else ()
+        link_libraries(jemalloc::jemalloc)
     endif ()
 
 elseif (${JEMALLOC_MANUALLY_INSTALLED})
