@@ -9,6 +9,8 @@
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORDISTANCEEXPRESSION_H
 
 #include <array>
+#include <chrono>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -63,6 +65,12 @@ class VectorDistanceExpression : public SparqlExpression {
   // evaluated per row (each typically a variable, a constant, or `vec:embed`).
   VectorDistanceExpression(std::string indexName, Ptr source1, Ptr source2);
 
+  // Logs ONE accumulated `vec:distance` timing line for the whole query
+  // execution (see the accumulator members below); silent if this instance
+  // never computed a distance (e.g. clones made during query planning, or
+  // never-evaluated instances).
+  ~VectorDistanceExpression() override;
+
   ExpressionResult evaluate(EvaluationContext* context) const override;
   std::string getCacheKey(const VariableToColumnMap& varColMap) const override;
 
@@ -71,6 +79,22 @@ class VectorDistanceExpression : public SparqlExpression {
 
   std::string indexName_;
   std::array<Ptr, 2> sources_;
+
+  // Accumulated distance-timing stats across ALL `evaluate()` blocks of one
+  // query execution: Bind's lazy path calls `evaluate()` once per input chunk
+  // (10000-row chunks) on the SAME expression object, so logging per block
+  // would emit hundreds of near-identical lines. The destructor logs the total
+  // ONCE when the query tree is torn down. Mutable because `evaluate()` is
+  // const; PLAIN (not atomic) because one expression instance is never
+  // evaluated by two threads at once -- the parallelism is WITHIN a block and
+  // joins before the accumulation happens.
+  mutable size_t totalDistances_ = 0;
+  mutable std::chrono::microseconds totalDistanceTime_{0};
+  mutable size_t distanceBlocks_ = 0;
+  // The index shape, cached on the first block that computes anything, so the
+  // destructor can log it without re-resolving the index.
+  mutable size_t loggedDim_ = 0;
+  mutable std::string loggedScalar_;
 };
 
 // Shared front of the vector-search function factories: extract the index

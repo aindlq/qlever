@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <optional>
 #include <string>
@@ -257,6 +258,25 @@ VectorDistanceExpression::VectorDistanceExpression(std::string indexName,
       sources_{std::move(source1), std::move(source2)} {}
 
 // _____________________________________________________________________________
+VectorDistanceExpression::~VectorDistanceExpression() {
+  // One accumulated timing line per expression instance, i.e. per query
+  // execution, instead of one per `evaluate()` block (see the accumulator
+  // members' comment in the header). This fires at query-tree destruction --
+  // AFTER the result is sent -- which is fine for a summary line. The guard
+  // keeps clones (query planning may clone expressions) and never-evaluated
+  // instances silent.
+  if (totalDistances_ > 0) {
+    AD_LOG_INFO << "vec:distance[" << indexName_ << "]: " << totalDistances_
+                << " distances, dim " << loggedDim_ << " " << loggedScalar_
+                << ", in " << (totalDistanceTime_.count() / 1000.0) << " ms"
+                << (distanceBlocks_ > 1
+                        ? absl::StrCat(" across ", distanceBlocks_, " blocks")
+                        : std::string{})
+                << std::endl;
+  }
+}
+
+// _____________________________________________________________________________
 ExpressionResult VectorDistanceExpression::evaluate(
     EvaluationContext* context) const {
   const Index& index = context->_qec.getIndex();
@@ -269,7 +289,8 @@ ExpressionResult VectorDistanceExpression::evaluate(
   const size_t resultSize = context->size();
 
   // How many rows of this `evaluate` block actually resolved to a distance
-  // (UNDEF rows are not counted); drives the one INFO timing line below.
+  // (UNDEF rows are not counted); feeds the per-operation accumulators that
+  // the destructor logs as one summary line.
   size_t numDistances = 0;
 
   // Fill `out[0..resultSize)` with `perRowDistance(i)` for every row, running
@@ -469,13 +490,18 @@ ExpressionResult VectorDistanceExpression::evaluate(
         }
       },
       std::move(result1), std::move(result2));
-  // A block that computed no distance at all (everything UNDEF) stays silent.
+  // Accumulate into the per-operation totals that the destructor logs as ONE
+  // summary line (`evaluate()` runs once per input chunk, so logging here
+  // would spam a line per block). Microseconds, so summing many fast blocks
+  // does not lose precision to integer-ms rounding. A block that computed no
+  // distance at all (everything UNDEF) contributes nothing.
   if (numDistances > 0) {
-    AD_LOG_INFO << "vec:distance[" << indexName_ << "]: " << numDistances
-                << " distances, dim " << vidx.dimensions() << " "
-                << qlever::vector::toString(vidx.metadata().config_.scalar_)
-                << ", in " << distanceTimer.msecs().count() << " ms"
-                << std::endl;
+    totalDistances_ += numDistances;
+    totalDistanceTime_ += std::chrono::duration_cast<std::chrono::microseconds>(
+        distanceTimer.value());
+    ++distanceBlocks_;
+    loggedDim_ = vidx.dimensions();
+    loggedScalar_ = qlever::vector::toString(vidx.metadata().config_.scalar_);
   }
   return result;
 }
