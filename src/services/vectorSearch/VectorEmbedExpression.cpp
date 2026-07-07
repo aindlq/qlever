@@ -24,6 +24,8 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "util/Exception.h"
+#include "util/Log.h"
+#include "util/Timer.h"
 
 namespace sparqlExpression {
 
@@ -101,6 +103,12 @@ ExpressionResult VectorEmbedExpression::evaluate(
               config.embeddingModel_,
               qlever::vector::toString(config.scalar_)));
 
+  // The accumulated wall time of the REAL embedding requests of this
+  // `evaluate` block (cache hits cost nothing and are not counted), logged
+  // once below -- never per row.
+  ad_utility::Timer requestTimer{ad_utility::Timer::Stopped};
+  size_t numRequests = 0;
+
   // Embed one input, MEMOIZED by (kind, value): a constant input embeds once,
   // a per-row variable embeds once per distinct value.
   auto embedMemoized = [&](const EmbedInput& input) -> const std::string& {
@@ -108,6 +116,7 @@ ExpressionResult VectorEmbedExpression::evaluate(
     if (auto it = cache_.find(key); it != cache_.end()) {
       return it->second;
     }
+    requestTimer.cont();
     std::vector<float> embedding =
         input.isImage_ ? qlever::vector::embedImageOpenAI(
                              config.embeddingUrl_, config.embeddingModel_,
@@ -115,6 +124,8 @@ ExpressionResult VectorEmbedExpression::evaluate(
                        : qlever::vector::embedTextOpenAI(
                              config.embeddingUrl_, config.embeddingModel_,
                              input.value_, context->cancellationHandle_);
+    requestTimer.stop();
+    ++numRequests;
     return cache_
         .emplace(std::move(key), qlever::vector::toFloatListString(embedding))
         .first->second;
@@ -133,7 +144,7 @@ ExpressionResult VectorEmbedExpression::evaluate(
   };
 
   ExpressionResult inputResult = input_->evaluate(context);
-  return std::visit(
+  ExpressionResult result = std::visit(
       [&](auto&& input) -> ExpressionResult {
         using T = std::decay_t<decltype(input)>;
         if constexpr (isConstantResult<T>) {
@@ -156,6 +167,14 @@ ExpressionResult VectorEmbedExpression::evaluate(
         }
       },
       std::move(inputResult));
+  // Only log when at least one REAL endpoint round-trip happened; a block
+  // served purely from the memoization cache stays silent.
+  if (numRequests > 0) {
+    AD_LOG_INFO << "vec:embed[" << indexName_ << "]: embedded " << numRequests
+                << " input(s) in " << requestTimer.msecs().count() << " ms via "
+                << config.embeddingUrl_ << std::endl;
+  }
+  return result;
 }
 
 // _____________________________________________________________________________

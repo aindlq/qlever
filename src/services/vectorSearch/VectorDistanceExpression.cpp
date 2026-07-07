@@ -27,6 +27,8 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "util/Exception.h"
+#include "util/Log.h"
+#include "util/Timer.h"
 
 namespace sparqlExpression {
 
@@ -234,6 +236,10 @@ ExpressionResult VectorDistanceExpression::evaluate(
   const VectorIndex& vidx = *vectorIndex;
   const size_t resultSize = context->size();
 
+  // How many rows of this `evaluate` block actually resolved to a distance
+  // (UNDEF rows are not counted); drives the one INFO timing line below.
+  size_t numDistances = 0;
+
   // Per-row source against a FIXED source: encode the fixed query point ONCE
   // into a reusable `DistanceComputer` (one rowmap lookup + one SIMD kernel
   // call per row).
@@ -264,6 +270,9 @@ ExpressionResult VectorDistanceExpression::evaluate(
       } else if (const auto* vec = std::get_if<std::vector<float>>(&row)) {
         result = toDistanceId((*computer)(*vec));
       }
+      if (!result.isUndefined()) {
+        ++numDistances;
+      }
       out.push_back(result);
       if (++sinceCheck == CHECK_INTERRUPT_PERIOD) {
         sinceCheck = 0;
@@ -288,7 +297,11 @@ ExpressionResult VectorDistanceExpression::evaluate(
           resolveSource(*it1, vidx, indexName_, context, SourceMode::PerRow);
       ResolvedSource b =
           resolveSource(*it2, vidx, indexName_, context, SourceMode::PerRow);
-      out.push_back(pairDistance(a, b, vidx));
+      Id distance = pairDistance(a, b, vidx);
+      if (!distance.isUndefined()) {
+        ++numDistances;
+      }
+      out.push_back(distance);
       if (++sinceCheck == CHECK_INTERRUPT_PERIOD) {
         sinceCheck = 0;
         context->cancellationHandle_->throwIfCancelled();
@@ -300,11 +313,16 @@ ExpressionResult VectorDistanceExpression::evaluate(
   ExpressionResult result1 = sources_[0]->evaluate(context);
   ExpressionResult result2 = sources_[1]->evaluate(context);
 
+  // Time ONLY the distance computation below (row resolution + the
+  // `DistanceComputer`/SIMD kernel calls) -- the child evaluation above (e.g.
+  // a `vec:embed`) is timed and logged separately.
+  ad_utility::Timer distanceTimer{ad_utility::Timer::Started};
+
   // Branch on constness: the expression framework yields a CONSTANT result
   // for a constant sub-expression, so a constant source (an inline float
   // list, a constant entity IRI, a `vec:embed` of constants, ...) is
   // parsed/looked up/encoded exactly once, never per row.
-  return std::visit(
+  ExpressionResult result = std::visit(
       [&](auto&& in1, auto&& in2) -> ExpressionResult {
         using T1 = std::decay_t<decltype(in1)>;
         using T2 = std::decay_t<decltype(in2)>;
@@ -314,7 +332,11 @@ ExpressionResult VectorDistanceExpression::evaluate(
                                            SourceMode::Constant);
           ResolvedSource b = resolveSource(in2, vidx, indexName_, context,
                                            SourceMode::Constant);
-          return pairDistance(a, b, vidx);
+          Id distance = pairDistance(a, b, vidx);
+          if (!distance.isUndefined()) {
+            ++numDistances;
+          }
+          return distance;
         } else if constexpr (isConstantResult<T1>) {
           return perRowAgainstConstant(
               resolveSource(in1, vidx, indexName_, context,
@@ -331,6 +353,15 @@ ExpressionResult VectorDistanceExpression::evaluate(
         }
       },
       std::move(result1), std::move(result2));
+  // A block that computed no distance at all (everything UNDEF) stays silent.
+  if (numDistances > 0) {
+    AD_LOG_INFO << "vec:distance[" << indexName_ << "]: " << numDistances
+                << " distances, dim " << vidx.dimensions() << " "
+                << qlever::vector::toString(vidx.metadata().config_.scalar_)
+                << ", in " << distanceTimer.msecs().count() << " ms"
+                << std::endl;
+  }
+  return result;
 }
 
 // _____________________________________________________________________________

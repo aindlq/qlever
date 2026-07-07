@@ -270,6 +270,15 @@ class VectorIndexCollection {
 std::shared_ptr<const VectorIndex> getVectorIndex(const Index& index,
                                                   const std::string& name);
 
+// The human-readable, space-separated names of the SIMD ISAs set in
+// `capabilities` (a NumKong `nk_capability_t` bitmask, e.g. from
+// `nk_capabilities_available()`; declared as the underlying `uint64_t` so this
+// header stays free of NumKong includes). Returns "serial(scalar)" if no SIMD
+// bit is set (or this binary was built without NumKong). Backs the one-time
+// "Vector search SIMD" startup log of the load hook; declared here so the
+// pure bitmask -> name mapping is unit-testable.
+std::string numkongActiveIsaString(uint64_t capabilities);
+
 // Recompute the entity mapping of the existing on-disk vector index `name`
 // against the CURRENTLY LOADED knowledge graph: re-resolves the row-aligned
 // `.iris` sidecar (in parallel; `numThreads` 0 = all cores) and rewrites

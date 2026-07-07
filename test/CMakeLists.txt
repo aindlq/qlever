@@ -226,6 +226,10 @@ if (QLEVER_WITH_VECTOR_SEARCH)
     # End-to-end test of the "index-payload" flow: `.npy` bundle -> build hook
     # -> load hook -> `vec:distance` ranking in SPARQL.
     addLinkAndDiscoverTest(VectorIndexPayloadE2ETest engine service_vectorSearch)
+
+    # The pure NumKong capability-bitmask -> ISA-name mapping behind the
+    # one-time "Vector search SIMD" startup log.
+    addLinkAndDiscoverTest(VectorSearchSimdInfoTest engine service_vectorSearch)
 endif ()
 
 # BufferedVectorTest also uses conflicting filenames.

@@ -28,6 +28,14 @@
 #include <thread>
 #include <vector>
 
+#if USEARCH_USE_NUMKONG
+// Pulls in `numkong/capabilities.h`: `nk_capabilities_available()`,
+// `nk_capabilities_compiled()`, `nk_uses_dynamic_dispatch()`, and the
+// `nk_cap_*_k` bits (the dispatch tables come from the linked
+// `numkongDispatch` library).
+#include <numkong/numkong.h>
+#endif
+
 #include "absl/strings/str_cat.h"
 #include "backports/StartsWithAndEndsWith.h"
 #include "backports/algorithm.h"
@@ -70,6 +78,44 @@ std::shared_ptr<const VectorIndex> getVectorIndex(const Index& index,
   // Aliasing constructor: shares ownership of the collection, points at the
   // contained index.
   return std::shared_ptr<const VectorIndex>{std::move(collection), idx};
+}
+
+// ____________________________________________________________________________
+std::string numkongActiveIsaString([[maybe_unused]] uint64_t capabilities) {
+#if USEARCH_USE_NUMKONG
+  std::string out;
+  auto append = [&](uint64_t bit, std::string_view name) {
+    if ((capabilities & bit) != 0) {
+      if (!out.empty()) {
+        out.push_back(' ');
+      }
+      out.append(name);
+    }
+  };
+  // x86.
+  append(nk_cap_haswell_k, "haswell/avx2");
+  append(nk_cap_skylake_k, "skylake/avx512");
+  append(nk_cap_icelake_k, "icelake/avx512-vnni");
+  append(nk_cap_genoa_k, "genoa/avx512-bf16");
+  append(nk_cap_sapphire_k, "sapphire/avx512-fp16");
+  append(nk_cap_sapphireamx_k, "amx");
+  append(nk_cap_graniteamx_k, "amx-fp16");
+  append(nk_cap_turin_k, "turin");
+  // ARM.
+  append(nk_cap_neon_k, "neon");
+  append(nk_cap_neonhalf_k, "neon-fp16");
+  append(nk_cap_neonbfdot_k, "neon-bfdot");
+  append(nk_cap_sve_k, "sve");
+  append(nk_cap_sve2_k, "sve2");
+  if (out.empty()) {
+    out = "serial(scalar)";
+  }
+  return out;
+#else
+  // Built without NumKong (QLEVER_VECTOR_SEARCH_SIMD=OFF): there is never a
+  // SIMD kernel, whatever the bitmask claims.
+  return "serial(scalar)";
+#endif
 }
 
 namespace {
@@ -652,6 +698,34 @@ void materializeMetadataTriples(IndexImpl& impl,
   }
 }
 
+// Log ONCE per process (at the first vector-index load) whether NumKong's
+// SIMD kernels are actually engaged -- i.e. which detected-AND-compiled ISAs
+// the runtime dispatch can pick from -- or warn loudly when everything would
+// run on the scalar fallback.
+void logNumkongSimdOnce() {
+  static std::once_flag flag;
+  std::call_once(flag, [] {
+#if USEARCH_USE_NUMKONG
+    const nk_capability_t available = nk_capabilities_available();
+    if ((available & ~static_cast<nk_capability_t>(nk_cap_serial_k)) == 0) {
+      AD_LOG_WARN << "Vector search: NO SIMD ISA active -- NumKong is on the "
+                     "scalar fallback; distance scans will be slow."
+                  << std::endl;
+      return;
+    }
+    AD_LOG_INFO << "Vector search SIMD: dynamic-dispatch="
+                << (nk_uses_dynamic_dispatch() != 0 ? "on" : "off")
+                << ", active ISA: " << numkongActiveIsaString(available)
+                << std::endl;
+#else
+    AD_LOG_WARN << "Vector search: NO SIMD ISA active -- this binary was "
+                   "built without NumKong (QLEVER_VECTOR_SEARCH_SIMD=OFF); "
+                   "distance scans will be slow."
+                << std::endl;
+#endif
+  });
+}
+
 // LOAD hook: memory-map every `<base>.vec.<name>.*` index and attach the
 // collection to the `IndexImpl`. A broken or stale index is skipped with a
 // warning instead of preventing the whole server from starting -- queries
@@ -769,6 +843,7 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                 << std::endl;
   }
   if (any) {
+    logNumkongSimdOnce();
     impl.setExtension(std::string{VECTOR_EXTENSION_NAME},
                       std::move(collection));
     materializeMetadataTriples(impl, metadataFields);
