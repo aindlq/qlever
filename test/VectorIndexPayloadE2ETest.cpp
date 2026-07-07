@@ -380,6 +380,95 @@ QueryExecutionContext* qecWithCrossIndexes() {
   }
   return qec;
 }
+
+// ===========================================================================
+// The LARGE fixture: an index with MORE entities than the `vec:distance`
+// parallel-scan threshold (see `VEC_DISTANCE_PARALLEL_THRESHOLD` in
+// `VectorDistanceExpression.cpp`), so a whole-column `BIND(vec:distance(...))`
+// runs the multi-threaded per-row scan (5000 rows is a single BIND evaluation
+// block: below the 10'000 `Bind::CHUNK_SIZE`, above the 2048 parallel
+// threshold). Used to prove the parallel path is bit-identical to a serial
+// reference and race-free.
+constexpr size_t BIG_NUM_VECTORS = 5000;
+constexpr size_t BIG_DIM = 8;
+
+// An exactly-representable (dyadic) query vector, so the string the SPARQL
+// query carries (`BIG_QUERY_STR`) parses -- via the same `absl::from_chars`
+// the expression uses -- to EXACTLY these `float`s. That lets the serial
+// reference `makeDistanceComputer(BIG_QUERY)` use a bit-identical query point,
+// so any difference the test sees comes from the parallel scan, not from query
+// re-encoding.
+const std::vector<float> BIG_QUERY = {0.5f,  -0.25f, 0.75f,  1.0f,
+                                      -0.5f, 0.25f,  0.125f, -0.125f};
+constexpr std::string_view BIG_QUERY_STR =
+    "0.5,-0.25,0.75,1,-0.5,0.25,0.125,-0.125";
+
+// Deterministic, distinct, non-zero-norm vectors for `<e0>..<e{N-1}>` (a
+// xorshift64 stream mapped to [-1, 1), with a +2 bump on the first component
+// so no row is the zero vector -- cosine distance is NaN there).
+std::vector<std::pair<std::string, std::vector<float>>> bigTestVectors() {
+  std::vector<std::pair<std::string, std::vector<float>>> rows;
+  rows.reserve(BIG_NUM_VECTORS);
+  uint64_t state = 88172645463325252ull;
+  auto nextFloat = [&state]() {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    uint32_t bits = static_cast<uint32_t>(state >> 40);  // top 24 bits
+    return static_cast<float>(bits) / static_cast<float>(1 << 23) - 1.0f;
+  };
+  for (size_t i = 0; i < BIG_NUM_VECTORS; ++i) {
+    std::vector<float> v(BIG_DIM);
+    for (size_t j = 0; j < BIG_DIM; ++j) {
+      v[j] = nextFloat();
+    }
+    v[0] += 2.0f;
+    rows.emplace_back("<e" + std::to_string(i) + ">", std::move(v));
+  }
+  return rows;
+}
+
+QueryExecutionContext* qecWithLargeIndex() {
+  // One triple per line: the parallel Turtle parser batches the input and needs
+  // a statement terminator (`.` + newline) within each batch, so a single
+  // 150 KB line would trip its buffer.
+  std::string kg;
+  for (size_t i = 0; i < BIG_NUM_VECTORS; ++i) {
+    kg += "<e" + std::to_string(i) + "> <is-a> <BigItem> .\n";
+  }
+  QueryExecutionContext* qec = getQec(kg);
+  auto& impl = const_cast<Index&>(qec->getIndex()).getImpl();
+  if (impl.getExtension(std::string{qlever::vector::VECTOR_EXTENSION_NAME}) !=
+      nullptr) {
+    return qec;
+  }
+  std::string basename =
+      (std::filesystem::temp_directory_path() /
+       ("qlever-vecpayloade2e-big-" + std::to_string(::getpid())))
+          .string();
+  std::string npy = basename + ".input.npy";
+  std::string iris = basename + ".input.iris";
+  writeNpyBundle(npy, iris, bigTestVectors());
+  nlohmann::json spec = nlohmann::json::parse(
+      R"({"vectorSearch":[{"name":"embbig","npy":")" + npy + R"(","iris":")" +
+      iris + R"(","metric":"cosine","hnsw":false}]})");
+  for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
+    hook(qec->getIndex(), basename, spec);
+  }
+  for (const auto& hook : IndexExtensionRegistry::get().loadHooks()) {
+    hook(impl, basename);
+  }
+  qec->setLocatedTriplesForEvaluation(
+      impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
+  for (auto* suffix :
+       {".vec.embbig.meta", ".vec.embbig.keys", ".vec.embbig.rowmap",
+        ".vec.embbig.data", ".vec.embbig.iris", ".vec.embbig.hnsw",
+        ".input.npy", ".input.iris"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + suffix, ec);
+  }
+  return qec;
+}
 }  // namespace
 
 // _____________________________________________________________________________
@@ -980,5 +1069,74 @@ TEST(VectorIndexPayloadE2E, modellessIndexSkipsModelCheck) {
     Id d = table(0, qet.getVariableColumn(Variable{"?d"}));
     ASSERT_EQ(d.getDatatype(), Datatype::Double);
     EXPECT_NEAR(d.getDouble(), 0.0, 1e-4);
+  }
+}
+
+// _____________________________________________________________________________
+// The whole-column scan `BIND(vec:distance(idx, ?e, <constant query>))` over an
+// index with more entities than the parallel-scan threshold exercises the
+// multi-threaded `perRowAgainstConstant` path. Its result MUST be BIT-IDENTICAL
+// to a serial reference computed with the same `DistanceComputer` in a plain
+// loop (proving the parallel path is race-free and deterministic, not merely
+// numerically close), and two runs MUST agree exactly.
+TEST(VectorIndexPayloadE2E, parallelPerRowScanMatchesSerialReference) {
+  auto* qec = qecWithLargeIndex();
+
+  // The exact same query the SPARQL expression will see, and hence the exact
+  // same `DistanceComputer` -- the reference distances below therefore differ
+  // from the query's only if the parallel scan is wrong.
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "embbig");
+  ASSERT_TRUE(vidx);
+  ASSERT_EQ(vidx->numLiveVectors(), BIG_NUM_VECTORS);
+  ASSERT_EQ(vidx->dimensions(), BIG_DIM);
+  auto computer = vidx->makeDistanceComputer(BIG_QUERY);
+  auto referenceDistance = [&computer](Id entity) {
+    float d = computer(entity);
+    return std::isnan(d) ? Id::makeUndefined()
+                         : Id::makeFromDouble(static_cast<double>(d));
+  };
+
+  auto runScan = [&](std::string queryVector) {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?e ?d WHERE { ?e <is-a> <BigItem> . "
+                           "BIND(vec:distance(vidx:embbig, ?e, \"" +
+                           queryVector + "\") AS ?d) }");
+    return qet.getResult();
+  };
+
+  auto result = runScan(std::string{BIG_QUERY_STR});
+  const IdTable& table = result->idTable();
+  // All entities have a vector -> one bound row each; > 2048 so the parallel
+  // path was taken, and (< 10'000) it was a single BIND evaluation block.
+  ASSERT_EQ(table.numRows(), BIG_NUM_VECTORS);
+
+  // Every parallel distance is bit-identical to the serial reference.
+  QueryExecutionTree probe =
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT ?e ?d WHERE { ?e <is-a> <BigItem> . "
+                         "BIND(vec:distance(vidx:embbig, ?e, \"" +
+                         std::string{BIG_QUERY_STR} + "\") AS ?d) }");
+  size_t eCol = probe.getVariableColumn(Variable{"?e"});
+  size_t dCol = probe.getVariableColumn(Variable{"?d"});
+  size_t numBound = 0;
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    Id entity = table(r, eCol);
+    Id reference = referenceDistance(entity);
+    ASSERT_EQ(table(r, dCol), reference)
+        << "row " << r << " diverges from the serial reference";
+    ASSERT_EQ(table(r, dCol).getDatatype(), Datatype::Double) << "row " << r;
+    ++numBound;
+  }
+  EXPECT_EQ(numBound, BIG_NUM_VECTORS);
+
+  // Determinism: a second run yields the same rows in the same order with the
+  // same distances (same index-scan order, no ORDER BY).
+  auto result2 = runScan(std::string{BIG_QUERY_STR});
+  const IdTable& table2 = result2->idTable();
+  ASSERT_EQ(table2.numRows(), table.numRows());
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    EXPECT_EQ(table2(r, eCol), table(r, eCol)) << "row " << r;
+    EXPECT_EQ(table2(r, dCol), table(r, dCol)) << "row " << r;
   }
 }

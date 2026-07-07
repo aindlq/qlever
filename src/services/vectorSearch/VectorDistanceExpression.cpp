@@ -11,11 +11,19 @@
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <variant>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "backports/StartsWithAndEndsWith.h"
 #include "engine/sparqlExpressions/LiteralExpression.h"
@@ -38,6 +46,30 @@ using qlever::vector::VectorIndex;
 // How often the per-row loop polls the cancellation handle -- frequent enough
 // for prompt cancellation, rare enough to stay out of the hot path.
 constexpr size_t CHECK_INTERRUPT_PERIOD = 65536;
+
+// Below this many rows the fork/join overhead of the parallel scan outweighs
+// the win, so the per-row distance loops stay on the serial path.
+constexpr size_t VEC_DISTANCE_PARALLEL_THRESHOLD = 2048;
+
+// Rows per work item handed to a worker. The per-row cost is uniform (one
+// rowmap binary search + one SIMD kernel call), so a coarse fixed chunk keeps
+// scheduling overhead negligible; it is also the cancellation-poll granularity.
+constexpr size_t VEC_DISTANCE_PARALLEL_CHUNK = 1024;
+
+#ifdef _OPENMP
+// Worker cap for the parallel scan. QLever answers many queries concurrently on
+// a thread pool already sized to the hardware, so letting a single
+// `vec:distance` grab every core would oversubscribe when several queries run
+// at once. Cap at the hardware concurrency AND OpenMP's configured maximum (so
+// `OMP_NUM_THREADS` can still lower it). The scan is memory-bandwidth bound, so
+// there is nothing to gain past the physical core count anyway. (No per-query
+// thread-count config is reachable from the expression's `EvaluationContext`;
+// if one is exposed here later, prefer it over the hardware concurrency.)
+int vectorDistanceThreadCap() {
+  unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+  return std::max(1, std::min(omp_get_max_threads(), static_cast<int>(hw)));
+}
+#endif
 
 // Parse a comma-separated list of finite floats, e.g. "0.1,-0.2,0.3" (the
 // string form of an explicit query vector, and the output format of
@@ -240,9 +272,83 @@ ExpressionResult VectorDistanceExpression::evaluate(
   // (UNDEF rows are not counted); drives the one INFO timing line below.
   size_t numDistances = 0;
 
+  // Fill `out[0..resultSize)` with `perRowDistance(i)` for every row, running
+  // the per-row work in parallel once the block is large enough. Correctness
+  // rests on `perRowDistance` being a PURE function of `i`: it only reads const
+  // index state (rowmap binary search + mmap SIMD) plus the serially
+  // materialized per-row buffer and writes nothing shared, so every `out[i]` is
+  // an independent, disjoint write and the parallel result is bit-identical to
+  // (and as deterministic as) the serial one. `numDistances` is combined via a
+  // reduction, so its total is order-independent and matches the serial count
+  // exactly. Cancellation follows the standard OpenMP pattern: check before the
+  // region, poll a non-throwing `isCancelled()` per chunk into a shared atomic
+  // flag inside the region (never unwinding an exception out of it), then throw
+  // once after the region.
+  auto fillDistances = [&](VectorWithMemoryLimit<Id>& out,
+                           const auto& perRowDistance) {
+    // Pre-size (all UNDEF) so workers write DISJOINT slots with zero allocator
+    // contention -- never `reserve` + `push_back` from multiple threads.
+    out.resize(resultSize, Id::makeUndefined());
+    context->cancellationHandle_->throwIfCancelled();
+    size_t produced = 0;
+#ifdef _OPENMP
+    if (resultSize >= VEC_DISTANCE_PARALLEL_THRESHOLD) {
+      std::atomic<bool> cancelled{false};
+      const int numThreads = vectorDistanceThreadCap();
+#pragma omp parallel for schedule(dynamic, VEC_DISTANCE_PARALLEL_CHUNK) \
+    num_threads(numThreads) reduction(+ : produced)
+      for (size_t i = 0; i < resultSize; ++i) {
+        // An exception must never unwind out of the OpenMP region: on
+        // cancellation drain the remaining iterations cheaply and throw
+        // afterwards. (`perRowDistance` itself never throws -- `resolveSource`
+        // in `PerRow` mode and the `DistanceComputer`/`pairDistance` calls are
+        // all no-throw.)
+        if (cancelled.load(std::memory_order_relaxed)) {
+          continue;
+        }
+        if (i % VEC_DISTANCE_PARALLEL_CHUNK == 0 &&
+            context->cancellationHandle_->isCancelled()) {
+          cancelled.store(true, std::memory_order_relaxed);
+          continue;
+        }
+        Id result = perRowDistance(i);
+        out[i] = result;
+        if (!result.isUndefined()) {
+          ++produced;
+        }
+      }
+      if (cancelled.load(std::memory_order_relaxed)) {
+        // Re-check through the handle so the proper timeout/manual-cancel
+        // exception is raised with the right message.
+        context->cancellationHandle_->throwIfCancelled();
+      }
+      numDistances += produced;
+      return;
+    }
+#endif
+    // Serial fallback: a small block (parallel overhead not worth it) or a
+    // build without OpenMP.
+    size_t sinceCheck = 0;
+    for (size_t i = 0; i < resultSize; ++i) {
+      Id result = perRowDistance(i);
+      out[i] = result;
+      if (!result.isUndefined()) {
+        ++produced;
+      }
+      if (++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+        sinceCheck = 0;
+        context->cancellationHandle_->throwIfCancelled();
+      }
+    }
+    numDistances += produced;
+  };
+
   // Per-row source against a FIXED source: encode the fixed query point ONCE
   // into a reusable `DistanceComputer` (one rowmap lookup + one SIMD kernel
-  // call per row).
+  // call per row). Both `resolveSource` (const index/vocab reads + local float
+  // parsing, no shared mutation) and `DistanceComputer::operator()` (rowmap
+  // binary search + mmap SIMD into a LOCAL buffer, no shared mutable state) are
+  // pure const reads, so the per-row closure is safe to run concurrently.
   auto perRowAgainstConstant = [&](const ResolvedSource& constant,
                                    auto&& perRow) -> ExpressionResult {
     if (std::holds_alternative<std::monostate>(constant)) {
@@ -257,56 +363,66 @@ ExpressionResult VectorDistanceExpression::evaluate(
                   std::get<std::vector<float>>(constant))};
     // `resolveSource` only returns an entity after checking `hasVector`.
     AD_CORRECTNESS_CHECK(computer.has_value());
-    VectorWithMemoryLimit<Id> out{context->_allocator};
-    out.reserve(resultSize);
-    size_t sinceCheck = 0;
-    for (const auto& element :
-         detail::makeGenerator(AD_FWD(perRow), resultSize, context)) {
-      ResolvedSource row =
-          resolveSource(element, vidx, indexName_, context, SourceMode::PerRow);
-      Id result = Id::makeUndefined();
-      if (const Id* entity = std::get_if<Id>(&row)) {
-        result = toDistanceId((*computer)(*entity));
-      } else if (const auto* vec = std::get_if<std::vector<float>>(&row)) {
-        result = toDistanceId((*computer)(*vec));
-      }
-      if (!result.isUndefined()) {
-        ++numDistances;
-      }
-      out.push_back(result);
-      if (++sinceCheck == CHECK_INTERRUPT_PERIOD) {
-        sinceCheck = 0;
-        context->cancellationHandle_->throwIfCancelled();
-      }
+
+    // Materialize the per-row source into a random-access buffer FIRST (cheap:
+    // copies ValueIds/handles, no SIMD, single-threaded) so the expensive
+    // resolve + SIMD distance can then run over disjoint `out[i]` in parallel,
+    // keeping an exact row->index correspondence.
+    auto gen = detail::makeGenerator(AD_FWD(perRow), resultSize, context);
+    using Element = ql::ranges::range_value_t<decltype(gen)>;
+    std::vector<Element> elements;
+    elements.reserve(resultSize);
+    for (auto&& element : gen) {
+      elements.emplace_back(AD_FWD(element));
     }
+    AD_CORRECTNESS_CHECK(elements.size() == resultSize);
+
+    VectorWithMemoryLimit<Id> out{context->_allocator};
+    fillDistances(out, [&](size_t i) -> Id {
+      ResolvedSource row = resolveSource(elements[i], vidx, indexName_, context,
+                                         SourceMode::PerRow);
+      if (const Id* entity = std::get_if<Id>(&row)) {
+        return toDistanceId((*computer)(*entity));
+      }
+      if (const auto* vec = std::get_if<std::vector<float>>(&row)) {
+        return toDistanceId((*computer)(*vec));
+      }
+      return Id::makeUndefined();
+    });
     return out;
   };
 
-  // Both sources per-row: zip the two generators and compute each pair
-  // one-shot (entity<->entity uses the stored bytes directly, no copies).
+  // Both sources per-row: materialize both columns, then compute each pair via
+  // `fillDistances` (parallel for a large block). `pairDistance` dispatches to
+  // the const `VectorIndex::distance` overloads (rowmap lookups + local encode
+  // buffers + mmap SIMD, entity<->entity uses the stored bytes directly), so
+  // the per-row closure is likewise a pure concurrent read.
   auto perRowPair = [&](auto&& perRow1, auto&& perRow2) -> ExpressionResult {
-    VectorWithMemoryLimit<Id> out{context->_allocator};
-    out.reserve(resultSize);
     auto gen1 = detail::makeGenerator(AD_FWD(perRow1), resultSize, context);
     auto gen2 = detail::makeGenerator(AD_FWD(perRow2), resultSize, context);
-    auto it1 = gen1.begin();
-    auto it2 = gen2.begin();
-    size_t sinceCheck = 0;
-    for (size_t i = 0; i < resultSize; ++i, ++it1, ++it2) {
-      ResolvedSource a =
-          resolveSource(*it1, vidx, indexName_, context, SourceMode::PerRow);
-      ResolvedSource b =
-          resolveSource(*it2, vidx, indexName_, context, SourceMode::PerRow);
-      Id distance = pairDistance(a, b, vidx);
-      if (!distance.isUndefined()) {
-        ++numDistances;
-      }
-      out.push_back(distance);
-      if (++sinceCheck == CHECK_INTERRUPT_PERIOD) {
-        sinceCheck = 0;
-        context->cancellationHandle_->throwIfCancelled();
-      }
+    using Element1 = ql::ranges::range_value_t<decltype(gen1)>;
+    using Element2 = ql::ranges::range_value_t<decltype(gen2)>;
+    std::vector<Element1> elements1;
+    std::vector<Element2> elements2;
+    elements1.reserve(resultSize);
+    elements2.reserve(resultSize);
+    for (auto&& element : gen1) {
+      elements1.emplace_back(AD_FWD(element));
     }
+    for (auto&& element : gen2) {
+      elements2.emplace_back(AD_FWD(element));
+    }
+    AD_CORRECTNESS_CHECK(elements1.size() == resultSize &&
+                         elements2.size() == resultSize);
+
+    VectorWithMemoryLimit<Id> out{context->_allocator};
+    fillDistances(out, [&](size_t i) -> Id {
+      ResolvedSource a = resolveSource(elements1[i], vidx, indexName_, context,
+                                       SourceMode::PerRow);
+      ResolvedSource b = resolveSource(elements2[i], vidx, indexName_, context,
+                                       SourceMode::PerRow);
+      return pairDistance(a, b, vidx);
+    });
     return out;
   };
 
