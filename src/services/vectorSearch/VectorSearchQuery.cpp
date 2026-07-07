@@ -81,18 +81,30 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
   } else if (pred == "imageBase64") {
     using ImageKind = qlever::vector::VectorSearchConfiguration::ImageKind;
     queryImage_ = {ImageKind::Base64, requireLiteral()};
-  } else if (pred == "left") {
-    setVariable("left", object, leftVar_);
+  } else if (pred == "candidates" || pred == "left") {
+    // `<candidates>` is the canonical name; `<left>` is the original one,
+    // kept as a working alias.
+    setVariable("candidates", object, leftVar_);
   } else if (pred == "result" || pred == "right") {
     setVariable("result", object, resultVar_);
   } else if (pred == "bindScore") {
     setVariable("bindScore", object, scoreVar_);
+  } else if (pred == "bindCoarseScore") {
+    setVariable("bindCoarseScore", object, coarseScoreVar_);
   } else if (pred == "k" || pred == "numNearestNeighbors") {
     if (!object.isInt() || object.getInt() <= 0) {
       throw VectorSearchException{
           "The parameter `<k>` expects a positive integer."};
     }
     k_ = static_cast<size_t>(object.getInt());
+  } else if (pred == "rerankK") {
+    if (!object.isInt() || object.getInt() <= 0) {
+      throw VectorSearchException{
+          "The parameter `<rerankK>` expects a positive integer (the number "
+          "of coarse-scan candidates kept for the rerank pass of a two-layer "
+          "index)."};
+    }
+    rerankK_ = static_cast<size_t>(object.getInt());
   } else if (pred == "maxDistance") {
     std::optional<double> value;
     if (object.isInt()) {
@@ -129,8 +141,10 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
         "Unsupported parameter `<", pred,
         ">` in vector search; supported: `<index>`, `<query>`, "
         "`<queryVector>`, `<queryText>`, `<imageUrl>`, `<imageBase64>`, "
-        "`<left>`, `<result>`/`<right>`, `<bindScore>`, `<k>` (alias "
-        "`<numNearestNeighbors>`), `<maxDistance>`, `<algorithm>`.")};
+        "`<candidates>` (alias `<left>`), `<result>`/`<right>`, "
+        "`<bindScore>`, `<bindCoarseScore>`, `<k>` (alias "
+        "`<numNearestNeighbors>`), `<rerankK>`, `<maxDistance>`, "
+        "`<algorithm>`.")};
   }
 }
 
@@ -160,25 +174,45 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   throwIf(numQuerySpecs != 1,
           "Vector search requires exactly one of `<queryVector>`, `<query>` (a "
           "constant entity IRI), `<queryText>`, `<imageUrl>`/`<imageBase64>`, "
-          "or `<left>` (a variable bound by the surrounding query).");
+          "or `<candidates>` (alias `<left>`; a variable bound by the "
+          "surrounding query).");
   throwIf(queryVector_.has_value() && queryVector_->empty(),
           "The `<queryVector>` parameter must contain at least one number.");
 
   if (leftVar_.has_value()) {
     // Binary "for each ?x" form: the query entities are bound by the
     // SURROUNDING query (the planner joins the vector search with the subtree
-    // that binds the variable).
+    // that binds the variable). TODO: `<candidates> ?in` with `?in == ?out`
+    // should eventually ANNOTATE the candidates in place instead of being an
+    // error (see `VectorSearchQuery::leftVar_`).
     throwIf(leftVar_ == resultVar_,
-            "The `<left>` and `<result>` variables of a vector search must be "
-            "different.");
+            "The `<candidates>`/`<left>` and `<result>` variables of a vector "
+            "search must be different.");
   }
   throwIf(scoreVar_.has_value() && scoreVar_ == resultVar_,
           "The `<bindScore>` and `<result>` variables of a vector search must "
           "be different.");
   throwIf(
       scoreVar_.has_value() && leftVar_.has_value() && scoreVar_ == leftVar_,
-      "The `<bindScore>` and `<left>` variables of a vector search must be "
-      "different.");
+      "The `<bindScore>` and `<candidates>`/`<left>` variables of a vector "
+      "search must be different.");
+  throwIf(coarseScoreVar_.has_value() && coarseScoreVar_ == resultVar_,
+          "The `<bindCoarseScore>` and `<result>` variables of a vector "
+          "search must be different.");
+  throwIf(coarseScoreVar_.has_value() && leftVar_.has_value() &&
+              coarseScoreVar_ == leftVar_,
+          "The `<bindCoarseScore>` and `<candidates>`/`<left>` variables of a "
+          "vector search must be different.");
+  throwIf(coarseScoreVar_.has_value() && scoreVar_.has_value() &&
+              coarseScoreVar_ == scoreVar_,
+          "The `<bindCoarseScore>` and `<bindScore>` variables of a vector "
+          "search must be different.");
+  // The coarse->rerank pass exists only on the whole-index produce path; the
+  // join form binds one exact (fine) score per row.
+  throwIf(coarseScoreVar_.has_value() && leftVar_.has_value(),
+          "The `<bindCoarseScore>` parameter is only supported for the "
+          "whole-index search forms, not together with "
+          "`<candidates>`/`<left>`.");
 
   qlever::vector::VectorSearchConfiguration config;
   config.indexName_ = indexName_.value();
@@ -189,7 +223,9 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   config.leftVariable_ = leftVar_;
   config.resultVariable_ = resultVar_.value();
   config.scoreVariable_ = scoreVar_;
+  config.coarseScoreVariable_ = coarseScoreVar_;
   config.k_ = k_.value_or(10);
+  config.rerankK_ = rerankK_;
   config.maxDistance_ = maxDistance_;
   config.algorithm_ = algo_;
   return config;

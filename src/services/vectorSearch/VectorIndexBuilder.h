@@ -41,6 +41,12 @@ namespace qlever::vector {
 // at the end (metadata last), so an interrupted build never leaves a
 // readable-but-inconsistent index behind.
 //
+// TWO-LAYER quantize+rerank builds (`config.rerankScalar_` set): every `add`
+// additionally spills the SAME f32 row encoded at the rerank precision, and
+// `build` gathers a second flat matrix `.rerank.data` with the identical row
+// order and (natural) stride conventions. The scan `.data` (in `scalar_`,
+// e.g. i8) stays byte-identical to a single-layer build.
+//
 // NOTE: a concurrently built HNSW graph is not bit-for-bit deterministic
 // (insertion interleaving affects the neighbourhood choices); recall is
 // unaffected. Set `buildThreads_ = 1` for a deterministic build.
@@ -91,6 +97,11 @@ class VectorIndexBuilder {
   using CastFn = bool (*)(const char*, std::size_t, char*);
   CastFn fromF32_ = nullptr;
   std::vector<char> castBuffer_;
+  // The second (fine) layer of a two-layer build; only used when
+  // `config_.rerankScalar_` is set.
+  size_t rerankRowBytes_ = 0;
+  CastFn rerankFromF32_ = nullptr;
+  std::vector<char> rerankCastBuffer_;
 
   // Per-row bookkeeping (the only per-row state held in RAM).
   std::vector<uint64_t> ids_;         // entity ids, insertion order
@@ -100,8 +111,10 @@ class VectorIndexBuilder {
   // Unsorted temporary spill files fed by `add`.
   std::string vecSpillPath_;
   std::string iriSpillPath_;
+  std::string rerankSpillPath_;  // only opened for a two-layer build
   std::ofstream vecSpill_;
   std::ofstream iriSpill_;
+  std::ofstream rerankSpill_;
   uint64_t iriSpillOffset_ = 0;
 };
 

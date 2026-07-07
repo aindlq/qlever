@@ -47,6 +47,7 @@ time is a separate, runtime-configured concern — Part 2 — not a build input.
 | `iris` | — | row-aligned entity-IRI list |
 | `metric` | `cosine` | `cosine` \| `dot` \| `l2` — the space's metric (distance is smaller-is-closer) |
 | `scalar` | `f32` | storage precision `f32` \| `f16` \| `bf16` \| `i8`, **independent** of the `.npy` dtype (an `<f4` file + `scalar:"bf16"` stores 2-byte bf16) |
+| `rerank` | *(unset)* | second-layer **rerank precision** `bf16` \| `f16` \| `f32`: builds a TWO-LAYER quantize+rerank store — a coarse `scalar` scan matrix (`.data`) **plus** a fine rerank matrix (`.rerank.data`) from the same input. Exact reads (`vec:distance`) use the fine layer; the `SERVICE` scans coarse and reranks fine. Unset = single-layer |
 | `dimensions` | *(inferred)* | if set, cross-checked against the `.npy` shape → **hard error** on mismatch |
 | `hnsw` | `true` | build the HNSW graph (required for the `SERVICE`; exact brute force works without it) |
 | `hnswConnectivity` | `16` | HNSW graph degree (M) |
@@ -78,13 +79,20 @@ environment:
 |---|---|
 | `embeddingUrl` | query-time embed endpoint for `vec:embed`: `http(s)://host:port` **or** `unix:/path/to.sock` (the client POSTs to `/v1/embeddings`) |
 | `embeddingModel` | model name sent to the endpoint; also the **model identity** stamped into the typed query literal (comparability) |
-| `preload` | RAM residency: `none` (mmap) \| `advise` (madvise) \| `lock` (mlock) \| `aligned` (huge-page copy) — pin a hot, fits-in-RAM index |
+| `preload` | RAM residency of the (coarse **scan**) flat store: `none` (mmap) \| `advise` (madvise) \| `lock` (mlock) \| `aligned` (huge-page copy) — pin a hot, fits-in-RAM index |
+| `preloadRerank` | RAM residency of the fine **rerank** store of a two-layer index, **independent** of `preload` (same values, default `none`; ignored on a single-layer index) |
 
 To move an endpoint or lock an index: edit the env and **restart** the server —
 no rebuild. `preload:"lock"`/`"aligned"` on a large index needs the container
 allowed to lock that much memory (`ulimits: memlock: -1`, or `cap_add:
 [IPC_LOCK]`). An index with no `embeddingUrl` still answers entity / inline /
 `vec:vector` queries — only `vec:embed` needs the endpoint.
+
+On a **two-layer** index the canonical setup pins the small quantized scan
+matrix and leaves the high-precision rerank matrix demand-paged:
+`{"emb": {"preload": "lock", "preloadRerank": "none"}}` — every coarse scan is
+then RAM-speed, and only the `rerankK` reranked rows (plus any `vec:distance`
+reads) touch the paged fine layer.
 
 ## Part 3 — Querying from SPARQL
 
@@ -237,9 +245,66 @@ graph and could otherwise miss in-subset entities. It is
 exact brute force is too slow; keep the exact form when the enumerator already
 selects a small subset.
 
-### Use case 7 — whole-index top-k, accelerated (HNSW `SERVICE`)
-For a huge *unfiltered* top-k, the opt-in HNSW graph via the `SERVICE` block
-(exact never needs it; HNSW is always explicit). See `indexing.md` for the shape.
+### Use case 7 — whole-index top-k via the `SERVICE` (HNSW and/or quantize+rerank)
+For a huge *unfiltered* top-k, use the `SERVICE` block (exact never needs it;
+the accelerated paths are always explicit):
+
+```sparql
+SELECT ?nn ?d ?dc WHERE {
+  SERVICE vec: {
+    _:c vec:index "emb" ;
+        vec:queryVector "0.12,-0.03, … ,0.44" ;   # or vec:query <e>, vec:queryText "…", vec:imageUrl <…>
+        vec:result ?nn ;                          # the k nearest entities (a fresh variable)
+        vec:bindScore ?d ;                        # their (fine) distance
+        vec:bindCoarseScore ?dc ;                 # optional: the coarse scan distance (two-layer only)
+        vec:k 10 ;
+        vec:rerankK 200 .                         # optional: coarse candidates kept for the rerank pass
+  }
+}
+```
+
+On a **two-layer** index (built with `rerank`, see Part 1) the top-k runs
+**coarse-scan-then-rerank**:
+
+1. the *coarse pass* searches the quantized scan matrix (brute force, or HNSW
+   per `vec:algorithm` — the graph reads the scan bytes) for the top-`rerankK`
+   candidates (`vec:rerankK`, default `max(10·k, 100)`);
+2. the *rerank pass* recomputes those candidates' distances **exactly** on the
+   fine rerank matrix, sorts, and keeps the top `vec:k`.
+
+`vec:bindScore` binds the **fine** distance — the same value the exact
+`vec:distance` returns for that entity — and `vec:bindCoarseScore` optionally
+binds the **coarse** scan distance next to it, so `ABS(?d - ?dc)` is the
+per-row quantization error. `vec:maxDistance` filters on the fine distance.
+On a single-layer index the SERVICE behaves as before (single-precision
+top-k; `vec:rerankK` is ignored, `vec:bindCoarseScore` equals
+`vec:bindScore`).
+
+**Candidates (`vec:candidates`, alias `vec:left`).** The SERVICE's input-set
+parameter is named `vec:candidates` (the original name `vec:left` keeps
+working). The intended semantics:
+
+- `vec:candidates ?in` with `?in` **bound** by the surrounding query → for
+  each `?in`, search by its stored vector (the join form; implemented);
+- `vec:candidates` **omitted** → search the whole index from the explicit
+  query point (the produce form above; implemented);
+- `vec:candidates ?in` present but **unbound** anywhere → intended to fall
+  back to the whole index; currently a clear execution-time error (TODO:
+  needs planner support), so omit the parameter instead;
+- `?in == ?out` (`vec:result` the same variable) → intended to annotate the
+  candidates in place; currently rejected (TODO), use a distinct `?out`.
+
+**Coexist / compare.** `vec:distance` (fine, exact) and the SERVICE (coarse
+scan → fine rerank) work on the *same* two-layer index, so one query can put
+the exact baseline and the accelerated scores side by side:
+
+```sparql
+SELECT ?nn ?d ?dc ?dexact WHERE {
+  SERVICE vec: { _:c vec:index "emb" ; vec:queryVector "…" ; vec:result ?nn ;
+                 vec:bindScore ?d ; vec:bindCoarseScore ?dc ; vec:k 10 . }
+  BIND(vec:distance(vidx:emb, ?nn, "…") AS ?dexact)   # == ?d (both fine)
+}
+```
 
 ### Use case 8 — introspect an index (it's a real RDF resource)
 ```sparql
@@ -271,6 +336,16 @@ mechanism, concisely.
   scan is memory-bandwidth-bound, so storing at the target precision (`bf16` = 2
   bytes) directly halves the bytes read; decoding to fp32 first would throw that
   away.
+
+- **Two-layer quantize + rerank** (`rerank` build key). One index can hold TWO
+  same-order matrices: a coarse scan layer (`scalar`, e.g. `i8` = 1 B/dim) and
+  a fine rerank layer (`rerank`, e.g. `bf16` = 2 B/dim). The split maps
+  directly onto the query surfaces: the HNSW graph and the SERVICE's candidate
+  scan read only the cheap coarse bytes, while **every exact primitive —
+  `vec:distance`, `getVector`, the rerank pass itself — reads the fine layer**,
+  so exactness is never traded away silently. Residency is per layer
+  (`preload` / `preloadRerank`), so the scan layer can be pinned while the
+  rerank layer stays paged.
 
 - **One distance, exact + ANN.** A single punned metric backs both the exact
   scan and the HNSW graph, so their distances are identical. Every metric is

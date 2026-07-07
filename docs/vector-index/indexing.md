@@ -102,6 +102,7 @@ array (e.g. one for image embeddings, one for text).
 | `metric`  | `cosine` \| `dot` \| `l2` (distance; smaller = closer)         |
 | `hnsw`    | `true` builds the ANN graph; `false` = exact/flat store only   |
 | `scalar`  | *(optional)* storage precision `f32` (default) \| `f16` \| `bf16` \| `i8`|
+| `rerank`  | *(optional)* second-layer **rerank precision** `bf16` \| `f16` \| `f32`; unset = single-layer. Builds a TWO-LAYER quantize+rerank store (see below) |
 | `embeddingUrl`   | *(optional)* embedding endpoint bound to this index (see below) |
 | `embeddingModel` | *(optional)* model name sent to that endpoint; also names the index's embedding space for the typed-query-vector comparability check (see "Typed query vectors") |
 
@@ -111,6 +112,37 @@ array (e.g. one for image embeddings, one for text).
   and set `"scalar": "bf16"` — a straight 2-byte store with no fp32 round-trip
   in the file, at half the file size. (An fp32 `.npy` plus `"scalar": "bf16"`
   also works; the values are truncated to bf16 at store time.)
+
+### Two-layer quantize + rerank (`rerank`)
+
+```json
+{ "name": "emb", "npy": "emb.npy", "iris": "emb.iris",
+  "metric": "cosine", "scalar": "i8", "rerank": "bf16", "hnsw": true }
+```
+
+With `rerank` set, the builder writes — from the **same** input matrix — two
+flat stores with identical row order:
+
+- `‹base›.vec.‹name›.data` — the coarse **scan** layer in `scalar` (here
+  `i8`, the existing quantization path, unchanged). This is what brute-force
+  candidate scans and the HNSW graph read.
+- `‹base›.vec.‹name›.rerank.data` — the fine **rerank** layer at the `rerank`
+  precision (`bf16`/`f16`/`f32`; never `i8` — it is the high-precision layer).
+
+Storage is the sum of the two layers (`i8` + `bf16` = 3 bytes per dimension —
+still 25 % less than a single `f32` store). Both layers carry the same metric;
+`i8` keeps its cosine-only restriction. The rerank precision is recorded in
+the `.meta` (`rerankScalar`); a `.meta` without the field is a normal
+single-layer index, so **existing indices load unchanged**.
+
+What each layer serves at query time:
+
+- **`vec:distance` (and every exact primitive) reads the fine layer** — it
+  stays the exact baseline, as if you had built a plain `bf16` index.
+- The **`SERVICE` top-k runs coarse-scan-then-rerank**: top-`rerankK`
+  candidates off the cheap `i8` bytes, then their distances are recomputed
+  exactly on the `bf16` layer and the top `k` by fine distance are returned
+  (see `usage-and-comparison.md`, use case 7).
 
 ### Embedding endpoint (`embeddingUrl` + `embeddingModel`)
 
@@ -162,14 +194,27 @@ to the index in the build spec:
   values. A malformed value is logged as a warning and ignored; it never
   prevents the server from starting.
 
-- The same variable also overrides the index's **RAM residency**: a `preload`
+- The same variable also configures the index's **RAM residency**: a `preload`
   field (`none` | `advise` | `lock` | `aligned`, e.g.
-  `{"metadata": {"preload": "lock"}}`) replaces the `preload` build option
-  persisted in the `.meta`, so an operator can pin a hot index in memory —
-  or prefault a cold one — **without rebuilding it**. Residency is applied
-  when the index is opened at server startup (unlike the endpoint fields, it
-  cannot change on a running server), and `"preload": "none"` cannot
-  downgrade a persisted stronger setting.
+  `{"metadata": {"preload": "lock"}}`) selects how eagerly the flat store is
+  made resident, so an operator can pin a hot index in memory — or prefault a
+  cold one — **without rebuilding it**. Residency is applied when the index is
+  opened at server startup (unlike the endpoint fields, it cannot change on a
+  running server); the default (and an explicit `"none"`) is a plain
+  demand-paged mmap.
+
+- On a **two-layer** index (`rerank`, see above) residency is **per layer**:
+  `preload` governs the coarse **scan** matrix, and a second field
+  **`preloadRerank`** (same value set, default `"none"` = plain mmap)
+  independently governs the fine **rerank** matrix. The headline setup pins
+  the small quantized layer and leaves the big high-precision layer paged:
+
+  ```json
+  {"emb": {"preload": "lock", "preloadRerank": "none"}}
+  ```
+
+  `preloadRerank` is ignored on a single-layer index. Like `preload` it is a
+  load-time serving setting; the `.meta` is never rewritten.
 
 ## 4. Serve and query
 

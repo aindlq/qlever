@@ -204,6 +204,7 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
                                         "dimensions",
                                         "metric",
                                         "scalar",
+                                        "rerank",
                                         "hnsw",
                                         "hnswConnectivity",
                                         "hnswExpansionAdd",
@@ -214,7 +215,7 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
     if (ql::ranges::find(knownKeys, key) == knownKeys.end()) {
       AD_THROW("Unknown key \"" + key +
                "\" in a vectorSearch build spec. Known keys: name, iris, npy, "
-               "dimensions, metric, scalar, hnsw, hnswConnectivity, "
+               "dimensions, metric, scalar, rerank, hnsw, hnswConnectivity, "
                "hnswExpansionAdd, hnswExpansionSearch, buildThreads, remap. "
                "(The query-time embedding endpoint/model and the RAM "
                "residency are serving concerns, set at server start via the "
@@ -237,6 +238,12 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
         vectorMetricFromString(obj.value("metric", std::string{"cosine"}));
     spec.config_.scalar_ =
         vectorScalarFromString(obj.value("scalar", std::string{"f32"}));
+    // Two-layer quantize+rerank: an optional second storage precision for the
+    // fine `.rerank.data` matrix. Empty (the default) = single-layer.
+    if (std::string rerank = obj.value("rerank", std::string{});
+        !rerank.empty()) {
+      spec.config_.rerankScalar_ = vectorScalarFromString(rerank);
+    }
     spec.config_.buildHnsw_ = obj.value("hnsw", true);
     spec.config_.hnswConnectivity_ =
         obj.value("hnswConnectivity", uint32_t{16});
@@ -257,6 +264,15 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
         "The `i8` scalar type normalizes each vector, so it only makes sense "
         "with `metric: cosine` (got `l2sq`/`innerProduct`). Use `f16` or "
         "`f32` for those metrics.");
+  }
+  // The rerank layer is the HIGH-precision layer that exact distances read;
+  // a quantized i8 rerank matrix would defeat its purpose (and i8 carries the
+  // cosine-only restriction on top).
+  if (spec.config_.rerankScalar_ == VectorScalar::I8) {
+    AD_THROW(
+        "The `rerank` precision must be one of `bf16`, `f16`, or `f32` (the "
+        "high-precision layer the rerank pass and `vec:distance` read); `i8` "
+        "belongs in the `scalar` scan layer.");
   }
   if (spec.config_.buildHnsw_ && spec.config_.hnswConnectivity_ < 2) {
     AD_THROW("`hnswConnectivity` must be at least 2.");
@@ -583,27 +599,39 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
     }
     const std::string name =
         fn.substr(prefix.size(), fn.size() - prefix.size() - suffix.size());
-    // A "preload" setting must be decided AT open time -- residency is applied
-    // when the index is opened -- unlike the embedding-endpoint fields below,
-    // which mutate the already-opened index. No setting (and an explicit
-    // "preload": "none") leaves the store mmap-only, the default. The entry is
-    // NOT erased here: the endpoint fields still apply below, and an entry for
-    // an index that fails to open must survive for the leftover warning at the
+    // A "preload"/"preloadRerank" setting must be decided AT open time --
+    // residency is applied when the index is opened -- unlike the
+    // embedding-endpoint fields below, which mutate the already-opened index.
+    // No setting (and an explicit "none") leaves the respective store
+    // mmap-only, the default. The two layers are independent: "preload"
+    // governs the coarse scan matrix, "preloadRerank" the fine rerank matrix
+    // of a two-layer index (a no-op on a single-layer one). The entry is NOT
+    // erased here: the endpoint fields still apply below, and an entry for an
+    // index that fails to open must survive for the leftover warning at the
     // end.
     VectorIndex::Residency residency = VectorIndex::Residency::None;
-    if (auto it = endpointOverrides.find(name);
-        it != endpointOverrides.end() && it->second.preload_.has_value()) {
-      const std::string& preload = it->second.preload_.value();
-      residency = VectorIndex::residencyFromString(preload);
-      if (residency != VectorIndex::Residency::None) {
-        AD_LOG_INFO << "Vector index '" << name << "': RAM residency set to '"
-                    << preload << "' at startup ("
-                    << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << ")" << std::endl;
-      }
+    VectorIndex::Residency rerankResidency = VectorIndex::Residency::None;
+    if (auto it = endpointOverrides.find(name); it != endpointOverrides.end()) {
+      auto residencyFor = [&](const std::optional<std::string>& preload,
+                              const char* what) {
+        if (!preload.has_value()) {
+          return VectorIndex::Residency::None;
+        }
+        auto r = VectorIndex::residencyFromString(preload.value());
+        if (r != VectorIndex::Residency::None) {
+          AD_LOG_INFO << "Vector index '" << name << "': " << what
+                      << " RAM residency set to '" << preload.value()
+                      << "' at startup (" << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                      << ")" << std::endl;
+        }
+        return r;
+      };
+      residency = residencyFor(it->second.preload_, "scan");
+      rerankResidency = residencyFor(it->second.preloadRerank_, "rerank");
     }
     VectorIndex idx;
     try {
-      idx.open(basename, name, residency);
+      idx.open(basename, name, residency, rerankResidency);
     } catch (const std::exception& e) {
       AD_LOG_WARN << "Skipping vector index '" << name << "': " << e.what()
                   << std::endl;
@@ -644,17 +672,21 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                   << "the HNSW graph)." << std::endl;
       continue;
     }
-    AD_LOG_INFO << "Loaded vector index '" << name << "' ("
-                << idx.numLiveVectors() << " vectors"
-                << (idx.numVectors() != idx.numLiveVectors()
-                        ? " + " +
-                              std::to_string(idx.numVectors() -
-                                             idx.numLiveVectors()) +
-                              " tombstones"
-                        : "")
-                << ", dim " << idx.dimensions()
-                << ", HNSW=" << (idx.hasHnsw() ? "yes" : "no") << ")"
-                << std::endl;
+    AD_LOG_INFO
+        << "Loaded vector index '" << name << "' (" << idx.numLiveVectors()
+        << " vectors"
+        << (idx.numVectors() != idx.numLiveVectors()
+                ? " + " +
+                      std::to_string(idx.numVectors() - idx.numLiveVectors()) +
+                      " tombstones"
+                : "")
+        << ", dim " << idx.dimensions() << ", scalar "
+        << toString(idx.metadata().config_.scalar_)
+        << (idx.hasRerankLayer()
+                ? " + rerank " +
+                      toString(idx.metadata().config_.rerankScalar_.value())
+                : "")
+        << ", HNSW=" << (idx.hasHnsw() ? "yes" : "no") << ")" << std::endl;
     // Apply the endpoint fields of the environment override BEFORE the
     // metadata fields are collected, so the `vec:model` metadata triple
     // reflects the effective model. (The "preload" field was already applied

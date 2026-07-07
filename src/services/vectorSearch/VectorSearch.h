@@ -16,8 +16,17 @@
 
 // A WHOLE-INDEX vector similarity search for a single query point (an explicit
 // vector, the vector of a constant entity, or an embedded text/image),
-// producing a `(?result[, ?score])` table of the k nearest entities of the
-// index (HNSW if available, else exact). This is the "search" surface.
+// producing a `(?result[, ?score][, ?coarseScore])` table of the k nearest
+// entities of the index (HNSW if available, else exact). This is the "search"
+// surface.
+//
+// On a TWO-LAYER index (built with `rerank`) the search runs coarse-scan-then-
+// rerank: the top-`rerankK` candidates come off the quantized scan matrix
+// (brute force or HNSW), their distances are then recomputed EXACTLY on the
+// fine rerank matrix, and the top `k` by fine distance are returned.
+// `vec:bindScore` binds the fine distance (== the exact `vec:distance` of the
+// entity); `vec:bindCoarseScore` optionally binds the coarse scan distance
+// alongside it, so `ABS(?d - ?dc)` exposes the quantization error.
 //
 // (The "for each ?x, find similar" form is `VectorSearchJoin`; ranking an
 // existing candidate set is the `vec:distance` function + `ORDER BY`/`LIMIT`.)

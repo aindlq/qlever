@@ -16,6 +16,7 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "services/vectorSearch/VectorQueryPoint.h"
+#include "util/HashMap.h"
 
 namespace {
 // Append a string to a cache key unambiguously (length-prefixed, so crafted
@@ -30,11 +31,19 @@ void appendToKey(std::string* key, std::string_view field,
 VectorSearch::VectorSearch(QueryExecutionContext* qec,
                            qlever::vector::VectorSearchConfiguration config)
     : Operation{qec}, config_{std::move(config)} {
+  // Column layout: `?result`, then the optional fine `?score`, then the
+  // optional coarse `?coarseScore` (each occupying the next column iff
+  // present).
+  size_t next = 0;
   variableColumns_[config_.resultVariable_] =
-      makeAlwaysDefinedColumn(ColumnIndex{0});
+      makeAlwaysDefinedColumn(ColumnIndex{next++});
   if (config_.scoreVariable_.has_value()) {
     variableColumns_[config_.scoreVariable_.value()] =
-        makeAlwaysDefinedColumn(ColumnIndex{1});
+        makeAlwaysDefinedColumn(ColumnIndex{next++});
+  }
+  if (config_.coarseScoreVariable_.has_value()) {
+    variableColumns_[config_.coarseScoreVariable_.value()] =
+        makeAlwaysDefinedColumn(ColumnIndex{next++});
   }
 }
 
@@ -46,7 +55,8 @@ std::string VectorSearch::getDescriptor() const {
 
 // ____________________________________________________________________________
 size_t VectorSearch::getResultWidth() const {
-  return config_.scoreVariable_.has_value() ? 2 : 1;
+  return 1 + static_cast<size_t>(config_.scoreVariable_.has_value()) +
+         static_cast<size_t>(config_.coarseScoreVariable_.has_value());
 }
 
 // ____________________________________________________________________________
@@ -82,10 +92,14 @@ VariableToColumnMap VectorSearch::computeVariableToColumnMap() const {
 
 // ____________________________________________________________________________
 std::string VectorSearch::getCacheKeyImpl() const {
-  std::string key = absl::StrCat("VECTOR_SEARCH index=", config_.indexName_,
-                                 " k=", config_.k_,
-                                 " algo=", static_cast<int>(config_.algorithm_),
-                                 " score=", config_.scoreVariable_.has_value());
+  std::string key = absl::StrCat(
+      "VECTOR_SEARCH index=", config_.indexName_, " k=", config_.k_,
+      " algo=", static_cast<int>(config_.algorithm_),
+      " score=", config_.scoreVariable_.has_value(),
+      " coarseScore=", config_.coarseScoreVariable_.has_value());
+  if (config_.rerankK_.has_value()) {
+    absl::StrAppend(&key, " rerankK=", config_.rerankK_.value());
+  }
   if (config_.maxDistance_.has_value()) {
     // Bit-exact so that two nearby values never share a key.
     absl::StrAppend(
@@ -163,7 +177,54 @@ Result VectorSearch::computeResult([[maybe_unused]] bool requestLaziness) {
   // decode/re-encode through f32).
   std::vector<qlever::vector::ScoredEntity> results;
   bool useHnsw = vidx->hasHnsw() && config_.algorithm_ != Algo::Exact;
-  if (queryEntity.has_value()) {
+  // The coarse (scan-layer) distance per result entity, kept iff
+  // `vec:bindCoarseScore` asked for it. On a single-layer index the two
+  // layers coincide, so the fine distance doubles as the coarse one and this
+  // map stays unused.
+  ad_utility::HashMap<Id, float> coarseDistances;
+  const bool withCoarseScore = config_.coarseScoreVariable_.has_value();
+
+  if (vidx->hasRerankLayer()) {
+    // TWO-LAYER coarse-scan-then-rerank: (1) the coarse pass searches the
+    // quantized scan matrix (brute force, or HNSW per `vec:algorithm` -- the
+    // graph reads the scan bytes) for the top-`rerankK` candidates;
+    // (2) the rerank pass recomputes their distances EXACTLY on the fine
+    // rerank matrix and keeps the top `k`. `maxDistance` filters on the FINE
+    // distance only -- the coarse pass must not drop near-boundary candidates
+    // by their quantized distance.
+    const size_t rerankK = std::max(
+        config_.rerankK_.value_or(std::max<size_t>(10 * config_.k_, 100)),
+        config_.k_);
+    std::vector<qlever::vector::ScoredEntity> coarse;
+    if (queryEntity.has_value()) {
+      coarse = useHnsw ? vidx->searchHnswByEntity(queryEntity.value(), rerankK,
+                                                  std::nullopt, checkInterrupt)
+                       : vidx->searchExactCoarseByEntity(
+                             queryEntity.value(), rerankK, std::nullopt,
+                             std::nullopt, checkInterrupt);
+    } else {
+      coarse = useHnsw ? vidx->searchHnsw(query, rerankK, std::nullopt,
+                                          checkInterrupt)
+                       : vidx->searchExactCoarse(query, rerankK, std::nullopt,
+                                                 std::nullopt, checkInterrupt);
+    }
+    std::vector<Id> candidates;
+    candidates.reserve(coarse.size());
+    for (const auto& hit : coarse) {
+      candidates.push_back(hit.entity_);
+      if (withCoarseScore) {
+        coarseDistances[hit.entity_] = hit.distance_;
+      }
+    }
+    // Fine pass: exact distances over exactly the coarse candidates (the
+    // restricted `searchExact` merge-joins them against the id-sorted store).
+    results = queryEntity.has_value()
+                  ? vidx->searchExactByEntity(queryEntity.value(), config_.k_,
+                                              candidates, config_.maxDistance_,
+                                              checkInterrupt)
+                  : vidx->searchExact(query, config_.k_, candidates,
+                                      config_.maxDistance_, checkInterrupt);
+  } else if (queryEntity.has_value()) {
     results =
         useHnsw ? vidx->searchHnswByEntity(queryEntity.value(), config_.k_,
                                            config_.maxDistance_, checkInterrupt)
@@ -179,10 +240,19 @@ Result VectorSearch::computeResult([[maybe_unused]] bool requestLaziness) {
 
   idTable.resize(results.size());
   bool withScore = config_.scoreVariable_.has_value();
+  const size_t coarseCol = withScore ? 2 : 1;
   for (size_t i = 0; i < results.size(); ++i) {
     idTable(i, 0) = results[i].entity_;
     if (withScore) {
       idTable(i, 1) = Id::makeFromDouble(results[i].distance_);
+    }
+    if (withCoarseScore) {
+      // Every fine result came out of the coarse candidate set, so the lookup
+      // always hits on a two-layer index; on a single-layer index coarse ==
+      // fine by definition.
+      auto it = coarseDistances.find(results[i].entity_);
+      idTable(i, coarseCol) = Id::makeFromDouble(
+          it != coarseDistances.end() ? it->second : results[i].distance_);
     }
   }
   return {std::move(idTable), resultSortedOn(), LocalVocab{}};

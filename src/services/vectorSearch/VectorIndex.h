@@ -57,6 +57,15 @@ using CheckInterruptCallback = std::function<void()>;
 // (usearch's `metric_punned_t`), so their distances are directly comparable.
 // Tombstoned rows (entities that disappeared from the knowledge graph after a
 // remap) are skipped by all searches.
+//
+// TWO-LAYER indices (`hasRerankLayer()`): the index holds a coarse SCAN
+// matrix (`.data`, e.g. i8 -- what the HNSW graph and the explicitly-named
+// `...Coarse` scans read) plus a fine RERANK matrix (`.rerank.data`, e.g.
+// bf16). All the exact primitives below -- `searchExact*`, the
+// `DistanceComputer`, the `distance` overloads, `getVector` -- read the FINE
+// layer, so `vec:distance` stays the exact baseline; only `searchHnsw*` and
+// `searchExactCoarse*` (the SERVICE's coarse candidate pass) read the scan
+// layer. On a single-layer index the two coincide.
 class VectorIndex {
  public:
   // How eagerly to make the flat `.data` store resident in RAM. The default
@@ -89,25 +98,34 @@ class VectorIndex {
 
   // Open `<basename>.vec.<name>.*` read-only (everything is mmaped).
   // Throws if the files are missing or inconsistent. `residency` optionally
-  // preloads/pins the flat store (see `Residency`); it is applied after a
-  // successful open and never affects correctness.
+  // preloads/pins the flat SCAN store (see `Residency`); `rerankResidency`
+  // does the same, INDEPENDENTLY, for the fine rerank store of a two-layer
+  // index (ignored when there is none) -- so an operator can e.g. mlock the
+  // small i8 scan matrix and leave the bf16 rerank matrix demand-paged. Both
+  // are applied after a successful open and never affect correctness.
   void open(const std::string& basename, const std::string& name,
-            Residency residency = Residency::None);
+            Residency residency = Residency::None,
+            Residency rerankResidency = Residency::None);
 
   // Apply (or re-apply) a RAM-residency strategy to the already-opened flat
-  // store. Idempotent and best-effort: gated on the store fitting in physical
-  // memory (skipped with a warning otherwise) so it can never drive the
-  // machine into OOM. Never changes search results.
+  // SCAN store. Idempotent and best-effort: gated on the store fitting in
+  // physical memory (skipped with a warning otherwise) so it can never drive
+  // the machine into OOM. Never changes search results. (The rerank layer's
+  // residency is load-time only: the `rerankResidency` argument of `open`.)
   void makeResident(Residency residency);
 
   // The RAM-residency strategy most recently applied (best-effort) to the
-  // flat store: the `open(..., residency)` argument (the "preload" serving
-  // setting). `None` if nothing was requested, the store is empty, or the
-  // fits-in-RAM gate skipped the request; degradation WITHIN a level (mlock
-  // denied, aligned-copy allocation failure) still reports the requested
-  // level, matching the warnings `makeResident` logs. Observational only
-  // (logging and tests).
+  // flat SCAN store: the `open(..., residency)` argument (the "preload"
+  // serving setting). `None` if nothing was requested, the store is empty, or
+  // the fits-in-RAM gate skipped the request; degradation WITHIN a level
+  // (mlock denied, aligned-copy allocation failure) still reports the
+  // requested level, matching the warnings `makeResident` logs. Observational
+  // only (logging and tests).
   Residency residency() const;
+
+  // The residency most recently applied to the fine RERANK store (the
+  // "preloadRerank" serving setting). Always `None` on a single-layer index.
+  Residency rerankResidency() const;
 
   // Map a `preload` configuration string ("advise", "lock", "aligned") to the
   // corresponding `Residency`; anything else (including "none") maps to
@@ -134,6 +152,9 @@ class VectorIndex {
   size_t numLiveVectors() const;
   VectorMetric metric() const;
   bool hasHnsw() const;
+  // True iff this is a two-layer index (a fine `.rerank.data` matrix exists
+  // next to the coarse scan `.data`; see the class comment).
+  bool hasRerankLayer() const;
 
   // True iff this index stores a (live) vector for `entity`.
   bool hasVector(Id entity) const;
@@ -150,15 +171,19 @@ class VectorIndex {
   // let the planner merge-join it -- no vectors are materialised.
   void memberEntities(ql::span<Id> out) const;
 
-  // The stored vector of `entity` decoded to f32, or `nullopt` if this index
-  // has none for it. (The store may hold f16/i8; searching BY an entity does
-  // not decode -- see the `...ByEntity` methods.)
+  // The stored vector of `entity` decoded to f32 (from the FINE layer of a
+  // two-layer index), or `nullopt` if this index has none for it. (The store
+  // may hold f16/i8; searching BY an entity does not decode -- see the
+  // `...ByEntity` methods.)
   std::optional<std::vector<float>> getVector(Id entity) const;
 
-  // Exact brute-force top-`k` nearest neighbours of `query`.
+  // Exact brute-force top-`k` nearest neighbours of `query`, scored on the
+  // FINE layer (the rerank matrix when present, else the single store) -- the
+  // exact baseline that `vec:distance` and the SERVICE's rerank pass share.
   //  - If `candidates` is `nullopt`, searches over ALL (live) entities.
   //  - Otherwise searches only the given candidate entities (the optimisation
-  //    used when a join's search side is already small). Candidates without a
+  //    used when a join's search side is already small, and the SERVICE's
+  //    rerank pass over the coarse top-`rerankK`). Candidates without a
   //    vector in this index are skipped; an EMPTY candidate list yields an
   //    empty result (it does NOT fall back to the whole index).
   // Results are ascending by distance; at most `k` entries. `maxDistance`, if
@@ -169,20 +194,37 @@ class VectorIndex {
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
 
+  // The same exact brute-force search on the COARSE scan matrix (identical to
+  // `searchExact` on a single-layer index). This is the SERVICE's coarse
+  // candidate pass of a two-layer index: cheap quantized bytes, results to be
+  // re-scored on the fine layer.
+  std::vector<ScoredEntity> searchExactCoarse(
+      ql::span<const float> query, size_t k,
+      std::optional<ql::span<const Id>> candidates = std::nullopt,
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {}) const;
+
   // Approximate top-`k` via the HNSW graph over the whole index. Requires
   // `hasHnsw()`. Results are ascending by distance. `k` is clamped to the
   // number of live vectors. `checkInterrupt`, if set, is polled while waiting
-  // for a search slot so the search can be cancelled under load.
+  // for a search slot so the search can be cancelled under load. NOTE: the
+  // graph reads the COARSE scan matrix, so on a two-layer index the returned
+  // distances are coarse-space (the SERVICE reranks them on the fine layer).
   std::vector<ScoredEntity> searchHnsw(
       ql::span<const float> query, size_t k,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
 
-  // The same two searches with a STORED entity's vector as the query point
-  // (used by the join form and `vec:query <iri>`). The stored bytes are used
-  // directly -- no decode/re-encode round trip through f32. An entity without
-  // a (live) vector yields an empty result.
+  // The same searches with a STORED entity's vector as the query point (used
+  // by the join form and `vec:query <iri>`). The stored bytes of the layer
+  // being searched are used directly -- no decode/re-encode round trip
+  // through f32. An entity without a (live) vector yields an empty result.
   std::vector<ScoredEntity> searchExactByEntity(
+      Id entity, size_t k,
+      std::optional<ql::span<const Id>> candidates = std::nullopt,
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {}) const;
+  std::vector<ScoredEntity> searchExactCoarseByEntity(
       Id entity, size_t k,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
@@ -192,14 +234,16 @@ class VectorIndex {
       const CheckInterruptCallback& checkInterrupt = {}) const;
 
   // A reusable per-query distance functor. It encodes the query point ONCE
-  // (into the index's storage scalar) and owns those bytes, then computes the
-  // metric distance from that point to any entity's stored vector via a single
-  // `.rowmap` lookup + one SIMD kernel call. `operator()` returns `NaN` for an
-  // entity that has no live vector in this index. This is the primitive behind
-  // the `vec:distance` SPARQL expression: BIND it over a bound `?entity`, then
-  // ORDER BY + LIMIT to get a filtered top-k search using QLever's own
-  // machinery. Cheap to copy; only valid while the `VectorIndex` it was made
-  // from is alive (it borrows the index's metric/mapping).
+  // (into the FINE layer's storage scalar -- the rerank matrix when present,
+  // so `vec:distance` is always the exact baseline) and owns those bytes,
+  // then computes the metric distance from that point to any entity's stored
+  // vector via a single `.rowmap` lookup + one SIMD kernel call. `operator()`
+  // returns `NaN` for an entity that has no live vector in this index. This
+  // is the primitive behind the `vec:distance` SPARQL expression: BIND it
+  // over a bound `?entity`, then ORDER BY + LIMIT to get a filtered top-k
+  // search using QLever's own machinery. Cheap to copy; only valid while the
+  // `VectorIndex` it was made from is alive (it borrows the index's
+  // metric/mapping).
   class DistanceComputer {
    public:
     // The distance from the query point to `entity`'s stored vector, or `NaN`

@@ -601,12 +601,26 @@ ExpressionResult VectorDistanceExpression::evaluate(
                                            std::nullopt, checkInterrupt)
                  : vidx.searchHnsw(std::get<std::vector<float>>(q), hnswK_,
                                    std::nullopt, checkInterrupt);
+    // On a TWO-LAYER index the graph's distances live in the coarse scan
+    // space; rerank the ~k' hits on the fine layer so `vec:distance` binds
+    // fine-layer distances on EVERY path (~k' extra SIMD calls, negligible).
+    std::optional<VectorIndex::DistanceComputer> fineComputer;
+    if (vidx.hasRerankLayer()) {
+      fineComputer = isEntity
+                         ? vidx.makeDistanceComputerByEntity(std::get<Id>(q))
+                         : std::optional{vidx.makeDistanceComputer(
+                               std::get<std::vector<float>>(q))};
+      // `buildHnswMemo` is only reached for a query point WITH a vector.
+      AD_CORRECTNESS_CHECK(fineComputer.has_value());
+    }
     ad_utility::HashMap<Id, Id> map;
     map.reserve(hits.size());
     for (const auto& hit : hits) {
       // Reuse `distanceToValueId` so the HNSW distances land on the EXACT same
       // scale as the brute-force path's.
-      map.emplace(hit.entity_, toDistanceId(hit.distance_));
+      map.emplace(hit.entity_, toDistanceId(fineComputer.has_value()
+                                                ? (*fineComputer)(hit.entity_)
+                                                : hit.distance_));
     }
     hnswMemo_ = std::move(map);
     hnswMemoKey_ = std::move(key);
@@ -742,7 +756,10 @@ ExpressionResult VectorDistanceExpression::evaluate(
         distanceTimer.value());
     ++distanceBlocks_;
     loggedDim_ = vidx.dimensions();
-    loggedScalar_ = qlever::vector::toString(vidx.metadata().config_.scalar_);
+    // The distances are computed on the FINE layer, so log ITS scalar.
+    const auto& cfg = vidx.metadata().config_;
+    loggedScalar_ =
+        qlever::vector::toString(cfg.rerankScalar_.value_or(cfg.scalar_));
   }
   return result;
 }

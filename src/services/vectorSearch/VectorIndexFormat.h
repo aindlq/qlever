@@ -9,6 +9,7 @@
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEXFORMAT_H
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -24,6 +25,15 @@
 //                   (f32/f16/i8), stride = `dimensions` scalars. IMMUTABLE
 //                   after the build: row indices are the permanent identity of
 //                   the vectors.
+//   B.vec.N.rerank.data
+//                   OPTIONAL second flat matrix (only with the two-layer
+//                   quantize+rerank build, `rerankScalar_`): the SAME rows in
+//                   the SAME order as `.data`, but stored at the (higher)
+//                   rerank precision (bf16/f16/f32). `.data` is then the
+//                   coarse SCAN layer (e.g. i8) that brute-force scans and the
+//                   HNSW graph read; this file is the fine RERANK layer that
+//                   `vec:distance` and the SERVICE's rerank pass read.
+//                   IMMUTABLE after the build, natural (unpadded) row stride.
 //   B.vec.N.iris    one IRI per line, aligned with the rows. IMMUTABLE. Kept so
 //                   that the entity mapping can be recomputed cheaply after the
 //                   knowledge graph is re-indexed (see "remapping" below).
@@ -58,7 +68,10 @@ namespace qlever::vector {
 //     is otherwise identical to v4. (Historically v5 also allowed opt-in
 //     64-byte row padding; that build option was removed and the stride is now
 //     always the natural length.) Version 4 indices still load unchanged
-//     (their stride is derived).
+//     (their stride is derived). A v5 index may ADDITIONALLY carry the
+//     optional two-layer rerank matrix (`rerankScalar_` + `.rerank.data`);
+//     a `.meta` without the field is a plain single-layer index, so old
+//     indices load unchanged and no version bump is needed.
 inline constexpr uint32_t VECTOR_INDEX_VERSION = 5;
 
 // The set of on-disk versions this binary can still read. A v4 index (no
@@ -195,6 +208,14 @@ struct VectorIndexConfig {
   uint32_t dimensions_ = 0;
   VectorMetric metric_ = VectorMetric::Cosine;
   VectorScalar scalar_ = VectorScalar::F32;
+  // Two-layer quantize+rerank build: when set, the builder writes -- from the
+  // SAME f32 input -- BOTH the coarse scan matrix `.data` (in `scalar_`, e.g.
+  // i8) AND a second fine matrix `.rerank.data` at this precision (bf16, f16,
+  // or f32; NEVER i8 -- the rerank layer is the high-precision one). The fine
+  // layer carries the same metric. `nullopt` (the default) = single-layer,
+  // exactly as before. Storage cost = scan bytes + rerank bytes (e.g.
+  // i8 + bf16 = 3 bytes per dimension).
+  std::optional<VectorScalar> rerankScalar_;
   bool buildHnsw_ = true;
   // HNSW (usearch) build parameters.
   uint32_t hnswConnectivity_ = 16;     // a.k.a. M
@@ -288,6 +309,10 @@ inline std::string vectorDataFile(const std::string& base,
                                   const std::string& name) {
   return base + ".vec." + name + ".data";
 }
+inline std::string vectorRerankDataFile(const std::string& base,
+                                        const std::string& name) {
+  return base + ".vec." + name + ".rerank.data";
+}
 inline std::string vectorIrisFile(const std::string& base,
                                   const std::string& name) {
   return base + ".vec." + name + ".iris";
@@ -314,6 +339,11 @@ inline void to_json(nlohmann::json& j, const VectorIndexMetadata& m) {
                      {"vocabSize", m.vocabSize_},
                      {"rowStrideBytes", m.rowStrideBytes_},
                      {"collationLocale", m.collationLocale_}};
+  // The two-layer rerank precision is only written when present, so a
+  // single-layer `.meta` stays byte-compatible with older builds.
+  if (m.config_.rerankScalar_.has_value()) {
+    j["rerankScalar"] = toString(m.config_.rerankScalar_.value());
+  }
   // NOTE: `embeddingUrl`/`embeddingModel`/`preload` are deliberately NOT
   // persisted -- they are serving concerns set at server start from the
   // `QLEVER_VECTOR_SEARCH_ENDPOINTS` environment variable (see
@@ -326,6 +356,13 @@ inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
   j.at("dimensions").get_to(m.config_.dimensions_);
   m.config_.metric_ = vectorMetricFromString(j.at("metric").get<std::string>());
   m.config_.scalar_ = vectorScalarFromString(j.at("scalar").get<std::string>());
+  // Absent (the back-compat default) = single-layer, exactly the old format.
+  if (std::string rerank = j.value("rerankScalar", std::string{});
+      !rerank.empty()) {
+    m.config_.rerankScalar_ = vectorScalarFromString(rerank);
+  } else {
+    m.config_.rerankScalar_ = std::nullopt;
+  }
   j.at("numVectors").get_to(m.numVectors_);
   m.numTombstones_ = j.value("numTombstones", uint64_t{0});
   j.at("hasHnsw").get_to(m.hasHnsw_);

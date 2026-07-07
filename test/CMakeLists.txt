@@ -230,6 +230,11 @@ if (QLEVER_WITH_VECTOR_SEARCH)
     # The pure NumKong capability-bitmask -> ISA-name mapping behind the
     # one-time "Vector search SIMD" startup log.
     addLinkAndDiscoverTest(VectorSearchSimdInfoTest engine service_vectorSearch)
+
+    # The two-layer quantize+rerank store: `rerank` build key, per-layer
+    # residency, the fine-layer `vec:distance` baseline, and the SERVICE's
+    # coarse-scan-then-rerank pass (`vec:rerankK`/`vec:bindCoarseScore`).
+    addLinkAndDiscoverTest(VectorRerankTest engine service_vectorSearch)
 endif ()
 
 # BufferedVectorTest also uses conflicting filenames.

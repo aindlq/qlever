@@ -66,12 +66,25 @@ struct VectorSearchQuery : MagicServiceQuery {
   std::optional<std::string> queryEntityIri_;
   std::optional<std::string> queryText_;  // free text -> embedded at query time
   std::optional<qlever::vector::VectorSearchConfiguration::ImageQuery>
-      queryImage_;                   // image -> embedded at query time
-  std::optional<Variable> leftVar_;  // binary "for each ?x" form: query entity
-                                     // bound by the surrounding query
+      queryImage_;  // image -> embedded at query time
+  // The candidate/query entities, bound by the surrounding query (the join
+  // form). Parsed from `vec:candidates` (canonical) or `vec:left` (the
+  // original name, kept as a working alias). Intended semantics: bound by the
+  // surrounding query -> search that subset per row; unbound or omitted ->
+  // the whole index (the produce form below). TODO: `vec:candidates ?in`
+  // that is PRESENT but UNBOUND anywhere in the query currently errors at
+  // execution time instead of falling back to the whole index, and
+  // `?in == ?out` (annotate the candidates in place) is currently rejected;
+  // both need planner support.
+  std::optional<Variable> leftVar_;
   std::optional<Variable> resultVar_;
   std::optional<Variable> scoreVar_;
+  // The coarse scan-layer distance (`vec:bindCoarseScore`), for comparison
+  // with the fine `vec:bindScore` on a two-layer index.
+  std::optional<Variable> coarseScoreVar_;
   std::optional<size_t> k_;
+  // Coarse candidate count of the two-layer rerank pass (`vec:rerankK`).
+  std::optional<size_t> rerankK_;
   std::optional<float> maxDistance_;
   qlever::vector::VectorSearchConfiguration::Algorithm algo_ =
       qlever::vector::VectorSearchConfiguration::Algorithm::Automatic;

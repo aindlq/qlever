@@ -50,11 +50,23 @@ struct VectorSearchConfiguration {
   // The variable bound to each result entity.
   Variable resultVariable_{"?_qlever_internal_vec_result"};
 
-  // Optional variable bound to the similarity distance of each result.
+  // Optional variable bound to the similarity distance of each result (the
+  // FINE, reranked distance on a two-layer index).
   std::optional<Variable> scoreVariable_;
+
+  // Optional variable bound to the COARSE (scan-layer, e.g. i8) distance of
+  // each result, for comparison against the fine `scoreVariable_` (e.g.
+  // `ABS(?d - ?dc)` = the quantization error). On a single-layer index the
+  // two layers coincide, so it binds the same distance as `scoreVariable_`.
+  std::optional<Variable> coarseScoreVariable_;
 
   // Number of nearest neighbours to return.
   size_t k_ = 10;
+
+  // Two-layer indices only: how many candidates the coarse scan pass keeps
+  // for the fine rerank pass (`vec:rerankK`). Unset = `max(10 * k, 100)`.
+  // Ignored on a single-layer index.
+  std::optional<size_t> rerankK_;
 
   // Optional upper bound on the distance of returned neighbours.
   std::optional<float> maxDistance_;

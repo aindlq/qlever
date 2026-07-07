@@ -123,6 +123,29 @@ VectorIndexBuilder::VectorIndexBuilder(std::string basename,
     AD_THROW("Could not create temporary build files for vector index \"" +
              config_.name_ + "\" next to " + basename_);
   }
+  // The optional fine rerank layer: a second, independently encoded spill of
+  // the SAME input rows (validated i8-free upstream in `parseSpec`; checked
+  // again here so direct builder users cannot request an i8 rerank layer).
+  if (config_.rerankScalar_.has_value()) {
+    if (config_.rerankScalar_.value() == VectorScalar::I8) {
+      AD_THROW("The rerank layer of vector index \"" + config_.name_ +
+               "\" must be a high-precision scalar (bf16, f16, or f32), not "
+               "i8.");
+    }
+    rerankRowBytes_ =
+        config_.dimensions_ * bytesPerScalar(config_.rerankScalar_.value());
+    rerankFromF32_ =
+        uu::casts_punned_t::make(toUsearchScalar(config_.rerankScalar_.value()))
+            .from.f32;
+    rerankCastBuffer_.resize(rerankRowBytes_);
+    rerankSpillPath_ =
+        vectorRerankDataFile(basename_, config_.name_) + ".spill";
+    rerankSpill_.open(rerankSpillPath_, std::ios::binary | std::ios::trunc);
+    if (!rerankSpill_.is_open()) {
+      AD_THROW("Could not create temporary build files for vector index \"" +
+               config_.name_ + "\" next to " + basename_);
+    }
+  }
 }
 
 // ____________________________________________________________________________
@@ -133,6 +156,9 @@ VectorIndexBuilder::~VectorIndexBuilder() {
   std::error_code ec;
   std::filesystem::remove(vecSpillPath_, ec);
   std::filesystem::remove(iriSpillPath_, ec);
+  if (!rerankSpillPath_.empty()) {
+    std::filesystem::remove(rerankSpillPath_, ec);
+  }
 }
 
 // ____________________________________________________________________________
@@ -151,6 +177,22 @@ void VectorIndexBuilder::add(Id entity, std::string_view iri,
     rowBytesPtr = castBuffer_.data();
   }
   vecSpill_.write(rowBytesPtr, static_cast<std::streamsize>(rowBytes_));
+  // Two-layer build: also spill the SAME f32 row at the rerank precision (both
+  // layers are encoded from the original input, never from each other).
+  if (config_.rerankScalar_.has_value()) {
+    const char* rerankPtr = reinterpret_cast<const char*>(vector.data());
+    if (rerankFromF32_ != nullptr &&
+        rerankFromF32_(rerankPtr, config_.dimensions_,
+                       rerankCastBuffer_.data())) {
+      rerankPtr = rerankCastBuffer_.data();
+    }
+    rerankSpill_.write(rerankPtr,
+                       static_cast<std::streamsize>(rerankRowBytes_));
+    if (!rerankSpill_) {
+      AD_THROW("Writing to the temporary build files of vector index \"" +
+               config_.name_ + "\" failed (disk full?).");
+    }
+  }
   iriSpill_.write(iri.data(), static_cast<std::streamsize>(iri.size()));
   iriSpill_.put('\n');
   if (!vecSpill_ || !iriSpill_) {
@@ -165,12 +207,17 @@ void VectorIndexBuilder::add(Id entity, std::string_view iri,
 
 // ____________________________________________________________________________
 VectorIndexMetadata VectorIndexBuilder::build() {
+  const bool twoLayer = config_.rerankScalar_.has_value();
   vecSpill_.close();
   iriSpill_.close();
+  if (twoLayer) {
+    rerankSpill_.close();
+  }
   // A failed flush at close (e.g. disk full) would leave a truncated spill;
   // the gather below reads by absolute offset and (because `File::read` loops
   // to EOF) would otherwise hang instead of erroring. Verify the spill sizes.
-  if (vecSpill_.fail() || iriSpill_.fail()) {
+  if (vecSpill_.fail() || iriSpill_.fail() ||
+      (twoLayer && rerankSpill_.fail())) {
     AD_THROW("Writing the temporary build files of vector index \"" +
              config_.name_ + "\" failed (disk full?).");
   }
@@ -186,12 +233,22 @@ VectorIndexMetadata VectorIndexBuilder::build() {
       AD_THROW("The temporary IRI file of vector index \"" + config_.name_ +
                "\" is incomplete (disk full?).");
     }
+    if (twoLayer) {
+      auto rerankSize = std::filesystem::file_size(rerankSpillPath_, ec);
+      if (ec || rerankSize != ids_.size() * rerankRowBytes_) {
+        AD_THROW("The temporary rerank file of vector index \"" +
+                 config_.name_ + "\" is incomplete (disk full?).");
+      }
+    }
   }
   // The spill files are always removed -- also on success (`dismiss` is only
   // called for the `.tmp` outputs tracked by `outputsCleanup` below).
   FileCleanup spillCleanup;
   spillCleanup.track(vecSpillPath_);
   spillCleanup.track(iriSpillPath_);
+  if (twoLayer) {
+    spillCleanup.track(rerankSpillPath_);
+  }
   FileCleanup outputsCleanup;
 
   // 1. Sort by entity id so the reader can binary-search. We sort an index
@@ -245,32 +302,44 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   const std::string keysPath = vectorKeysFile(basename_, config_.name_);
   const std::string rowmapPath = vectorRowmapFile(basename_, config_.name_);
   const std::string dataPath = vectorDataFile(basename_, config_.name_);
+  const std::string rerankPath = vectorRerankDataFile(basename_, config_.name_);
   const std::string irisPath = vectorIrisFile(basename_, config_.name_);
   const std::string hnswPath = vectorHnswFile(basename_, config_.name_);
   const std::string metaPath = vectorMetaFile(basename_, config_.name_);
   auto tmp = [](const std::string& path) { return path + ".tmp"; };
 
-  // 3. Gather the flat store from the spill file in sorted order (parallel
-  //    positional reads directly into the memory-mapped destination).
-  {
-    outputsCleanup.track(tmp(dataPath));
+  // Gather one flat matrix from its spill file in sorted `rows` order
+  // (parallel positional reads directly into the memory-mapped destination).
+  // Used for the scan `.data` and -- with the rerank row length -- the
+  // optional fine `.rerank.data`; both use the natural (unpadded) row stride.
+  auto gatherMatrix = [&](const std::string& outPath,
+                          const std::string& spillPath, size_t layerRowBytes) {
+    outputsCleanup.track(tmp(outPath));
     ad_utility::MmapVector<char> data;
-    data.open(n * stride, tmp(dataPath));
-    ad_utility::File spill{vecSpillPath_.c_str(), "r"};
+    data.open(n * layerRowBytes, tmp(outPath));
+    ad_utility::File spill{spillPath.c_str(), "r"};
     char* dataBegin = n > 0 ? &data[0] : nullptr;
     parallelOverRows(
         n, numThreads, [&](size_t, size_t first, size_t last, auto& stop) {
           for (size_t i = first; i < last; ++i) {
             if (stop.load(std::memory_order_relaxed)) return;
-            ssize_t read = spill.read(dataBegin + i * stride, rowBytes_,
-                                      static_cast<off_t>(rows[i] * rowBytes_));
-            if (read != static_cast<ssize_t>(rowBytes_)) {
+            ssize_t read =
+                spill.read(dataBegin + i * layerRowBytes, layerRowBytes,
+                           static_cast<off_t>(rows[i] * layerRowBytes));
+            if (read != static_cast<ssize_t>(layerRowBytes)) {
               throw std::runtime_error{
                   "Reading back the temporary vector file failed."};
             }
           }
         });
     // Destructor flushes and writes the trailer.
+  };
+
+  // 3. Gather the flat scan store (and, for a two-layer build, the fine
+  //    rerank store: the SAME rows in the SAME order at the rerank precision).
+  gatherMatrix(dataPath, vecSpillPath_, rowBytes_);
+  if (twoLayer) {
+    gatherMatrix(rerankPath, rerankSpillPath_, rerankRowBytes_);
   }
 
   // 4. Write the entity mapping: `.keys` (row -> id, ascending by
@@ -310,13 +379,17 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     }
   }
 
-  // The spill files are no longer needed (the flat store and the `.iris` file
-  // have been written). Remove them NOW, before the multi-hour HNSW build, so
-  // the transient disk footprint is ~1x the vector matrix rather than ~2x.
+  // The spill files are no longer needed (the flat store(s) and the `.iris`
+  // file have been written). Remove them NOW, before the multi-hour HNSW
+  // build, so the transient disk footprint is ~1x the vector matrix rather
+  // than ~2x.
   {
     std::error_code ec;
     std::filesystem::remove(vecSpillPath_, ec);
     std::filesystem::remove(iriSpillPath_, ec);
+    if (twoLayer) {
+      std::filesystem::remove(rerankSpillPath_, ec);
+    }
   }
 
   // 6. Optionally build and save the HNSW graph, keyed by ROW INDEX, with the
@@ -415,8 +488,15 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   }
 
   // 8. Rename everything into place (metadata last, see above). A stale
-  //    `.hnsw` file from a previous build is removed if this build has none.
+  //    `.hnsw`/`.rerank.data` file from a previous build is removed if this
+  //    build has none.
   std::filesystem::rename(tmp(dataPath), dataPath);
+  if (twoLayer) {
+    std::filesystem::rename(tmp(rerankPath), rerankPath);
+  } else {
+    std::error_code ec;
+    std::filesystem::remove(rerankPath, ec);
+  }
   std::filesystem::rename(tmp(keysPath), keysPath);
   std::filesystem::rename(tmp(rowmapPath), rowmapPath);
   std::filesystem::rename(tmp(irisPath), irisPath);

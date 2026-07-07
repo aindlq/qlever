@@ -71,8 +71,9 @@ void registerVectorSearchService() {
           throw std::runtime_error{
               "The vector-search SERVICE does not take a nested `{ ... }` "
               "pattern. Bind the query entity in the surrounding query "
-              "(`vec:left ?x`), or rank an existing candidate set with the "
-              "`vec:distance` function + `ORDER BY` + `LIMIT`."};
+              "(`vec:candidates ?x`, alias `vec:left`), or rank an existing "
+              "candidate set with the `vec:distance` function + `ORDER BY` + "
+              "`LIMIT`."};
         }
         if (config.leftVariable_.has_value()) {
           // "for each ?x bound by the SURROUNDING query, find the k nearest":
