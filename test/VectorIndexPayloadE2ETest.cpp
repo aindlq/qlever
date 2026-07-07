@@ -492,7 +492,12 @@ QueryExecutionContext* qecWithLargeIndex() {
 // <HnswItem>` (a whole-index scan -> input rows == numLiveVectors, the guard's
 // size condition), and the four `<h2>..<h5>` additionally carry `<flag>
 // <keep>` so a query that starts from `<flag>` is a strict SUBSET (input rows <
-// numLiveVectors), which must DECLINE HNSW and fall back to exact.
+// numLiveVectors), which must DECLINE HNSW and fall back to exact. All six
+// members plus the two NON-indexed `<x0>` and `<x1>` are `<is-a> <SuperItem>`,
+// so a query that starts from `<SuperItem>` is a strict SUPERSET of the index
+// (input rows > numLiveVectors, the input COVERS the index), which must still
+// ENGAGE HNSW -- the real-world "all works of a type, some without a vector"
+// shape.
 //
 // With the cosine metric and query [1,0,0]: `<h0>`=[1,0,0] (distance 0), then
 // `<h1>`=[0.9,0.1,0] (~0.006), then `<h5>`=[0.1,0,0.9] (~0.89), then the
@@ -503,7 +508,11 @@ constexpr std::string_view KG_HNSW =
     "<h2> <is-a> <HnswItem> . <h3> <is-a> <HnswItem> . "
     "<h4> <is-a> <HnswItem> . <h5> <is-a> <HnswItem> . "
     "<h2> <flag> <keep> . <h3> <flag> <keep> . "
-    "<h4> <flag> <keep> . <h5> <flag> <keep> .";
+    "<h4> <flag> <keep> . <h5> <flag> <keep> . "
+    "<h0> <is-a> <SuperItem> . <h1> <is-a> <SuperItem> . "
+    "<h2> <is-a> <SuperItem> . <h3> <is-a> <SuperItem> . "
+    "<h4> <is-a> <SuperItem> . <h5> <is-a> <SuperItem> . "
+    "<x0> <is-a> <SuperItem> . <x1> <is-a> <SuperItem> .";
 
 const std::vector<std::pair<std::string, std::vector<float>>>&
 hnswTestVectors() {
@@ -1283,8 +1292,9 @@ TEST(VectorIndexPayloadE2E, parallelPerRowScanMatchesSerialReference) {
 
 // _____________________________________________________________________________
 // The opt-in HNSW fast path, GUARD PASSES: a whole-index scan (all six members
-// enumerated -> input rows == numLiveVectors) with a constant query and k'=3
-// takes the approximate top-k' path. Only the ~k' nearest entities get a bound
+// enumerated -> input rows == numLiveVectors, the boundary case of the
+// input-covers-the-index `>=` guard) with a constant query and k'=3 takes the
+// approximate top-k' path. Only the ~k' nearest entities get a bound
 // distance (every other row is UNDEF), the bound set equals `searchHnsw(Q,k')`
 // with matching distances, and -- recall is exact for this clean fixture -- the
 // `FILTER(BOUND) ORDER BY ?d LIMIT n` ranking matches the EXACT top-n.
@@ -1353,6 +1363,134 @@ TEST(VectorIndexPayloadE2E, hnswFastPathBindsOnlyTopKForWholeIndex) {
   const IdTable& topTable = topResult->idTable();
   // The LIMIT is applied lazily during export, so the ordered table still holds
   // all ~k' bound rows; the RANKING (first two) is what must match the exact
+  // top-2.
+  ASSERT_GE(topTable.numRows(), 2u);
+  EXPECT_EQ(topTable(0, teCol).getBits(), exact[0].entity_.getBits());
+  EXPECT_EQ(topTable(1, teCol).getBits(), exact[1].entity_.getBits());
+}
+
+// _____________________________________________________________________________
+// The opt-in HNSW fast path, GUARD PASSES on a SUPERSET: the SINGLE triple
+// pattern `?e <is-a> <SuperItem>` binds `?e` to all six index members PLUS the
+// two non-indexed `<x0>`/`<x1>` (8 input rows > 6 = numLiveVectors) -- the
+// input COVERS the index without being exactly it, the real-world "all works
+// of a type, some without a vector" query. The guard must ENGAGE HNSW: only
+// the ~k' nearest INDEX entities get a bound distance, everything else
+// (including the non-indexed extras) stays UNDEF, and `FILTER(BOUND) ORDER BY
+// ?d LIMIT n` matches the exact top-n. The first run requests a LAZY result,
+// so the single-`IndexScan` subtree feeds `Bind` chunk by chunk without a
+// known total row count -- engaging HNSW there also proves the subtree-size
+// hint `Bind` passes for the whole-input guard (with a hint of 0 or an
+// `==`-on-total guard this query would silently fall back to brute force).
+TEST(VectorIndexPayloadE2E, hnswFastPathEngagesOnSupersetSingleScan) {
+  auto* qec = qecWithHnswIndex();
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "embhnsw");
+  ASSERT_TRUE(vidx);
+  ASSERT_TRUE(vidx->hasHnsw());
+  ASSERT_EQ(vidx->numLiveVectors(), 6u);
+  auto getId = makeGetId(qec->getIndex());
+
+  constexpr size_t K = 3;
+  // Collect all (?e, ?d) rows of the superset query for query vector `q`,
+  // requesting a lazy (`requestLaziness=true`) or materialized result.
+  auto runSupersetQuery = [&](const std::string& q, bool requestLaziness) {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT ?e ?d WHERE { ?e <is-a> <SuperItem> . "
+                           "BIND(vec:distance(vidx:embhnsw, ?e, \"" +
+                           q + "\", 3) AS ?d) }");
+    auto result = qet.getResult(requestLaziness);
+    // The lazy request must actually take the fully lazy `Bind` path (the
+    // whole point of this run: no materialized total input size exists).
+    EXPECT_EQ(result->isFullyMaterialized(), !requestLaziness);
+    size_t eCol = qet.getVariableColumn(Variable{"?e"});
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    std::vector<std::pair<Id, Id>> rows;
+    auto addRows = [&](const IdTable& table) {
+      for (size_t r = 0; r < table.numRows(); ++r) {
+        rows.emplace_back(table(r, eCol), table(r, dCol));
+      }
+    };
+    if (result->isFullyMaterialized()) {
+      addRows(result->idTable());
+    } else {
+      for (auto& pair : result->idTables()) {
+        addRows(pair.idTable_);
+      }
+    }
+    return rows;
+  };
+
+  // Exactly the ~k' nearest per `searchHnsw(Q,k')` are BOUND with the HNSW
+  // distance; every other row -- in particular the two non-indexed extras --
+  // is UNDEF.
+  auto expectHnswEngaged = [&](const std::vector<std::pair<Id, Id>>& rows,
+                               const std::vector<float>& queryVec) {
+    std::vector<qlever::vector::ScoredEntity> ref =
+        vidx->searchHnsw(queryVec, K);
+    ASSERT_EQ(ref.size(), K);
+    auto refDistanceOf = [&](uint64_t bits) -> std::optional<double> {
+      for (const auto& hit : ref) {
+        if (hit.entity_.getBits() == bits) {
+          return static_cast<double>(hit.distance_);
+        }
+      }
+      return std::nullopt;
+    };
+    // All eight `<SuperItem>`s: the six index members plus the two extras.
+    ASSERT_EQ(rows.size(), 8u);
+    size_t numBound = 0;
+    for (const auto& [e, d] : rows) {
+      std::optional<double> refDist = refDistanceOf(e.getBits());
+      if (d.isUndefined()) {
+        EXPECT_FALSE(refDist.has_value())
+            << "a top-k' HNSW entity was left UNDEF";
+        continue;
+      }
+      ++numBound;
+      ASSERT_TRUE(refDist.has_value())
+          << "an entity was BOUND but is not an HNSW top-k' entity";
+      EXPECT_EQ(d.getDatatype(), Datatype::Double);
+      EXPECT_NEAR(d.getDouble(), refDist.value(), 1e-6);
+    }
+    // Only ~k' bound rows at all -- brute force would have bound all six
+    // members.
+    EXPECT_EQ(numBound, K);
+    // The non-indexed extras are enumerated by the pattern but have no
+    // vector, so they must be present and UNDEF.
+    for (const char* extra : {"<x0>", "<x1>"}) {
+      Id e = getId(extra);
+      auto it = std::find_if(rows.begin(), rows.end(),
+                             [&](const auto& p) { return p.first == e; });
+      ASSERT_NE(it, rows.end()) << extra << " missing from the superset scan";
+      EXPECT_TRUE(it->second.isUndefined())
+          << extra << " has no vector, must stay UNDEF";
+    }
+  };
+
+  // The critical run: fully LAZY input -> the guard sees the subtree-size
+  // hint (8 >= 6) and engages.
+  expectHnswEngaged(runSupersetQuery("1,0,0", true), {1.f, 0.f, 0.f});
+  // The materialized path (a DIFFERENT query vector, so no cache reuse):
+  // `Bind` passes the true materialized input size (8 >= 6) and engages too.
+  expectHnswEngaged(runSupersetQuery("0,1,0", false), {0.f, 1.f, 0.f});
+
+  // The flagship idiom over the superset: FILTER(BOUND) + ORDER BY sorts only
+  // the ~k' bound rows; recall is exact for this clean fixture, so the top-2
+  // ranking equals the EXACT brute-force top-2.
+  const std::vector<float> Q = {1.f, 0.f, 0.f};
+  std::vector<qlever::vector::ScoredEntity> exact = vidx->searchExact(Q, 2);
+  ASSERT_EQ(exact.size(), 2u);
+  QueryExecutionTree topQet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e ?d WHERE { ?e <is-a> <SuperItem> . "
+               "BIND(vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 3) AS ?d) "
+               "FILTER(BOUND(?d)) } ORDER BY ?d LIMIT 2");
+  auto topResult = topQet.getResult();
+  size_t teCol = topQet.getVariableColumn(Variable{"?e"});
+  const IdTable& topTable = topResult->idTable();
+  // The LIMIT is applied lazily during export, so the ordered table still
+  // holds all ~k' bound rows; the RANKING (first two) must match the exact
   // top-2.
   ASSERT_GE(topTable.numRows(), 2u);
   EXPECT_EQ(topTable(0, teCol).getBits(), exact[0].entity_.getBits());

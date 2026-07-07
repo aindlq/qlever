@@ -200,11 +200,15 @@ fourth argument, `vec:distance(vidx:emb, ?doc, Q, k')`, opts the *same* query
 into the index's HNSW graph: it runs one whole-index `searchHnsw(Q, k')` and
 binds a distance only for those ~`k'` nearest entities, so the usual
 `FILTER(BOUND(?d)) ORDER BY ?d LIMIT n` then sorts only ~`k'` rows instead of the
-whole column. This is **guarded to whole-index queries** — it is taken only when
-the input is the entire live set (its row count equals the index's vector count)
-and one side is the constant query `Q`; on a *filtered* subset (or an index
-without an HNSW graph) it **silently falls back to the exact path**, because HNSW
-searches the whole graph and could otherwise miss in-subset entities. It is
+whole column. This is **guarded to inputs that cover the index** — it is taken
+only when the input covers the entire live set (its row count is *at least* the
+index's vector count) and one side is the constant query `Q`. Covering inputs
+include the exact whole-index scan *and supersets of it* — e.g. all works of a
+type where some works carry no vector — because the HNSW top-`k'` entities are
+then all present in the input, so the result is complete. On a *selective*
+filter (fewer input rows than index vectors) or an index without an HNSW graph
+it **silently falls back to the exact path**, because HNSW searches the whole
+graph and could otherwise miss in-subset entities. It is
 **approximate** (bounded by HNSW recall): larger `k'` trades speed for recall,
 `k' = 0` (or omitting it) is exact. Use it for a huge *unfiltered* top-k where
 exact brute force is too slow; keep the exact form when the enumerator already

@@ -8,6 +8,7 @@
 
 #include "engine/CallFixedSize.h"
 #include "engine/ExistsJoin.h"
+#include "engine/IndexScan.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/sparqlExpressions/SparqlExpression.h"
 #include "engine/sparqlExpressions/SparqlExpressionGenerators.h"
@@ -170,23 +171,36 @@ Result Bind::computeResult(bool requestLaziness) {
     return {std::move(result), resultSortedOn(), std::move(localVocab)};
   }
 
-  return {
-      Result::LazyResult(ad_utility::CachingTransformInputRange(
-          subRes->idTables(),
-          [applyBind = std::move(applyBind)](auto& idTableAndVocab) mutable {
-            // The `LocalVocab` disallows inserts if it doesn't own its
-            // `primaryWordSet` exclusively. We clone the local vocab to enforce
-            // this invariant in all cases
-            LocalVocab localVocab = idTableAndVocab.localVocab_.clone();
-            // A fully lazy input yields chunks without a known total row count,
-            // so the whole-input size is unknown here (0 disables any
-            // whole-input expression fast path).
-            IdTable resultTable =
-                applyBind(std::move(idTableAndVocab.idTable_), &localVocab, 0);
-            return Result::IdTableVocabPair(std::move(resultTable),
-                                            std::move(localVocab));
-          })),
-      resultSortedOn()};
+  // A fully lazy input yields its chunks without a known total row count, so
+  // as the whole-input-guard hint for expressions like `vec:distance` (see
+  // `computeExpressionBind`) we pass the SUBTREE's known size instead: the
+  // exact size for an `IndexScan` (read from the permutation metadata; cheap,
+  // at most the two boundary blocks are inspected), else the size estimate.
+  // An over-estimate can only make a *selective* query wrongly attempt a
+  // whole-input fast path, which binds fewer rows, never wrong values.
+  const size_t totalInputSizeHint = [this]() -> size_t {
+    if (const auto* scan = dynamic_cast<const IndexScan*>(
+            _subtree->getRootOperation().get())) {
+      return scan->getLimitOffset().actualSize(scan->getExactSize());
+    }
+    return _subtree->getSizeEstimate();
+  }();
+
+  return {Result::LazyResult(ad_utility::CachingTransformInputRange(
+              subRes->idTables(),
+              [applyBind = std::move(applyBind),
+               totalInputSizeHint](auto& idTableAndVocab) mutable {
+                // The `LocalVocab` disallows inserts if it doesn't own its
+                // `primaryWordSet` exclusively. We clone the local vocab to
+                // enforce this invariant in all cases
+                LocalVocab localVocab = idTableAndVocab.localVocab_.clone();
+                IdTable resultTable =
+                    applyBind(std::move(idTableAndVocab.idTable_), &localVocab,
+                              totalInputSizeHint);
+                return Result::IdTableVocabPair(std::move(resultTable),
+                                                std::move(localVocab));
+              })),
+          resultSortedOn()};
 }
 
 // _____________________________________________________________________________

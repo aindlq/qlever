@@ -652,12 +652,19 @@ ExpressionResult VectorDistanceExpression::evaluate(
     return ExpressionResult{std::move(out)};
   };
 
-  // The HNSW path applies only for a whole-index scan (the size guard) on an
-  // index that actually has an HNSW graph. A `_totalInputSize` of 0 means the
-  // total is unknown (a fully lazy input), which disables the path.
+  // The HNSW path applies only when the input COVERS the index (the size
+  // guard: at least as many input rows as live vectors) on an index that
+  // actually has an HNSW graph. Covering inputs include the exact whole-index
+  // scan and SUPERSETS of it, e.g. "all works of a type" where some works
+  // carry no vector: the HNSW top-k' entities are then all present in the
+  // input, so the bound result set is complete. A SELECTIVE subset has fewer
+  // rows than live vectors and correctly falls back to the exact scan (HNSW
+  // searches the whole graph and could otherwise miss in-subset entities). A
+  // `_totalInputSize` of 0 means the total is unknown, which disables the
+  // path.
   std::optional<ExpressionResult> hnswResult;
   if (hnswK_ > 0 && vidx.hasHnsw() && context->_totalInputSize != 0 &&
-      context->_totalInputSize == vidx.numLiveVectors()) {
+      context->_totalInputSize >= vidx.numLiveVectors()) {
     hnswResult = std::visit(
         [&](const auto& in1,
             const auto& in2) -> std::optional<ExpressionResult> {
