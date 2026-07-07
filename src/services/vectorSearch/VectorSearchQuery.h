@@ -44,6 +44,15 @@ inline constexpr std::string_view VECTOR_EMBED_IRI =
 inline constexpr std::string_view VECTOR_VECTOR_IRI =
     "<https://qlever.cs.uni-freiburg.de/vectorSearch/vector>";
 
+// The magic PREDICATE `<.../index/NAME> vec:hasMember ?e` -- registered with
+// the engine-side `MagicPredicateRegistry` (see `VectorSearchService.cpp`). It
+// enumerates the entities that have a (live) vector in the index as a single,
+// already-`ValueId`-sorted column, so it merge-joins cheaply with the rest of
+// the query and replaces the `vec:distance -> UNDEF -> FILTER(BOUND(?d))`
+// membership idiom.
+inline constexpr std::string_view VECTOR_HAS_MEMBER_IRI =
+    "<https://qlever.cs.uni-freiburg.de/vectorSearch/hasMember>";
+
 class VectorSearchException : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };

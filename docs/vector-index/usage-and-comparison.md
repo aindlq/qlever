@@ -96,13 +96,14 @@ PREFIX vidx: <https://qlever.cs.uni-freiburg.de/vectorSearch/index/>
 ```
 
 An **index** is referenced by its IRI `vidx:<name>` — the *same* IRI you
-introspect and the one you search. The three functions:
+introspect and the one you search. The three functions, plus one magic predicate:
 
 | function | meaning |
 |---|---|
 | `vec:distance(vidx:X, S1, S2)` | uniform **smaller-is-closer** distance between two *sources*; each source is an entity (→ its stored vector) or a query vector |
 | `vec:embed(vidx:X, input)` | embed text / an image IRI via index X's endpoint → a query vector |
 | `vec:vector(vidx:X, ?e)` | entity `?e`'s stored vector *from index X* as a query vector |
+| `vidx:X vec:hasMember ?e` | **magic predicate**: binds `?e` to the entities that have a vector in index X (merge-join; see below) |
 
 The metric (cosine / dot / l2) is a property of the index, so there is **one**
 distance function — you never pass a metric, and every ranking is `ORDER BY ?d ASC`.
@@ -119,6 +120,28 @@ vec:vector(vidx:emb, <doc/42>)        →  "0.51,0.09, … ,-0.11"^^<https://qle
 The datatype `…/vec/MODEL/PRECISION` (MODEL = the index's `embeddingModel`,
 PRECISION = its `scalar`) travels with the value, so `vec:distance` can check
 that a query vector belongs to the space it's comparing against.
+
+### Membership — `vidx:X vec:hasMember ?e`
+
+`vidx:X vec:hasMember ?e` enumerates exactly the entities that have a vector in
+index X. It is **cheap**: the index physically stores its entities as a
+`ValueId`-sorted key list (tombstones excluded), so this scans one, already
+`ValueId`-sorted, single column — no vectors are materialised — and the planner
+**merge-joins** it with the rest of your query. Two uses:
+
+- **Drop `FILTER(BOUND)`.** Instead of enumerating a broader set and pruning the
+  non-members by the `vec:distance → UNDEF` sentinel, join to the members up
+  front — `?e` is then guaranteed a member:
+  ```sparql
+  SELECT ?doc ?d WHERE {
+    ?doc a :Document .
+    vidx:emb vec:hasMember ?doc .                                # members only
+    BIND(vec:distance(vidx:emb, ?doc, vec:embed(vidx:emb, "a red bicycle")) AS ?d)
+  } ORDER BY ?d LIMIT 10                                         # no FILTER(BOUND) needed
+  ```
+- **Enumerate the whole index.** `vidx:X vec:hasMember ?e` alone yields exactly
+  the whole index — which is the WHOLE-INDEX input the HNSW fast path (`useIndex`
+  / the 4th `vec:distance` argument, use case 6) requires to engage.
 
 ### Use case 1 — semantic search by text
 ```sparql

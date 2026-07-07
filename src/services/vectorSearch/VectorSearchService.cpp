@@ -15,17 +15,28 @@
 // changing the variant, the parser/planner dispatch, or any CMake of the core
 // libraries (see `src/services/CMakeLists.txt`).
 
+#include <absl/strings/str_cat.h>
+
 #include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
 #include <typeindex>
 
+#include "engine/MagicPredicateRegistry.h"
 #include "engine/MagicServicePlanning.h"
 #include "engine/Operation.h"
+#include "engine/QueryExecutionContext.h"
 #include "engine/QueryExecutionTree.h"
+#include "index/Index.h"
 #include "parser/MagicServiceQuery.h"
 #include "parser/MagicServiceRegistry.h"
 #include "parser/SparqlFunctionRegistry.h"
+#include "parser/TripleComponent.h"
 #include "services/vectorSearch/VectorDistanceExpression.h"
 #include "services/vectorSearch/VectorEmbedExpression.h"
+#include "services/vectorSearch/VectorIndexExtension.h"
+#include "services/vectorSearch/VectorMemberScan.h"
 #include "services/vectorSearch/VectorSearch.h"
 #include "services/vectorSearch/VectorSearchJoin.h"
 #include "services/vectorSearch/VectorSearchQuery.h"
@@ -90,6 +101,51 @@ void registerVectorSearchService() {
                      &sparqlExpression::makeVectorEmbedExpression);
   functions.addExact(std::string{parsedQuery::VECTOR_VECTOR_IRI},
                      &sparqlExpression::makeVectorVectorExpression);
+
+  // 4. Planner: the `vec:hasMember` MAGIC PREDICATE. A triple
+  //    `<.../index/NAME> vec:hasMember ?e` produces a `VectorMemberScan` leaf
+  //    that emits the index's member entities as one already-`ValueId`-sorted
+  //    column, so the planner merge-joins it with the surrounding query (no
+  //    vectors are materialised). This drops the `FILTER(BOUND)` membership
+  //    idiom: `?e a :T . vidx:X vec:hasMember ?e` is a clean, cheap join. The
+  //    handler validates the triple's shape (constant index-IRI subject,
+  //    variable object, index must exist) with clear user-facing errors.
+  MagicPredicateRegistry::get().add(
+      std::string{parsedQuery::VECTOR_HAS_MEMBER_IRI},
+      [](QueryExecutionContext* qec, const TripleComponent& subject,
+         const TripleComponent& object) -> std::shared_ptr<Operation> {
+        if (!subject.isIri()) {
+          throw std::runtime_error{
+              "The subject of `vec:hasMember` must be a constant vector-index "
+              "IRI `<https://qlever.cs.uni-freiburg.de/vectorSearch/index/"
+              "NAME>`, not a variable or literal."};
+        }
+        std::optional<std::string> indexName =
+            qlever::vector::indexNameFromMetadataIri(
+                subject.getIri().toStringRepresentation());
+        if (!indexName.has_value()) {
+          throw std::runtime_error{absl::StrCat(
+              "The subject of `vec:hasMember` must be a vector-index IRI "
+              "`<https://qlever.cs.uni-freiburg.de/vectorSearch/index/NAME>`, "
+              "but got ",
+              subject.getIri().toStringRepresentation(), ".")};
+        }
+        if (!object.isVariable()) {
+          throw std::runtime_error{
+              "The object of `vec:hasMember` must be a variable that is bound "
+              "to the members of the vector index."};
+        }
+        // The index must be loaded (it is at query time; this makes a typo in
+        // the index IRI fail with a clear message rather than an empty result).
+        if (!qlever::vector::getVectorIndex(qec->getIndex(),
+                                            indexName.value())) {
+          throw std::runtime_error{absl::StrCat(
+              "There is no loaded vector index named '", indexName.value(),
+              "'. Was the index built with `--service-index`?")};
+        }
+        return std::make_shared<VectorMemberScan>(
+            qec, std::move(indexName).value(), object.getVariable());
+      });
 }
 
 // Run the registration at static-initialization time. The folder is linked as

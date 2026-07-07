@@ -93,6 +93,7 @@ endif ()
 add_library(service_vectorSearch OBJECT
         VectorSearch.cpp
         VectorSearchJoin.cpp
+        VectorMemberScan.cpp
         VectorSearchQuery.cpp
         VectorSearchService.cpp
         VectorQueryPoint.cpp

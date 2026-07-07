@@ -138,6 +138,18 @@ class VectorIndex {
   // True iff this index stores a (live) vector for `entity`.
   bool hasVector(Id entity) const;
 
+  // Write the entity `Id`s of all LIVE members (entities that have a vector in
+  // this index) into `out`, in ascending `ValueId` order. That is exactly the
+  // physical order of the id-sorted `.rowmap` (validated strictly ascending by
+  // `idBits_` at open): the store keeps entities in id order and tombstones are
+  // already excluded. For the persistent ids stored here (never local-vocab)
+  // the bit order equals QLever's `Id` comparison order, so the emitted column
+  // is sorted the way a merge join expects. `out.size()` MUST equal
+  // `numLiveVectors()`. This is the primitive behind the `vec:hasMember`
+  // membership scan: emit the members as one already-sorted single column and
+  // let the planner merge-join it -- no vectors are materialised.
+  void memberEntities(ql::span<Id> out) const;
+
   // The stored vector of `entity` decoded to f32, or `nullopt` if this index
   // has none for it. (The store may hold f16/i8; searching BY an entity does
   // not decode -- see the `...ByEntity` methods.)

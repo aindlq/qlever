@@ -25,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -33,12 +34,15 @@
 
 #include "./util/GTestHelpers.h"
 #include "./util/IndexTestHelpers.h"
+#include "engine/Join.h"
 #include "engine/QueryPlanner.h"
+#include "engine/Sort.h"
 #include "index/IndexExtension.h"
 #include "index/IndexImpl.h"
 #include "parser/SparqlParser.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
+#include "services/vectorSearch/VectorMemberScan.h"
 #include "util/json.h"
 
 namespace {
@@ -1596,4 +1600,189 @@ TEST(VectorIndexPayloadE2E, hnswFourthArgumentValidation) {
       plan("vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 3, 4)"),
       ::testing::HasSubstr("three or four arguments"));
   EXPECT_NO_THROW(plan("vec:distance(vidx:embhnsw, ?e, \"1,0,0\", 3)"));
+}
+
+// ===========================================================================
+// The `vec:hasMember` MAGIC PREDICATE (see `VectorMemberScan`): a triple
+// `<.../index/NAME> vec:hasMember ?e` binds `?e` to exactly the entities that
+// have a vector in the index, as a single already-`ValueId`-sorted column, so
+// it merge-joins cheaply -- replacing the `vec:distance -> FILTER(BOUND)`
+// membership idiom.
+namespace {
+
+// Collect, over the whole execution tree rooted at `tree`, whether it contains
+// a merge `Join`, a `Sort`, and a `VectorMemberScan`. Used to prove that a
+// membership join is a MERGE join over already-sorted inputs (a `Join` with no
+// intervening `Sort`).
+struct PlanShape {
+  bool hasJoin = false;
+  bool hasSort = false;
+  bool hasMemberScan = false;
+};
+PlanShape analysePlan(const QueryExecutionTree& tree) {
+  PlanShape shape;
+  std::function<void(const QueryExecutionTree*)> walk =
+      [&](const QueryExecutionTree* subtree) {
+        if (subtree == nullptr) {
+          return;
+        }
+        Operation* op = subtree->getRootOperation().get();
+        if (dynamic_cast<Join*>(op) != nullptr) {
+          shape.hasJoin = true;
+        }
+        if (dynamic_cast<Sort*>(op) != nullptr) {
+          shape.hasSort = true;
+        }
+        if (dynamic_cast<VectorMemberScan*>(op) != nullptr) {
+          shape.hasMemberScan = true;
+        }
+        for (const QueryExecutionTree* child : op->getChildren()) {
+          walk(child);
+        }
+      };
+  walk(&tree);
+  return shape;
+}
+}  // namespace
+
+// _____________________________________________________________________________
+// (a) `vidx:emb vec:hasMember ?e` ALONE enumerates precisely the live member
+// IRIs (the four indexed entities <a>..<d>), NOT the vectorless <nomember>
+// that shares the `<is-a> <Item>` pattern -- and the single column comes out
+// sorted ascending by `ValueId`, matching a merge join's sort order.
+TEST(VectorIndexPayloadE2E, hasMemberEnumeratesMembersSorted) {
+  auto* qec = qecWithPayloadIndex();
+  QueryExecutionTree qet =
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT ?e WHERE { vidx:emb vec:hasMember ?e }");
+  // The lone leaf is the `VectorMemberScan`, sorted on its only column.
+  EXPECT_TRUE(dynamic_cast<VectorMemberScan*>(qet.getRootOperation().get()));
+  EXPECT_THAT(qet.resultSortedOn(), ::testing::ElementsAre(0));
+
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+
+  ASSERT_EQ(table.numRows(), 4u);
+  std::set<uint64_t> members;
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    members.insert(table(r, eCol).getBits());
+    if (r > 0) {
+      // Ascending by `ValueId` bits (the merge-join order for these persistent
+      // ids): every VocabIndex id compares by bits.
+      EXPECT_LT(table(r - 1, eCol).getBits(), table(r, eCol).getBits())
+          << "member column must be strictly ascending at row " << r;
+    }
+  }
+  EXPECT_EQ(members, (std::set<uint64_t>{
+                         getId("<a>").getBits(), getId("<b>").getBits(),
+                         getId("<c>").getBits(), getId("<d>").getBits()}));
+  EXPECT_FALSE(members.contains(getId("<nomember>").getBits()));
+}
+
+// _____________________________________________________________________________
+// (b) Joined with a broader pattern, `?e <is-a> <Item> . vidx:emb vec:hasMember
+// ?e` yields the INTERSECTION (members only, <nomember> excluded), and the plan
+// is a MERGE join: a `Join` over the two already-`?e`-sorted operands with NO
+// intervening `Sort`.
+TEST(VectorIndexPayloadE2E, hasMemberJoinIsAMergeJoin) {
+  auto* qec = qecWithPayloadIndex();
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT ?e WHERE { ?e <is-a> <Item> . vidx:emb vec:hasMember "
+               "?e }");
+  PlanShape shape = analysePlan(qet);
+  EXPECT_TRUE(shape.hasMemberScan);
+  EXPECT_TRUE(shape.hasJoin) << "the membership pattern should merge-join";
+  EXPECT_FALSE(shape.hasSort)
+      << "both operands are already sorted on ?e, so no Sort is needed";
+
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+
+  ASSERT_EQ(table.numRows(), 4u);
+  std::set<uint64_t> members;
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    members.insert(table(r, eCol).getBits());
+  }
+  EXPECT_EQ(members, (std::set<uint64_t>{
+                         getId("<a>").getBits(), getId("<b>").getBits(),
+                         getId("<c>").getBits(), getId("<d>").getBits()}));
+  EXPECT_FALSE(members.contains(getId("<nomember>").getBits()));
+}
+
+// _____________________________________________________________________________
+// (c) End-to-end: with `vec:hasMember` guaranteeing membership, ranking needs
+// NO `FILTER(BOUND)` -- and the result is identical to the old
+// `FILTER(BOUND(?d))` form. Both forms rank the four members by distance to
+// [1,0,0].
+TEST(VectorIndexPayloadE2E, hasMemberDropsFilterBoundAndMatchesIt) {
+  auto* qec = qecWithPayloadIndex();
+
+  // Collect (entity-bits, distance-bits) pairs for the ordered result of a
+  // query, so the two forms can be compared exactly.
+  auto rankedPairs = [&](const std::string& query) {
+    QueryExecutionTree qet = planQuery(qec, std::string{PREFIX} + query);
+    auto result = qet.getResult();
+    size_t eCol = qet.getVariableColumn(Variable{"?e"});
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    std::vector<std::pair<uint64_t, uint64_t>> pairs;
+    for (size_t r = 0; r < table.numRows(); ++r) {
+      pairs.emplace_back(table(r, eCol).getBits(), table(r, dCol).getBits());
+    }
+    return pairs;
+  };
+
+  // NEW: membership join, no FILTER(BOUND).
+  auto viaMembership = rankedPairs(
+      "SELECT ?e ?d WHERE { ?e <is-a> <Item> . vidx:emb vec:hasMember ?e . "
+      "BIND(vec:distance(vidx:emb, ?e, \"1,0,0\") AS ?d) } ORDER BY ?d");
+  // OLD: enumerate + FILTER(BOUND) to drop the non-member.
+  auto viaFilterBound = rankedPairs(
+      "SELECT ?e ?d WHERE { ?e <is-a> <Item> . "
+      "BIND(vec:distance(vidx:emb, ?e, \"1,0,0\") AS ?d) FILTER(BOUND(?d)) } "
+      "ORDER BY ?d");
+
+  // Both keep exactly the four members and rank them identically.
+  ASSERT_EQ(viaMembership.size(), 4u);
+  EXPECT_EQ(viaMembership, viaFilterBound);
+  // And every kept distance is a real double (no UNDEF survived).
+  auto* qecForId = qec;
+  auto getId = makeGetId(qecForId->getIndex());
+  for (const auto& [entityBits, distBits] : viaMembership) {
+    EXPECT_NE(entityBits, getId("<nomember>").getBits());
+    EXPECT_EQ(Id::fromBits(distBits).getDatatype(), Datatype::Double);
+  }
+}
+
+// _____________________________________________________________________________
+// (d) Shape errors are reported (at planning time) with clear messages: a
+// variable or non-index-IRI subject, and a non-variable object.
+TEST(VectorIndexPayloadE2E, hasMemberShapeErrors) {
+  auto* qec = qecWithPayloadIndex();
+  auto plan = [&](const std::string& pattern) {
+    return planQuery(
+        qec, std::string{PREFIX} + "SELECT * WHERE { " + pattern + " }");
+  };
+  // Variable subject.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      plan("?idx vec:hasMember ?e"),
+      ::testing::HasSubstr("subject of `vec:hasMember` must be a constant"));
+  // A constant IRI that is not a vector-index IRI.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      plan("<a> vec:hasMember ?e"),
+      ::testing::HasSubstr("must be a vector-index IRI"));
+  // A well-formed index IRI for an index that is not loaded.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      plan("<https://qlever.cs.uni-freiburg.de/vectorSearch/index/nope> "
+           "vec:hasMember ?e"),
+      ::testing::HasSubstr("no loaded vector index named 'nope'"));
+  // A literal object.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      plan("vidx:emb vec:hasMember \"x\""),
+      ::testing::HasSubstr("object of `vec:hasMember` must be a variable"));
 }

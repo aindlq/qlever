@@ -36,6 +36,7 @@
 #include "engine/IndexScan.h"
 #include "engine/Join.h"
 #include "engine/Load.h"
+#include "engine/MagicPredicateRegistry.h"
 #include "engine/MagicServicePlanning.h"
 #include "engine/MaterializedViews.h"
 #include "engine/Minus.h"
@@ -894,6 +895,18 @@ auto QueryPlanner::seedWithScansAndText(
 
     if (input == HAS_PREDICATE_PREDICATE) {
       pushPlan(makeSubtreePlan<HasPredicateScan>(_qec, node.triple_));
+      continue;
+    }
+
+    // Registry-based magic predicates (e.g. the vector-search `vec:hasMember`
+    // membership scan). A plugin self-registers a handler keyed by the exact
+    // predicate IRI; the handler validates the triple's shape and builds a
+    // single leaf operation. This keeps the planner free of any per-plugin
+    // code (mirrors the magic-SERVICE `MagicServicePlannerRegistry`).
+    if (const auto* predicatePlanner =
+            MagicPredicateRegistry::get().lookup(input)) {
+      pushPlan(makeSubtreePlan(
+          (*predicatePlanner)(_qec, node.triple_.s_, node.triple_.o_)));
       continue;
     }
 

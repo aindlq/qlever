@@ -479,6 +479,17 @@ bool VectorIndex::hasVector(Id entity) const {
 }
 
 // ____________________________________________________________________________
+void VectorIndex::memberEntities(ql::span<Id> out) const {
+  const auto& rowmap = impl_->rowmap_;
+  AD_CONTRACT_CHECK(out.size() == rowmap.size());
+  // The rowmap is stored strictly ascending by `idBits_` (validated at open),
+  // so this single pass emits the members in ascending `ValueId` order.
+  for (size_t i = 0; i < rowmap.size(); ++i) {
+    out[i] = Id::fromBits(rowmap[i].idBits_);
+  }
+}
+
+// ____________________________________________________________________________
 std::optional<std::vector<float>> VectorIndex::getVector(Id entity) const {
   const auto& impl = *impl_;
   auto row = impl.rowOf(entity);
