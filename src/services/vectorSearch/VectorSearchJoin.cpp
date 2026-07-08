@@ -388,17 +388,17 @@ void VectorSearchJoin::computePreFilterRows(
   }
   auto checkInterrupt = [this]() { checkCancellation(); };
 
-  // The DISTINCT bound candidates (the restricted searches below skip
-  // candidates without a stored vector themselves).
+  // All bound candidate ids, WITH duplicates (a photo bound to several works
+  // repeats). No hash-set dedup here: the restricted `searchExact*` below sorts
+  // the ids and the rowmap merge-join emits each matched row exactly ONCE (on a
+  // match it advances past that id, so a repeated candidate is skipped) -- so
+  // the merge both DEDUPS and drops candidates that have no stored vector, for
+  // free. When the candidates already arrive sorted (e.g. via `vec:hasMember`
+  // or an index scan) even the sort is skipped.
   std::vector<Id> candidates;
-  {
-    ad_utility::HashSet<Id> seen;
-    for (size_t row = 0; row < childTable.numRows(); ++row) {
-      Id candidate = childTable(row, leftCol_);
-      if (seen.insert(candidate).second) {
-        candidates.push_back(candidate);
-      }
-    }
+  candidates.reserve(childTable.numRows());
+  for (size_t row = 0; row < childTable.numRows(); ++row) {
+    candidates.push_back(childTable(row, leftCol_));
   }
   const size_t effectiveK =
       config_.keepAllCandidates_ ? candidates.size() : config_.k_;
