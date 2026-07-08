@@ -801,6 +801,19 @@ void VectorIndex::gatherSortedDistances(ql::span<const Id> ascendingEntities,
 }
 
 namespace {
+#ifdef _OPENMP
+// Parallelize the exact top-k distance sweep once it crosses this many
+// candidates. Below it (notably the small two-layer RERANK pass over a few
+// hundred pruned candidates) the scan stays serial -- the OpenMP fan-out would
+// cost more than it saves. Mirrors the `vec:distance` expression's thresholds.
+constexpr size_t VEC_SEARCH_PARALLEL_THRESHOLD = 2048;
+constexpr size_t VEC_SEARCH_PARALLEL_CHUNK = 1024;
+int vectorSearchThreadCap() {
+  unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+  return std::max(1, std::min(omp_get_max_threads(), static_cast<int>(hw)));
+}
+#endif
+
 // A bounded max-heap that keeps the `k` smallest (best) distances seen.
 class TopK {
  public:
@@ -826,10 +839,87 @@ class TopK {
     return out;
   }
 
+  // Drain `other`'s entries into this heap -- used to fold a thread-local
+  // partial top-k into the global one after a parallel scan.
+  void merge(TopK& other) {
+    while (!other.heap_.empty()) {
+      const auto& [dist, id] = other.heap_.top();
+      offer(dist, id);
+      other.heap_.pop();
+    }
+  }
+
  private:
   size_t k_;
   std::priority_queue<std::pair<float, uint64_t>> heap_;
 };
+
+// Score `n` items into `top` (a `k`-bounded heap): `rowAndId(i)` returns the
+// `(row, id)` of item `i`, or `nullopt` to skip it (e.g. a tombstone). The
+// distance computation -- the mmap-heavy SIMD work -- runs in parallel once
+// `n` crosses `VEC_SEARCH_PARALLEL_THRESHOLD`, via per-thread heaps merged at
+// the end, so the big brute-force scan uses every core while the small rerank
+// pass stays serial. For distinct distances the parallel result is identical
+// to the serial one (the same `k` smallest distances).
+template <typename LayerT, typename Fn>
+void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
+                  const char* queryBytes, std::optional<float> maxDistance,
+                  Fn&& rowAndId, const CheckInterruptCallback& checkInterrupt) {
+  auto scoreOne = [&](TopK& dst, size_t i) {
+    std::optional<std::pair<size_t, uint64_t>> ri = rowAndId(i);
+    if (!ri.has_value()) {
+      return;
+    }
+    float dist = layer.distanceToRow(queryBytes, ri->first);
+    if (!maxDistance.has_value() || dist <= maxDistance.value()) {
+      dst.offer(dist, ri->second);
+    }
+  };
+#ifdef _OPENMP
+  const int numThreads = vectorSearchThreadCap();
+  if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+    std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
+    std::atomic<bool> cancelled{false};
+#pragma omp parallel num_threads(numThreads)
+    {
+      TopK& localTop = locals[static_cast<size_t>(omp_get_thread_num())];
+#pragma omp for schedule(dynamic, VEC_SEARCH_PARALLEL_CHUNK) nowait
+      for (size_t i = 0; i < n; ++i) {
+        // An exception must never unwind out of the OpenMP region: poll the
+        // (throwing) interrupt once per chunk, latch a flag on cancellation,
+        // and re-raise once AFTER the region.
+        if (cancelled.load(std::memory_order_relaxed)) {
+          continue;
+        }
+        if (checkInterrupt && i % VEC_SEARCH_PARALLEL_CHUNK == 0) {
+          try {
+            checkInterrupt();
+          } catch (...) {
+            cancelled.store(true, std::memory_order_relaxed);
+            continue;
+          }
+        }
+        scoreOne(localTop, i);
+      }
+    }
+    if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+      checkInterrupt();  // re-raise the cancellation outside the parallel region
+    }
+    for (TopK& local : locals) {
+      top.merge(local);
+    }
+    return;
+  }
+#endif
+  size_t sinceCheck = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+      sinceCheck = 0;
+      checkInterrupt();
+    }
+    scoreOne(top, i);
+  }
+}
 }  // namespace
 
 // ____________________________________________________________________________
@@ -852,17 +942,6 @@ std::vector<ScoredEntity> searchExactBytes(
     return {};
   }
   TopK top{k};
-  size_t sinceCheck = 0;
-  auto consider = [&](size_t row, uint64_t id) {
-    if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
-      sinceCheck = 0;
-      checkInterrupt();
-    }
-    float dist = layer.distanceToRow(queryBytes, row);
-    if (!maxDistance.has_value() || dist <= maxDistance.value()) {
-      top.offer(dist, id);
-    }
-  };
 
   // RAII: advise the flat store for a SEQUENTIAL scan while the ordered scan
   // below runs, restoring RANDOM (the gather default) on exit. This is a purely
@@ -891,13 +970,19 @@ std::vector<ScoredEntity> searchExactBytes(
 
   if (!candidates.has_value()) {
     // Whole-index brute force: rows are visited in order, so it is sequential.
+    // The distance sweep runs in parallel (per-thread heaps) above the
+    // threshold.
     SeqScanHint hint{layer, !layer.alignedBuf_};
-    for (size_t row = 0; row < impl.meta_.numVectors_; ++row) {
-      uint64_t id = impl.keys_[row];
-      if (id != TOMBSTONE_KEY) {
-        consider(row, id);
-      }
-    }
+    scanIntoTopK(
+        top, k, impl.meta_.numVectors_, layer, queryBytes, maxDistance,
+        [&](size_t row) -> std::optional<std::pair<size_t, uint64_t>> {
+          uint64_t id = impl.keys_[row];
+          if (id == TOMBSTONE_KEY) {
+            return std::nullopt;
+          }
+          return std::pair<size_t, uint64_t>{row, id};
+        },
+        checkInterrupt);
     return top.sorted();
   }
 
@@ -925,23 +1010,34 @@ std::vector<ScoredEntity> searchExactBytes(
   // so later gathers skip the misleading SEQUENTIAL hint.
   bool seqHint = !layer.alignedBuf_ &&
                  !impl.gatherNonMonotonic_.load(std::memory_order_relaxed);
+  // Collect the matched (row, id) pairs first: the merge-join is cheap, while
+  // the per-row SIMD distance below is the expensive part we parallelize. They
+  // arrive in ascending row order on a monotonic store, so the sequential-scan
+  // hint still applies while scoring.
+  std::vector<std::pair<size_t, uint64_t>> matched;
+  matched.reserve(candBits.size());
   bool monotonic = true;
-  size_t prevRow = 0;
-  bool havePrev = false;
   {
     SeqScanHint hint{layer, seqHint};
     mergeJoinRowmap(candBits.begin(), candBits.end(), impl.rowmap_.begin(),
                     impl.rowmap_.end(), [&](size_t row, uint64_t id) {
-                      if (havePrev && row < prevRow) {
+                      if (!matched.empty() && row < matched.back().first) {
                         monotonic = false;
                       }
-                      prevRow = row;
-                      havePrev = true;
-                      consider(row, id);
+                      matched.emplace_back(row, id);
                     });
   }
   if (seqHint && !monotonic) {
     impl.gatherNonMonotonic_.store(true, std::memory_order_relaxed);
+  }
+  {
+    SeqScanHint hint{layer, seqHint && monotonic};
+    scanIntoTopK(
+        top, k, matched.size(), layer, queryBytes, maxDistance,
+        [&](size_t i) -> std::optional<std::pair<size_t, uint64_t>> {
+          return matched[i];
+        },
+        checkInterrupt);
   }
   return top.sorted();
 }
