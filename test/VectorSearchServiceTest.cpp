@@ -577,6 +577,41 @@ TEST(VectorSearchService, joinFormEstimatesAndMemoization) {
 }
 
 // _____________________________________________________________________________
+// The annotate FORM P (`vec:candidates ?x ; vec:result ?x`, no `vec:k`) emits
+// one row per child row whose candidate is a MEMBER, so its size estimate is
+// capped at the index's live-vector count (times the candidate multiplicity),
+// NOT the raw child size -- which matters when the candidate set is a metadata
+// subset holding many non-members.
+TEST(VectorSearchService, annotateFormEstimateCappedAtMembers) {
+  auto* qec = qecWithVectorIndex();
+  auto getId = makeGetId(qec->getIndex());
+  qlever::vector::VectorSearchConfiguration config;
+  config.indexName_ = "clip";
+  config.leftVariable_ = Variable{"?x"};
+  config.resultVariable_ = Variable{"?x"};  // annotate in place (?in == ?out)
+  config.queryVector_ = std::vector<float>{1, 0, 0, 0};  // a query point -> FORM P
+  config.keepAllCandidates_ = true;                      // annotate, no vec:k
+  // Five DISTINCT candidates, one row each.
+  auto child =
+      makeChild(qec, {Variable{"?x"}},
+                {{getId("<e0>")}, {getId("<e1>")}, {getId("<e2>")},
+                 {getId("<e3>")}, {getId("<e4>")}});
+  VectorSearchJoin join{qec, config, child};
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "clip");
+  ASSERT_TRUE(vidx != nullptr);
+  double mult = std::max(1.0f, child->getMultiplicity(0));
+  uint64_t memberBound =
+      static_cast<uint64_t>(vidx->numLiveVectors() * mult);
+  EXPECT_EQ(join.getSizeEstimate(),
+            std::min<uint64_t>(child->getSizeEstimate(), memberBound));
+  // With fewer members than candidates, it is STRICTLY tighter than the raw
+  // child size (the whole point of the fix).
+  if (memberBound < child->getSizeEstimate()) {
+    EXPECT_LT(join.getSizeEstimate(), child->getSizeEstimate());
+  }
+}
+
+// _____________________________________________________________________________
 // The `<left>` variable can be bound by the SURROUNDING query instead of a
 // nested pattern: the operation is planned as an incomplete leaf and completed
 // by the join enumeration (the generic `IncompleteJoinOperation` mechanism).

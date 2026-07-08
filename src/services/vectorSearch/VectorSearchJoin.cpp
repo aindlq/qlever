@@ -182,9 +182,27 @@ uint64_t VectorSearchJoin::getSizeEstimateBeforeLimit() {
   if (config_.hasQueryPoint()) {
     // FORM P never leaves the bound set: at most the child's rows, and at
     // most ~k of its distinct candidates unless all are kept.
-    return config_.keepAllCandidates_
-               ? child_->getSizeEstimate()
-               : std::min<uint64_t>(child_->getSizeEstimate(), config_.k_);
+    if (!config_.keepAllCandidates_) {
+      return std::min<uint64_t>(child_->getSizeEstimate(), config_.k_);
+    }
+    // Annotate form: exactly one row per child row whose candidate is a
+    // MEMBER -- the rowmap merge drops candidates with no stored vector. So
+    // the surviving DISTINCT candidates are capped at the index's live-vector
+    // count; scaled by the child's multiplicity on the candidate column, that
+    // bounds the output rows. This is tighter than the raw child size whenever
+    // the candidate set holds many non-members, which is the whole point of a
+    // pre-filter over a metadata subset.
+    uint64_t childEstimate = child_->getSizeEstimate();
+    auto vidx = qlever::vector::getVectorIndex(
+        getExecutionContext()->getIndex(), config_.indexName_);
+    if (vidx == nullptr) {
+      return childEstimate;
+    }
+    double candidateMultiplicity =
+        std::max(1.0f, child_->getMultiplicity(leftCol_));
+    auto memberBound = static_cast<uint64_t>(
+        static_cast<double>(vidx->numLiveVectors()) * candidateMultiplicity);
+    return std::min<uint64_t>(childEstimate, memberBound);
   }
   // FORM E: k result rows per child row.
   return child_->getSizeEstimate() * config_.k_;
