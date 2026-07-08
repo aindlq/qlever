@@ -294,7 +294,10 @@ std::vector<double> referenceRd(const std::vector<std::vector<float>>& vecs,
   return r;
 }
 
-std::string buildRandomCslsIndex(bool withHnsw, const std::string& name) {
+std::string buildRandomCslsIndex(
+    bool withHnsw, const std::string& name,
+    VectorScalar scalar = VectorScalar::F32,
+    std::optional<VectorScalar> rerank = std::nullopt) {
   std::string basename = uniqueTmpBasename();
   VectorIndexConfig cfg;
   cfg.name_ = name;
@@ -303,6 +306,8 @@ std::string buildRandomCslsIndex(bool withHnsw, const std::string& name) {
   cfg.buildHnsw_ = withHnsw;
   cfg.csls_ = true;
   cfg.cslsNeighbors_ = 3;
+  cfg.scalar_ = scalar;
+  cfg.rerankScalar_ = rerank;
   VectorIndexBuilder builder{basename, cfg};
   auto vecs = makeRandomUnitVectors();
   for (size_t i = 0; i < vecs.size(); ++i) {
@@ -400,6 +405,40 @@ TEST(VectorCsls, cslsRaisesHnswRecallDefaults) {
   ASSERT_TRUE(plain != nullptr);
   EXPECT_EQ(plain->metadata().config_.hnswConnectivity_, 16u);
   EXPECT_EQ(plain->metadata().config_.hnswExpansionAdd_, 128u);
+}
+
+// _____________________________________________________________________________
+// Binary scan + bf16 rerank: the r(d) self-kNN finds candidates through the
+// binary Hamming graph but RE-SCORES them on the FINE bf16 (cosine) layer, so
+// r(d) is a real cosine similarity tracking the exact reference -- NOT the
+// binary/Hamming score (which would collapse toward saturation). Regression
+// for a coarse-layer leak into CSLS on a low-precision index.
+TEST(VectorCsls, binaryScanRdReScoresOnBf16NotCoarse) {
+  std::string basename = buildRandomCslsIndex(
+      /*withHnsw=*/true, "csbin", VectorScalar::Binary, VectorScalar::Bf16);
+  VectorIndex idx;
+  idx.open(basename, "csbin");
+  ASSERT_TRUE(idx.hasCsls());
+  auto expected = referenceRd(makeRandomUnitVectors(), 3);
+  size_t tight = 0;
+  size_t saturated = 0;
+  for (size_t i = 0; i < RD_ROWS; ++i) {
+    auto r = idx.cslsRForEntity(mkId(1000 + i * 7));
+    ASSERT_TRUE(r.has_value());
+    if (std::abs(r.value() - static_cast<float>(expected[i])) < 2e-2f) {
+      ++tight;  // bf16 truncation tolerance
+    }
+    if (r.value() > 0.95f) {
+      ++saturated;
+    }
+  }
+  // Tracks the exact bf16-cosine reference for the vast majority (the binary
+  // self-kNN over 200 vectors fetches ~all, so the bf16 rescore is exact up to
+  // bf16 precision), and is NOT saturated -- a collapse to ~1.0 would be the
+  // fine rescore leaking onto the binary Hamming layer.
+  EXPECT_GE(tight, (RD_ROWS * 85) / 100);
+  EXPECT_LT(saturated, RD_ROWS / 4) << "r(d) saturated -- coarse-layer leak?";
+  cleanupTmp(basename, "csbin");
 }
 
 // _____________________________________________________________________________
