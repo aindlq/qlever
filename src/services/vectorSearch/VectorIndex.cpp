@@ -161,13 +161,17 @@ struct VectorIndex::Impl {
 
     // Encode an f32 query into this layer's storage scalar. Returns a pointer
     // to the encoded bytes; `buffer` provides the storage when a conversion
-    // happens.
+    // happens. The buffer is ZEROED first (`assign`, not `resize`): usearch's
+    // f32 -> b1x8 sign-pack cast memsets only the `dim / 8` WHOLE output
+    // bytes and then ORs bits in, so a partial trailing byte of a reused
+    // buffer would keep stale bits (all other casts overwrite every byte, for
+    // which the zeroing is merely redundant).
     const char* encodeQuery(ql::span<const float> query,
                             std::vector<char>& buffer) const {
       const char* raw = reinterpret_cast<const char*>(query.data());
       auto fromF32 = casts_.from.f32;
       if (fromF32 != nullptr) {
-        buffer.resize(rowBytes_);
+        buffer.assign(rowBytes_, 0);
         if (fromF32(raw, dim_, buffer.data())) {
           return buffer.data();
         }
@@ -324,8 +328,9 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
     complainInterrupted("the dimension");
   }
   impl.scan_.dim_ = impl.dim();
-  impl.scan_.rowBytes_ =
-      impl.dim() * bytesPerScalar(impl.meta_.config_.scalar_);
+  // Raw row byte length via `rowBytesFor`: `dim * bytesPerScalar`, except for
+  // the sign-packed `binary` scalar whose rows are `(dim + 7) / 8` bytes.
+  impl.scan_.rowBytes_ = rowBytesFor(impl.meta_.config_.scalar_, impl.dim());
   // Row stride: explicit for a v5 index, derived (== raw row byte length) for a
   // v4 index (`rowStrideBytes_ == 0`). It must be at least the raw row length
   // (the metric reads `rowBytes_` per row), or the mapped reads could go out
@@ -351,9 +356,13 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
     }
   }
 
-  // 3. The shared metric (over the storage scalar) and the f32 casts.
+  // 3. The shared metric (over the storage scalar) and the f32 casts. The
+  //    SCAN layer of a `binary` index is compared by HAMMING distance over the
+  //    sign bits (`toUsearchScanMetric`), not the index's cosine metric --
+  //    the fine rerank layer below always carries the index metric.
   impl.scan_.metric_.emplace(impl.meta_.config_.dimensions_,
-                             toUsearchMetric(impl.meta_.config_.metric_),
+                             toUsearchScanMetric(impl.meta_.config_.scalar_,
+                                                 impl.meta_.config_.metric_),
                              toUsearchScalar(impl.meta_.config_.scalar_));
   impl.scan_.casts_ =
       uu::casts_punned_t::make(toUsearchScalar(impl.meta_.config_.scalar_));
@@ -370,7 +379,7 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
     openMmap(rerank.data_, vectorRerankDataFile(basename, name),
              ad_utility::AccessPattern::Random);
     rerank.dim_ = impl.dim();
-    rerank.rowBytes_ = impl.dim() * bytesPerScalar(rerankScalar);
+    rerank.rowBytes_ = rowBytesFor(rerankScalar, impl.dim());
     rerank.stride_ = rerank.rowBytes_;
     if (rerank.data_.size() != impl.meta_.numVectors_ * rerank.stride_) {
       complainInterrupted("the rerank data size on disk");
@@ -903,7 +912,8 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
       }
     }
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
-      checkInterrupt();  // re-raise the cancellation outside the parallel region
+      checkInterrupt();  // re-raise the cancellation outside the parallel
+                         // region
     }
     for (TopK& local : locals) {
       top.merge(local);
@@ -937,7 +947,8 @@ std::vector<ScoredEntity> searchExactBytes(
   // `numScored` (optional out-param) reports how many vectors actually had a
   // distance computed -- the WHOLE live set for a whole-index search, or just
   // the candidates that are members for a restricted one. It is NOT the raw
-  // candidate count: a candidate without a stored vector is skipped, not scored.
+  // candidate count: a candidate without a stored vector is skipped, not
+  // scored.
   auto reportScored = [numScored](size_t n) {
     if (numScored != nullptr) {
       *numScored = n;

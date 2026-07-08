@@ -106,12 +106,18 @@ void writeNpyBundle(
   }
 }
 
-// The shared test context: THREE indices over the same vectors, built through
+// The shared test context: FOUR indices over the same vectors, built through
 // the REGISTERED build/load hooks (the `--service-index` path incl. the
 // `rerank` key of `parseSpec`):
 //   * "embrr"  -- the two-layer index under test (scan i8 + rerank bf16);
 //   * "embbf"  -- a single-layer bf16 reference (the fine layer's twin);
-//   * "embi8"  -- a single-layer i8 reference (the coarse layer's twin).
+//   * "embi8"  -- a single-layer i8 reference (the coarse layer's twin);
+//   * "embbin" -- a two-layer BINARY index (scan 1-bit sign-packed Hamming +
+//                 rerank bf16). Against the query [0,1,0,0] the sign patterns
+//                 ({0} for r0, {0,1} for r1/r2/r5, {1} for r3, {2} for r4 vs
+//                 the query's {1}) put the whole fine top set within the wide
+//                 binary default rerankK, so the reranked top-k must equal
+//                 the exact fine top-k.
 QueryExecutionContext* qecWithRerankIndexes() {
   QueryExecutionContext* qec = getQec(std::string{KG_RERANK});
   auto& impl = const_cast<Index&>(qec->getIndex()).getImpl();
@@ -135,14 +141,19 @@ QueryExecutionContext* qecWithRerankIndexes() {
     return e;
   };
   nlohmann::json spec{
-      {"vectorSearch", nlohmann::json::array({entry("embrr", "i8", "bf16"),
-                                              entry("embbf", "bf16", nullptr),
-                                              entry("embi8", "i8", nullptr)})}};
+      {"vectorSearch",
+       nlohmann::json::array({entry("embrr", "i8", "bf16"),
+                              entry("embbf", "bf16", nullptr),
+                              entry("embi8", "i8", nullptr),
+                              entry("embbin", "binary", "bf16")})}};
   for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
     hook(qec->getIndex(), basename, spec);
   }
-  // The two-layer build must produce the rerank matrix ONLY for "embrr".
+  // The two-layer builds must produce the rerank matrix ONLY for "embrr" and
+  // "embbin".
   EXPECT_TRUE(std::filesystem::exists(vectorRerankDataFile(basename, "embrr")));
+  EXPECT_TRUE(
+      std::filesystem::exists(vectorRerankDataFile(basename, "embbin")));
   EXPECT_FALSE(
       std::filesystem::exists(vectorRerankDataFile(basename, "embbf")));
   EXPECT_FALSE(
@@ -153,7 +164,7 @@ QueryExecutionContext* qecWithRerankIndexes() {
   qec->setLocatedTriplesForEvaluation(
       impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
   // The load hook memory-maps everything; the directory entries can go.
-  for (std::string_view name : {"embrr", "embbf", "embi8"}) {
+  for (std::string_view name : {"embrr", "embbf", "embi8", "embbin"}) {
     for (std::string_view suffix : {".meta", ".keys", ".rowmap", ".data",
                                     ".rerank.data", ".iris", ".hnsw"}) {
       std::error_code ec;
@@ -208,13 +219,14 @@ std::vector<float> bigRow(size_t i) {
 
 // Build a two-layer (or, with `rerank = nullopt`, single-layer) tmp index.
 std::string buildTmpTwoLayer(std::optional<VectorScalar> rerank,
-                             std::string name = "rr") {
+                             std::string name = "rr",
+                             VectorScalar scan = VectorScalar::I8) {
   std::string basename = uniqueTmpBasename();
   VectorIndexConfig cfg;
   cfg.name_ = name;
   cfg.dimensions_ = BIG_DIM;
   cfg.metric_ = VectorMetric::Cosine;
-  cfg.scalar_ = VectorScalar::I8;
+  cfg.scalar_ = scan;
   cfg.rerankScalar_ = rerank;
   cfg.buildHnsw_ = false;
   VectorIndexBuilder builder{basename, cfg};
@@ -298,6 +310,66 @@ TEST(VectorRerank, buildWritesBothMatricesAndMeta) {
 }
 
 // _____________________________________________________________________________
+// The BINARY two-layer build: the coarse scan matrix holds 1-bit sign-packed
+// rows of `(dim + 7) / 8` bytes (the 32x storage rung: 512 B per 4096-dim
+// vector), the fine bf16 rerank matrix is written exactly as for i8, and the
+// `.meta` records scalar=binary + rerankScalar=bf16. Exact reads (`getVector`,
+// `searchExact`) serve the fine layer; the coarse layer serves integer
+// Hamming distances.
+TEST(VectorRerank, binaryBuildWritesBothMatricesAndMeta) {
+  std::string basename =
+      buildTmpTwoLayer(VectorScalar::Bf16, "rr", VectorScalar::Binary);
+
+  // Scan payload: BIG_ROWS * BIG_DIM / 8 bytes (1 bit per component), far
+  // below the bf16 rerank matrix's 2 bytes per component.
+  const auto pageSlack = static_cast<std::uintmax_t>(getpagesize()) + 32;
+  const std::uintmax_t scanBytes =
+      std::filesystem::file_size(vectorDataFile(basename, "rr"));
+  const std::uintmax_t rerankBytes =
+      std::filesystem::file_size(vectorRerankDataFile(basename, "rr"));
+  EXPECT_GE(scanBytes, BIG_ROWS * BIG_DIM / 8);
+  EXPECT_LE(scanBytes, BIG_ROWS * BIG_DIM / 8 + pageSlack);
+  EXPECT_GE(rerankBytes, BIG_ROWS * BIG_DIM * 2);
+  EXPECT_LE(rerankBytes, BIG_ROWS * BIG_DIM * 2 + pageSlack);
+
+  nlohmann::json meta = readMetaJson(basename);
+  EXPECT_EQ(meta.at("scalar"), "binary");
+  ASSERT_TRUE(meta.contains("rerankScalar"));
+  EXPECT_EQ(meta.at("rerankScalar"), "bf16");
+  EXPECT_EQ(meta.at("rowStrideBytes"), BIG_DIM / 8);
+
+  VectorIndex idx;
+  idx.open(basename, "rr");
+  EXPECT_TRUE(idx.hasRerankLayer());
+  EXPECT_EQ(idx.metadata().config_.scalar_, VectorScalar::Binary);
+
+  // `getVector` decodes the FINE bf16 layer: the 0.5 components come back
+  // exactly (the packed sign bits could only yield 0/1).
+  auto v = idx.getVector(mkId(101));
+  ASSERT_TRUE(v.has_value());
+  EXPECT_FLOAT_EQ((*v)[2], 0.5f);
+  EXPECT_FLOAT_EQ((*v)[3], 0.5f);
+  EXPECT_FLOAT_EQ((*v)[0], 0.f);
+
+  // The exact search reads the fine layer: self at cosine distance ~0.
+  auto hits = idx.searchExact(bigRow(1), 1);
+  ASSERT_EQ(hits.size(), 1u);
+  EXPECT_EQ(hits[0].entity_, mkId(101));
+  EXPECT_NEAR(hits[0].distance_, 0.f, 1e-4);
+
+  // The coarse layer serves HAMMING distances: the two-hot sign patterns of
+  // distinct rows are disjoint, so self = 0 and every other row = 4.
+  auto coarse = idx.searchExactCoarse(bigRow(1), BIG_ROWS);
+  ASSERT_EQ(coarse.size(), BIG_ROWS);
+  EXPECT_EQ(coarse[0].entity_, mkId(101));
+  EXPECT_EQ(coarse[0].distance_, 0.f);
+  for (size_t i = 1; i < BIG_ROWS; ++i) {
+    EXPECT_EQ(coarse[i].distance_, 4.f) << i;
+  }
+  cleanupTmp(basename);
+}
+
+// _____________________________________________________________________________
 // A single-layer build produces exactly the OLD `.meta` format -- no
 // `rerankScalar` key, no `.rerank.data` -- and it (i.e. any pre-two-layer
 // index) still loads as a single-layer index.
@@ -345,6 +417,48 @@ TEST(VectorRerank, i8RerankLayerIsRejected) {
               R"({"vectorSearch":[{"name":"q","npy":"/nonexistent.npy",)"
               R"("iris":"/nonexistent.iris","scalar":"i8","rerank":"i8"}]})")),
       HasSubstr("rerank"));
+}
+
+// _____________________________________________________________________________
+// `binary` is a SCAN-layer-only precision: `rerank: "binary"` is rejected both
+// by the build-spec parser and by the builder itself (the rerank layer is the
+// high-precision layer that exact distances read).
+TEST(VectorRerank, binaryRerankLayerIsRejected) {
+  VectorIndexConfig cfg;
+  cfg.name_ = "bad";
+  cfg.dimensions_ = 4;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.scalar_ = VectorScalar::Binary;
+  cfg.rerankScalar_ = VectorScalar::Binary;
+  AD_EXPECT_THROW_WITH_MESSAGE((VectorIndexBuilder{uniqueTmpBasename(), cfg}),
+                               HasSubstr("rerank layer"));
+
+  auto* qec = qecWithRerankIndexes();
+  ASSERT_FALSE(IndexExtensionRegistry::get().buildHooks().empty());
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      IndexExtensionRegistry::get().buildHooks().front()(
+          qec->getIndex(), "/nonexistent/base",
+          nlohmann::json::parse(
+              R"({"vectorSearch":[{"name":"q","npy":"/nonexistent.npy",)"
+              R"("iris":"/nonexistent.iris","scalar":"binary",)"
+              R"("rerank":"binary"}]})")),
+      HasSubstr("rerank"));
+}
+
+// _____________________________________________________________________________
+// `binary` keeps only sign bits (Hamming, an angular proxy), so like `i8` it
+// is rejected for metrics other than cosine.
+TEST(VectorRerank, binaryRejectsNonCosineMetric) {
+  auto* qec = qecWithRerankIndexes();
+  ASSERT_FALSE(IndexExtensionRegistry::get().buildHooks().empty());
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      IndexExtensionRegistry::get().buildHooks().front()(
+          qec->getIndex(), "/nonexistent/base",
+          nlohmann::json::parse(
+              R"({"vectorSearch":[{"name":"q","npy":"/nonexistent.npy",)"
+              R"("iris":"/nonexistent.iris","scalar":"binary",)"
+              R"("metric":"l2sq"}]})")),
+      HasSubstr("cosine"));
 }
 
 // _____________________________________________________________________________
@@ -448,6 +562,79 @@ TEST(VectorRerank, serviceRerankMatchesExactFineSearch) {
                                    coarseByEntity[table(r, nnCol)])))
         << "row " << r;
   }
+}
+
+// _____________________________________________________________________________
+// The BINARY SERVICE top-k: the coarse pass ranks by HAMMING distance over
+// the sign bits, the fine pass rescores exactly on bf16. On this fixture the
+// sign patterns keep the whole fine top set within the (wide) binary default
+// rerankK, so the binary-scan -> bf16-rerank top-k EQUALS the exact bf16
+// `searchExact` top-k -- entities and bit-identical fine scores, with
+// `vec:bindScore` == the exact `vec:distance`. `vec:bindCoarseScore` binds
+// the raw Hamming distance: an INTEGER in [0, dim] on a different scale than
+// the fine cosine score (deliberately not reconciled -- `ABS(?d - ?dc)` is
+// meaningless here, unlike on the i8 index).
+TEST(VectorRerank, serviceBinaryRerankMatchesExactFineSearch) {
+  auto* qec = qecWithRerankIndexes();
+  auto vidx = getVectorIndex(qec->getIndex(), "embbin");
+  ASSERT_TRUE(vidx != nullptr);
+  ASSERT_TRUE(vidx->hasRerankLayer());
+  ASSERT_EQ(vidx->metadata().config_.scalar_, VectorScalar::Binary);
+  const std::vector<float> query{0.f, 1.f, 0.f, 0.f};
+
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT * WHERE { SERVICE vec: { _:c vec:index \"embbin\" ; "
+               "vec:queryVector \"0,1,0,0\" ; vec:result ?nn ; "
+               "vec:bindScore ?d ; vec:bindCoarseScore ?dc ; vec:k 3 . } "
+               "BIND(vec:distance(vidx:embbin, ?nn, \"0,1,0,0\") AS ?dref) }");
+  auto result = qet.getResult();
+  size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  size_t dcCol = qet.getVariableColumn(Variable{"?dc"});
+  size_t drefCol = qet.getVariableColumn(Variable{"?dref"});
+  const IdTable& table = result->idTable();
+
+  // Reference: the exact fine-layer (bf16) top-3 and the coarse Hamming
+  // distances of ALL entities.
+  auto fineTop = vidx->searchExact(query, 3);
+  ASSERT_EQ(fineTop.size(), 3u);
+  auto coarseAll = vidx->searchExactCoarse(query, vidx->numLiveVectors());
+  ad_utility::HashMap<Id, float> coarseByEntity;
+  for (const auto& hit : coarseAll) {
+    coarseByEntity[hit.entity_] = hit.distance_;
+  }
+
+  auto getId = makeGetId(qec->getIndex());
+  ASSERT_EQ(table.numRows(), 3u);
+  // Unambiguous fine ranking: r3 (0) < r2 (0.2) < r1 (0.4) -- exactly the
+  // exact bf16 top-3.
+  EXPECT_EQ(table(0, nnCol), getId("<r3>"));
+  EXPECT_EQ(table(1, nnCol), getId("<r2>"));
+  EXPECT_EQ(table(2, nnCol), getId("<r1>"));
+  for (size_t r = 0; r < 3; ++r) {
+    EXPECT_EQ(table(r, nnCol), fineTop[r].entity_) << "row " << r;
+    // Fine score: bit-identical to the exact fine search AND to the exact
+    // `vec:distance` of the same entity.
+    EXPECT_EQ(table(r, dCol),
+              Id::makeFromDouble(static_cast<double>(fineTop[r].distance_)))
+        << "row " << r;
+    EXPECT_EQ(table(r, dCol), table(r, drefCol)) << "row " << r;
+    // Coarse score: the raw Hamming distance -- an integer in [0, dim].
+    ASSERT_TRUE(coarseByEntity.contains(table(r, nnCol)));
+    double hamming = table(r, dcCol).getDouble();
+    EXPECT_EQ(table(r, dcCol), Id::makeFromDouble(static_cast<double>(
+                                   coarseByEntity[table(r, nnCol)])))
+        << "row " << r;
+    EXPECT_EQ(hamming, std::floor(hamming)) << "row " << r;
+    EXPECT_GE(hamming, 0.0);
+    EXPECT_LE(hamming, 4.0);  // dim = 4
+  }
+  // The designed Hamming values: the query's sign pattern is {1}; r3's is
+  // {1} (distance 0), r2's and r1's are {0,1} (distance 1).
+  EXPECT_EQ(table(0, dcCol), Id::makeFromDouble(0.0));
+  EXPECT_EQ(table(1, dcCol), Id::makeFromDouble(1.0));
+  EXPECT_EQ(table(2, dcCol), Id::makeFromDouble(1.0));
 }
 
 // _____________________________________________________________________________

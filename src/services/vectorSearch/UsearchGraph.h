@@ -117,8 +117,23 @@ inline uu::scalar_kind_t toUsearchScalar(VectorScalar s) {
       return uu::scalar_kind_t::i8_k;
     case VectorScalar::Bf16:
       return uu::scalar_kind_t::bf16_k;
+    case VectorScalar::Binary:
+      return uu::scalar_kind_t::b1x8_k;
   }
   return uu::scalar_kind_t::f32_k;
+}
+
+// The usearch metric kind of the coarse SCAN layer (`.data`) of an index with
+// scan scalar `scalar` and index metric `metric`: sign-packed `binary` rows
+// are compared by HAMMING distance -- the number of differing sign bits, an
+// integer in [0, dim] that serves as an angular proxy (the index's cosine
+// metric is not computable on packed bits) -- while every other scalar uses
+// the index metric directly. The fine RERANK layer of a two-layer index
+// always uses `toUsearchMetric(metric)`.
+inline uu::metric_kind_t toUsearchScanMetric(VectorScalar scalar,
+                                             VectorMetric metric) {
+  return scalar == VectorScalar::Binary ? uu::metric_kind_t::hamming_k
+                                        : toUsearchMetric(metric);
 }
 
 }  // namespace qlever::vector

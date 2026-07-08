@@ -68,6 +68,9 @@ struct VectorSearchConfiguration {
   // each result, for comparison against the fine `scoreVariable_` (e.g.
   // `ABS(?d - ?dc)` = the quantization error). On a single-layer index the
   // two layers coincide, so it binds the same distance as `scoreVariable_`.
+  // NOTE: on a `binary` scan layer the coarse distance is the integer HAMMING
+  // distance (0..dim, differing sign bits) -- a proxy on a DIFFERENT scale
+  // than the fine cosine distance, so `ABS(?d - ?dc)` is meaningless there.
   std::optional<Variable> coarseScoreVariable_;
 
   // Number of nearest neighbours to return.
@@ -79,8 +82,9 @@ struct VectorSearchConfiguration {
   bool keepAllCandidates_ = false;
 
   // Two-layer indices only: how many candidates the coarse scan pass keeps
-  // for the fine rerank pass (`vec:rerankK`). Unset = `max(10 * k, 100)`.
-  // Ignored on a single-layer index.
+  // for the fine rerank pass (`vec:rerankK`). Unset = `defaultRerankK` of the
+  // index's scan scalar (`max(10 * k, 100)`; the far coarser 1-bit `binary`
+  // layer keeps `max(50 * k, 500)`). Ignored on a single-layer index.
   std::optional<size_t> rerankK_;
 
   // Optional upper bound on the distance of returned neighbours.

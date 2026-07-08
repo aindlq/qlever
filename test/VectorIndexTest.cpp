@@ -6,6 +6,7 @@
 // which can be found in the `LICENSE` file at the root of the QLever project.
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -382,8 +383,8 @@ TEST(VectorIndex, exactSearchOverCandidateSubset) {
   withDups.insert(withDups.end(), subset.begin(), subset.end());
   size_t numScored = 999999;
   auto dupRes =
-      idx.searchExact(b.data.vecs[3], NUM_VECTORS,
-                      ql::span<const Id>{withDups}, std::nullopt, {}, &numScored);
+      idx.searchExact(b.data.vecs[3], NUM_VECTORS, ql::span<const Id>{withDups},
+                      std::nullopt, {}, &numScored);
   EXPECT_EQ(numScored, subset.size());
   EXPECT_EQ(dupRes.size(), std::min<size_t>(subset.size(), NUM_VECTORS));
   cleanup(b);
@@ -850,6 +851,85 @@ TEST(VectorIndex, i8RejectsNonCosineMetric) {
        {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
     std::error_code ec;
     std::filesystem::remove(basename + ".vec.q" + suffix, ec);
+  }
+}
+
+// _____________________________________________________________________________
+// `binary` storage: 1 bit per component, the 32x-smaller-than-f32 rung. Rows
+// are sign-packed (bit i set iff component i > 0) to `(dim + 7) / 8` bytes
+// (`rowBytesFor`; `dim * bytesPerScalar` is ill-defined and throws) and ranked
+// by the integer HAMMING distance -- also by the HNSW graph, which is built
+// over the packed rows with the Hamming metric.
+TEST(VectorIndex, binaryStorageHammingScan) {
+  // dim = 12 is deliberately NOT a multiple of 8: the last row byte is only
+  // half used, exercising both the packed row length `(dim + 7) / 8 = 2` and
+  // the per-row zeroing of the partial trailing byte (usearch's b1x8 cast
+  // only ORs bits into it -- a stale bit from the previous row would corrupt
+  // the Hamming distances of rows 9..12 below).
+  constexpr size_t dim = 12;
+  EXPECT_EQ(rowBytesFor(VectorScalar::Binary, dim), 2u);
+  // The headline storage math: dim 768 = 96 bytes per vector.
+  EXPECT_EQ(rowBytesFor(VectorScalar::Binary, 768), 96u);
+  EXPECT_ANY_THROW(bytesPerScalar(VectorScalar::Binary));
+
+  // Row i flips the FIRST i components of the all-positive base row to
+  // negative, so its sign pattern is at Hamming distance exactly i from
+  // row 0's.
+  auto row = [&](size_t i) {
+    std::vector<float> v(dim, 1.f);
+    for (size_t j = 0; j < i; ++j) v[j] = -1.f;
+    return v;
+  };
+  constexpr size_t numRows = dim + 1;  // Hamming distances 0..dim, no ties
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = "b";
+  cfg.dimensions_ = dim;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.scalar_ = VectorScalar::Binary;
+  cfg.buildHnsw_ = true;  // HNSW composes with the Hamming scan metric
+  cfg.hnswExpansionSearch_ = 200;
+  VectorIndexBuilder builder{basename, cfg};
+  for (size_t i = 0; i < numRows; ++i) {
+    builder.add(mkId(10 + i), "<http://ex/" + std::to_string(10 + i) + ">",
+                row(i));
+  }
+  auto meta = builder.build();
+  EXPECT_EQ(meta.rowStrideBytes_, 2u);
+
+  // Storage sanity: the `.data` payload is `numRows * (dim + 7) / 8` bytes
+  // (plus the MmapVector page rounding and its trailer).
+  const auto dataSize = std::filesystem::file_size(basename + ".vec.b.data");
+  EXPECT_GE(dataSize, numRows * 2);
+  EXPECT_LE(dataSize,
+            numRows * 2 + static_cast<std::uintmax_t>(getpagesize()) + 32);
+
+  VectorIndex idx;
+  idx.open(basename, "b");
+  EXPECT_EQ(idx.metadata().config_.scalar_, VectorScalar::Binary);
+  EXPECT_TRUE(idx.hasHnsw());
+  EXPECT_FALSE(idx.hasRerankLayer());
+
+  // A SINGLE-layer binary index serves Hamming distances everywhere:
+  // integers in [0, dim], here exactly i for row i against row 0's pattern.
+  auto res = idx.searchExact(row(0), numRows);
+  ASSERT_EQ(res.size(), numRows);
+  for (size_t i = 0; i < numRows; ++i) {
+    EXPECT_EQ(res[i].entity_, mkId(10 + i)) << i;
+    EXPECT_EQ(res[i].distance_, static_cast<float>(i)) << i;
+    EXPECT_GE(res[i].distance_, 0.f);
+    EXPECT_LE(res[i].distance_, static_cast<float>(dim));
+    EXPECT_EQ(res[i].distance_, std::floor(res[i].distance_)) << i;
+  }
+  // Stored-entity query through the HNSW graph: nearest is self, Hamming 0.
+  auto hnswRes = idx.searchHnswByEntity(mkId(10 + 3), 3);
+  ASSERT_FALSE(hnswRes.empty());
+  EXPECT_EQ(hnswRes.front().entity_, mkId(10 + 3));
+  EXPECT_EQ(hnswRes.front().distance_, 0.f);
+  for (auto* suffix :
+       {".meta", ".keys", ".rowmap", ".data", ".iris", ".hnsw"}) {
+    std::error_code ec;
+    std::filesystem::remove(basename + ".vec.b" + suffix, ec);
   }
 }
 

@@ -46,8 +46,8 @@ time is a separate, runtime-configured concern — Part 2 — not a build input.
 | `npy` | — | the `.npy` matrix (the vectors) |
 | `iris` | — | row-aligned entity-IRI list |
 | `metric` | `cosine` | `cosine` \| `dot` \| `l2` — the space's metric (distance is smaller-is-closer) |
-| `scalar` | `f32` | storage precision `f32` \| `f16` \| `bf16` \| `i8`, **independent** of the `.npy` dtype (an `<f4` file + `scalar:"bf16"` stores 2-byte bf16) |
-| `rerank` | *(unset)* | second-layer **rerank precision** `bf16` \| `f16` \| `f32`: builds a TWO-LAYER quantize+rerank store — a coarse `scalar` scan matrix (`.data`) **plus** a fine rerank matrix (`.rerank.data`) from the same input. Exact reads (`vec:distance`) use the fine layer; the `SERVICE` scans coarse and reranks fine. Unset = single-layer |
+| `scalar` | `f32` | storage precision `f32` \| `f16` \| `bf16` \| `i8` \| `binary` (1-bit sign-packed, `⌈dim/8⌉` bytes per row — dim 768 = 96 B/vector, 32× smaller than `f32`; coarse-ranked by **Hamming** distance, cosine-only, meant as the scan layer under a `rerank` layer), **independent** of the `.npy` dtype (an `<f4` file + `scalar:"bf16"` stores 2-byte bf16) |
+| `rerank` | *(unset)* | second-layer **rerank precision** `bf16` \| `f16` \| `f32` (never `i8`/`binary`): builds a TWO-LAYER quantize+rerank store — a coarse `scalar` scan matrix (`.data`) **plus** a fine rerank matrix (`.rerank.data`) from the same input. Exact reads (`vec:distance`) use the fine layer; the `SERVICE` scans coarse and reranks fine. Unset = single-layer |
 | `dimensions` | *(inferred)* | if set, cross-checked against the `.npy` shape → **hard error** on mismatch |
 | `hnsw` | `true` | build the HNSW graph (required for the `SERVICE`; exact brute force works without it) |
 | `hnswConnectivity` | `16` | HNSW graph degree (M) |
@@ -268,7 +268,8 @@ On a **two-layer** index (built with `rerank`, see Part 1) the top-k runs
 
 1. the *coarse pass* searches the quantized scan matrix (brute force, or HNSW
    per `vec:algorithm` — the graph reads the scan bytes) for the top-`rerankK`
-   candidates (`vec:rerankK`, default `max(10·k, 100)`);
+   candidates (`vec:rerankK`, default `max(10·k, 100)`; on a **`binary`** scan
+   layer `max(50·k, 500)` — 1-bit sign ranking is far coarser than `i8`);
 2. the *rerank pass* recomputes those candidates' distances **exactly** on the
    fine rerank matrix, sorts, and keeps the top `vec:k`.
 
@@ -279,6 +280,14 @@ per-row quantization error. `vec:maxDistance` filters on the fine distance.
 On a single-layer index the SERVICE behaves as before (single-precision
 top-k; `vec:rerankK` is ignored, `vec:bindCoarseScore` equals
 `vec:bindScore`).
+
+> **`binary` coarse-score caveat.** On a `binary` scan layer the coarse
+> distance is the raw **Hamming distance** — an *integer* in `[0, dim]`
+> (differing sign bits), a ranking proxy on a **different scale** than the
+> fine cosine score. It is deliberately not rescaled to the cosine range, so
+> `ABS(?d - ?dc)` is *not* the quantization error there (unlike `i8`);
+> `vec:bindCoarseScore` is still useful to see how the sign-bit pre-ranking
+> ordered a candidate.
 
 **The three SERVICE forms.** `vec:result ?out` is **required in every form**;
 the input-set parameter is `vec:candidates ?in` (the original name `vec:left`
@@ -348,7 +357,8 @@ mechanism, concisely.
   (prefetch-friendly), the result stays merge-joinable with QLever's sorted
   world, and the same matrix backs the HNSW graph.
 
-- **Precision & SIMD.** The stored scalar (`f32`/`f16`/`bf16`/`i8`) is used
+- **Precision & SIMD.** The stored scalar (`f32`/`f16`/`bf16`/`i8`/1-bit
+  `binary`) is used
   **as-is** — no up-conversion. Distances run through NumKong kernels that
   runtime-dispatch to the widest ISA the CPU has (AVX-512 FP16/BF16, AMX, NEON,
   …), reported once at startup (`Vector search SIMD: …`). *Why:* a brute-force
@@ -357,7 +367,8 @@ mechanism, concisely.
   away.
 
 - **Two-layer quantize + rerank** (`rerank` build key). One index can hold TWO
-  same-order matrices: a coarse scan layer (`scalar`, e.g. `i8` = 1 B/dim) and
+  same-order matrices: a coarse scan layer (`scalar`, e.g. `i8` = 1 B/dim, or
+  1-bit sign-packed `binary` = ⅛ B/dim scanned by Hamming distance) and
   a fine rerank layer (`rerank`, e.g. `bf16` = 2 B/dim). The split maps
   directly onto the query surfaces: the HNSW graph and the SERVICE's candidate
   scan read only the cheap coarse bytes, while **every exact primitive —
@@ -406,7 +417,7 @@ RDF resource. The divergence is **what the vector *is***.
 |---|---|---|
 | A vector is… | a first-class **RDF literal** `"[…]"^^emb:fp32Vector` in the vocabulary | **index payload** — bytes in a per-space matrix, never an RDF term |
 | Per-embedding RDF | reified `<e> emb:hasEmbedding _:b . _:b emb:asFp32Vector … ; emb:type …` | **none** (metadata is once **per index**, not per embedding) |
-| Precision | fp32 | f32 / f16 / **bf16** / i8, stored + scanned as-is |
+| Precision | fp32 | f32 / f16 / **bf16** / i8 / 1-bit **binary**, stored + scanned as-is |
 | Query vector | a materialised RDF literal you pass in | a **transient** typed value from `vec:embed`/`vec:vector`/inline |
 | Query-time embedding | none — precompute externally | **`vec:embed`** (text/image; http or `unix:` socket) |
 | ANN | none — brute-force only | optional **HNSW** via `SERVICE` (exact is the default) |

@@ -16,10 +16,10 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "services/vectorSearch/VectorQueryPoint.h"
-#include "util/Timer.h"
 #include "services/vectorSearch/VectorSearch.h"
 #include "util/HashMap.h"
 #include "util/HashSet.h"
+#include "util/Timer.h"
 
 // ____________________________________________________________________________
 VectorSearchJoin::VectorSearchJoin(
@@ -428,19 +428,22 @@ void VectorSearchJoin::computePreFilterRows(
     // Coarse pass over exactly the bound set, then the fine rerank pass over
     // the coarse survivors (never below `effectiveK`, so the annotate form
     // without `<k>` keeps every candidate). `maxDistance` filters on the
-    // FINE distance only.
-    const size_t rerankK = std::max(
-        config_.rerankK_.value_or(std::max<size_t>(10 * effectiveK, 100)),
-        effectiveK);
+    // FINE distance only. The default `rerankK` is scan-scalar dependent
+    // (`defaultRerankK`): the 1-bit binary layer pre-ranks far more coarsely
+    // than i8, so it keeps a wider candidate margin.
+    const size_t rerankK =
+        std::max(config_.rerankK_.value_or(qlever::vector::defaultRerankK(
+                     vidx.metadata().config_.scalar_, effectiveK)),
+                 effectiveK);
     ad_utility::Timer coarseTimer{ad_utility::Timer::Started};
     size_t coarseScored = 0;
-    auto coarse = queryEntity.has_value()
-                      ? vidx.searchExactCoarseByEntity(
-                            queryEntity.value(), rerankK, candidates,
-                            std::nullopt, checkInterrupt, &coarseScored)
-                      : vidx.searchExactCoarse(query, rerankK, candidates,
-                                               std::nullopt, checkInterrupt,
-                                               &coarseScored);
+    auto coarse =
+        queryEntity.has_value()
+            ? vidx.searchExactCoarseByEntity(queryEntity.value(), rerankK,
+                                             candidates, std::nullopt,
+                                             checkInterrupt, &coarseScored)
+            : vidx.searchExactCoarse(query, rerankK, candidates, std::nullopt,
+                                     checkInterrupt, &coarseScored);
     // `coarseScored` = candidates that HAVE a vector (were actually scored),
     // not the raw candidate count -- the merge-join skips the vectorless ones.
     qlever::vector::logVectorSearchPhase(
@@ -461,10 +464,9 @@ void VectorSearchJoin::computePreFilterRows(
                                        config_.maxDistance_, checkInterrupt)
             : vidx.searchExact(query, effectiveK, pruned, config_.maxDistance_,
                                checkInterrupt);
-    qlever::vector::logVectorSearchPhase(config_.indexName_,
-                                         "rerank (fine layer)",
-                                         rerankTimer.value().count() / 1000.0,
-                                         pruned.size());
+    qlever::vector::logVectorSearchPhase(
+        config_.indexName_, "rerank (fine layer)",
+        rerankTimer.value().count() / 1000.0, pruned.size());
   } else {
     ad_utility::Timer scanTimer{ad_utility::Timer::Started};
     size_t numScored = 0;

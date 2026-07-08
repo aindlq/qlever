@@ -265,14 +265,39 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
         "with `metric: cosine` (got `l2sq`/`innerProduct`). Use `f16` or "
         "`f32` for those metrics.");
   }
+  // The `binary` store keeps only the SIGN bit of each component and ranks by
+  // Hamming distance -- an angular proxy that carries no magnitude at all, so
+  // like i8 it is cosine-only.
+  if (spec.config_.scalar_ == VectorScalar::Binary &&
+      spec.config_.metric_ != VectorMetric::Cosine) {
+    AD_THROW(
+        "The `binary` scalar type keeps only the sign bit of each component "
+        "(ranked by Hamming distance, an angular proxy), so it only makes "
+        "sense with `metric: cosine` (got `l2sq`/`innerProduct`). Use `f16` "
+        "or `f32` for those metrics.");
+  }
   // The rerank layer is the HIGH-precision layer that exact distances read;
-  // a quantized i8 rerank matrix would defeat its purpose (and i8 carries the
-  // cosine-only restriction on top).
-  if (spec.config_.rerankScalar_ == VectorScalar::I8) {
+  // a quantized i8/binary rerank matrix would defeat its purpose (and both
+  // carry the cosine-only restriction on top).
+  if (spec.config_.rerankScalar_ == VectorScalar::I8 ||
+      spec.config_.rerankScalar_ == VectorScalar::Binary) {
     AD_THROW(
         "The `rerank` precision must be one of `bf16`, `f16`, or `f32` (the "
-        "high-precision layer the rerank pass and `vec:distance` read); `i8` "
-        "belongs in the `scalar` scan layer.");
+        "high-precision layer the rerank pass and `vec:distance` read); `" +
+        toString(spec.config_.rerankScalar_.value()) +
+        "` belongs in the `scalar` scan layer.");
+  }
+  // A binary index WITHOUT a rerank layer is allowed but every distance it
+  // can serve is the Hamming sign-bit proxy -- point that out at build time.
+  if (spec.config_.scalar_ == VectorScalar::Binary &&
+      !spec.config_.rerankScalar_.has_value()) {
+    AD_LOG_WARN
+        << "Vector index \"" << spec.config_.name_
+        << "\": `scalar: binary` without a `rerank` layer stores only the "
+           "sign bits; ALL distances (searches, `vec:distance`, scores) are "
+           "integer Hamming distances -- an approximate angular proxy, never "
+           "exact cosine. Add e.g. `\"rerank\": \"bf16\"` for exact scores."
+        << std::endl;
   }
   if (spec.config_.buildHnsw_ && spec.config_.hnswConnectivity_ < 2) {
     AD_THROW("`hnswConnectivity` must be at least 2.");

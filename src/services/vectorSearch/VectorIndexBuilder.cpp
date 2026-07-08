@@ -111,7 +111,10 @@ VectorIndexBuilder::VectorIndexBuilder(std::string basename,
              "dimension (" +
              std::to_string(config_.dimensions_) + ").");
   }
-  rowBytes_ = config_.dimensions_ * bytesPerScalar(config_.scalar_);
+  // Raw row byte length via `rowBytesFor`: `dim * bytesPerScalar`, except for
+  // the sign-packed `binary` scalar whose rows are `(dim + 7) / 8` bytes
+  // (usearch's f32 -> b1x8 cast packs bit i of a row iff component i > 0).
+  rowBytes_ = rowBytesFor(config_.scalar_, config_.dimensions_);
   fromF32_ =
       uu::casts_punned_t::make(toUsearchScalar(config_.scalar_)).from.f32;
   castBuffer_.resize(rowBytes_);
@@ -124,16 +127,18 @@ VectorIndexBuilder::VectorIndexBuilder(std::string basename,
              config_.name_ + "\" next to " + basename_);
   }
   // The optional fine rerank layer: a second, independently encoded spill of
-  // the SAME input rows (validated i8-free upstream in `parseSpec`; checked
-  // again here so direct builder users cannot request an i8 rerank layer).
+  // the SAME input rows (validated i8/binary-free upstream in `parseSpec`;
+  // checked again here so direct builder users cannot request a quantized
+  // rerank layer).
   if (config_.rerankScalar_.has_value()) {
-    if (config_.rerankScalar_.value() == VectorScalar::I8) {
+    if (config_.rerankScalar_.value() == VectorScalar::I8 ||
+        config_.rerankScalar_.value() == VectorScalar::Binary) {
       AD_THROW("The rerank layer of vector index \"" + config_.name_ +
-               "\" must be a high-precision scalar (bf16, f16, or f32), not "
-               "i8.");
+               "\" must be a high-precision scalar (bf16, f16, or f32), not " +
+               toString(config_.rerankScalar_.value()) + ".");
     }
     rerankRowBytes_ =
-        config_.dimensions_ * bytesPerScalar(config_.rerankScalar_.value());
+        rowBytesFor(config_.rerankScalar_.value(), config_.dimensions_);
     rerankFromF32_ =
         uu::casts_punned_t::make(toUsearchScalar(config_.rerankScalar_.value()))
             .from.f32;
@@ -170,8 +175,14 @@ void VectorIndexBuilder::add(Id entity, std::string_view iri,
              "\", which is configured with dimension " +
              std::to_string(config_.dimensions_) + ".");
   }
-  // Convert to the storage scalar (no-op for f32).
+  // Convert to the storage scalar (no-op for f32). The `binary` sign-pack
+  // cast (usearch's f32 -> b1x8) memsets only the `dim / 8` WHOLE output
+  // bytes and then ORs bits in, so a partial trailing byte would keep stale
+  // bits of the PREVIOUS row in the reused buffer -- zero it first.
   const char* rowBytesPtr = reinterpret_cast<const char*>(vector.data());
+  if (config_.scalar_ == VectorScalar::Binary) {
+    ql::ranges::fill(castBuffer_, char{0});
+  }
   if (fromF32_ != nullptr &&
       fromF32_(rowBytesPtr, config_.dimensions_, castBuffer_.data())) {
     rowBytesPtr = castBuffer_.data();
@@ -414,9 +425,13 @@ VectorIndexMetadata VectorIndexBuilder::build() {
                      "smaller scalar type (f16/i8) or more RAM."
                   << std::endl;
     }
-    uu::metric_punned_t metric{config_.dimensions_,
-                               toUsearchMetric(config_.metric_),
-                               toUsearchScalar(config_.scalar_)};
+    // The graph is built over the SCAN layer, so it uses the scan metric:
+    // HAMMING over the sign bits for a `binary` store (the reader's
+    // `graphMetric()` mirrors this), the index metric otherwise.
+    uu::metric_punned_t metric{
+        config_.dimensions_,
+        toUsearchScanMetric(config_.scalar_, config_.metric_),
+        toUsearchScalar(config_.scalar_)};
     FlatStoreMetric graphMetric{data.data(), stride, n, metric};
     GraphIndex graph{uu::index_config_t{config_.hnswConnectivity_,
                                         config_.hnswConnectivity_ * 2}};

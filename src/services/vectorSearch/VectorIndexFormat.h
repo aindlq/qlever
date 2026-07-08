@@ -8,6 +8,7 @@
 #ifndef QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEXFORMAT_H
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEXFORMAT_H
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -22,7 +23,8 @@
 //
 //   B.vec.N.meta    JSON metadata (this file's `VectorIndexMetadata`)
 //   B.vec.N.data    flat row-major matrix in the configured scalar type
-//                   (f32/f16/i8), stride = `dimensions` scalars. IMMUTABLE
+//                   (f32/f16/bf16/i8, or 1-bit sign-packed `binary`), row
+//                   length = `rowBytesFor(scalar, dimensions)`. IMMUTABLE
 //                   after the build: row indices are the permanent identity of
 //                   the vectors.
 //   B.vec.N.rerank.data
@@ -64,7 +66,9 @@ namespace qlever::vector {
 // `.rowmap` sidecars, tombstones (cheap remapping after a KG re-index);
 // 4 = `.data` holds the configured scalar type (f32/f16/i8) as raw bytes;
 // 5 = added an explicit per-row byte STRIDE (`rowStrideBytes_`); it always
-//     equals the natural row byte length `dimensions * bytesPerScalar`, so v5
+//     equals the natural row byte length `rowBytesFor(scalar, dimensions)`
+//     (`dimensions * bytesPerScalar`; `(dimensions + 7) / 8` for the packed
+//     1-bit `binary` scalar), so v5
 //     is otherwise identical to v4. (Historically v5 also allowed opt-in
 //     64-byte row padding; that build option was removed and the stride is now
 //     always the natural length.) Version 4 indices still load unchanged
@@ -140,11 +144,21 @@ enum class VectorMetric : uint8_t { Cosine, L2Sq, InnerProduct };
 // truncating it back to bf16 recovers the original bits exactly. NOTE: `I8`
 // rescales every vector to a common magnitude (usearch's dot-product-oriented
 // int8 cast), so it is only meaningful with the `cosine` metric (the builder
-// rejects `i8` + `l2sq`/`innerProduct`). (`Bf16` is appended after `I8` to
-// keep the preexisting enum values stable.)
-enum class VectorScalar : uint8_t { F32, F16, I8, Bf16 };
+// rejects `i8` + `l2sq`/`innerProduct`). `Binary` is the 1-BIT rung: only the
+// SIGN of each component is kept (bit i set iff component i > 0, packed 8 per
+// byte -- a row is `(dim + 7) / 8` bytes, see `rowBytesFor`), and rows are
+// compared by HAMMING distance (differing sign bits), an angular proxy --
+// like `i8` it is cosine-only, and it is meant as the coarse SCAN layer of a
+// two-layer index whose fine layer rescores exactly. (Values are appended in
+// the order the scalars were introduced to keep the preexisting enum values
+// stable.)
+enum class VectorScalar : uint8_t { F32, F16, I8, Bf16, Binary };
 
-// Bytes per stored scalar value.
+// Bytes per stored scalar value. UNDEFINED for `Binary` (a scalar is a single
+// bit, 8 packed per byte) -- every row/byte-length computation must go through
+// `rowBytesFor` below, which handles the packed-bit case; calling this with
+// `Binary` throws so a missed call site fails loudly instead of sizing a
+// matrix with 0-byte rows.
 inline size_t bytesPerScalar(VectorScalar s) {
   switch (s) {
     case VectorScalar::F32:
@@ -155,8 +169,30 @@ inline size_t bytesPerScalar(VectorScalar s) {
       return 1;
     case VectorScalar::Bf16:
       return 2;
+    case VectorScalar::Binary:
+      throw std::runtime_error(
+          "bytesPerScalar is undefined for the sub-byte `binary` scalar; "
+          "compute row lengths via rowBytesFor.");
   }
   return 4;
+}
+
+// Byte length of one row of `dim` scalars of type `s`: `dim` whole scalars,
+// except for the packed 1-bit `Binary` rows (8 sign bits per byte, the last
+// byte's unused bits zero-padded). The ONLY way row byte lengths may be
+// computed -- `dim * bytesPerScalar(s)` is wrong (and throws) for `Binary`.
+inline size_t rowBytesFor(VectorScalar s, size_t dim) {
+  return s == VectorScalar::Binary ? (dim + 7) / 8 : dim * bytesPerScalar(s);
+}
+
+// Default coarse-candidate count of the two-layer rerank pass when
+// `vec:rerankK` is unset (always additionally clamped to >= k by the
+// callers). The `binary` scan layer keeps 1 bit per component (vs i8's 8), so
+// its Hamming pre-ranking is far coarser and needs a wider candidate margin
+// for the fine rerank to recover the true top-k.
+inline size_t defaultRerankK(VectorScalar scanScalar, size_t k) {
+  return scanScalar == VectorScalar::Binary ? std::max<size_t>(50 * k, 500)
+                                            : std::max<size_t>(10 * k, 100);
 }
 
 // String conversions (used both for the SPARQL surface and the JSON metadata).
@@ -190,6 +226,8 @@ inline std::string toString(VectorScalar s) {
       return "i8";
     case VectorScalar::Bf16:
       return "bf16";
+    case VectorScalar::Binary:
+      return "binary";
   }
   return "f32";
 }
@@ -199,6 +237,7 @@ inline VectorScalar vectorScalarFromString(std::string_view s) {
   if (s == "f16") return VectorScalar::F16;
   if (s == "i8") return VectorScalar::I8;
   if (s == "bf16") return VectorScalar::Bf16;
+  if (s == "binary") return VectorScalar::Binary;
   throw std::runtime_error("Unknown vector scalar type: " + std::string{s});
 }
 
@@ -210,11 +249,12 @@ struct VectorIndexConfig {
   VectorScalar scalar_ = VectorScalar::F32;
   // Two-layer quantize+rerank build: when set, the builder writes -- from the
   // SAME f32 input -- BOTH the coarse scan matrix `.data` (in `scalar_`, e.g.
-  // i8) AND a second fine matrix `.rerank.data` at this precision (bf16, f16,
-  // or f32; NEVER i8 -- the rerank layer is the high-precision one). The fine
-  // layer carries the same metric. `nullopt` (the default) = single-layer,
-  // exactly as before. Storage cost = scan bytes + rerank bytes (e.g.
-  // i8 + bf16 = 3 bytes per dimension).
+  // i8 or binary) AND a second fine matrix `.rerank.data` at this precision
+  // (bf16, f16, or f32; NEVER i8/binary -- the rerank layer is the
+  // high-precision one). The fine layer carries the same metric. `nullopt`
+  // (the default) = single-layer, exactly as before. Storage cost = scan
+  // bytes + rerank bytes (e.g. i8 + bf16 = 3 bytes per dimension; binary +
+  // bf16 = 2.125 bytes per dimension).
   std::optional<VectorScalar> rerankScalar_;
   bool buildHnsw_ = true;
   // HNSW (usearch) build parameters.
@@ -278,7 +318,7 @@ struct VectorIndexMetadata {
   // that does not match.
   uint64_t vocabSize_ = 0;
   // Byte stride between consecutive rows in `.data`. Always the natural row
-  // byte length `dimensions * bytesPerScalar`. 0 means "not stored" (a v4
+  // byte length `rowBytesFor(scalar, dimensions)`. 0 means "not stored" (a v4
   // index), in which case the loader derives it as the raw row byte length.
   uint64_t rowStrideBytes_ = 0;
   // Fingerprint of the knowledge-graph vocabulary's collation

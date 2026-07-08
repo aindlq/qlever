@@ -47,7 +47,11 @@ IdTable computeWholeIndexSearch(
 // fine rerank matrix, and the top `k` by fine distance are returned.
 // `vec:bindScore` binds the fine distance (== the exact `vec:distance` of the
 // entity); `vec:bindCoarseScore` optionally binds the coarse scan distance
-// alongside it, so `ABS(?d - ?dc)` exposes the quantization error.
+// alongside it, so `ABS(?d - ?dc)` exposes the quantization error. EXCEPTION:
+// on a `binary` scan layer the coarse distance is the integer HAMMING
+// distance (0..dim differing sign bits) -- a ranking proxy on a different
+// scale than the fine cosine distance, deliberately NOT reconciled with it
+// (`ABS(?d - ?dc)` is meaningless there, unlike i8).
 //
 // (The "for each ?x, find similar" form is `VectorSearchJoin`; ranking an
 // existing candidate set is the `vec:distance` function + `ORDER BY`/`LIMIT`.)

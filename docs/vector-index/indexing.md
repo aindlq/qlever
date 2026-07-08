@@ -101,7 +101,7 @@ array (e.g. one for image embeddings, one for text).
 | `iris`    | path to the row-aligned IRI list                               |
 | `metric`  | `cosine` \| `dot` \| `l2` (distance; smaller = closer)         |
 | `hnsw`    | `true` builds the ANN graph; `false` = exact/flat store only   |
-| `scalar`  | *(optional)* storage precision `f32` (default) \| `f16` \| `bf16` \| `i8`|
+| `scalar`  | *(optional)* storage precision `f32` (default) \| `f16` \| `bf16` \| `i8` \| `binary` (1-bit sign-packed, see below) |
 | `rerank`  | *(optional)* second-layer **rerank precision** `bf16` \| `f16` \| `f32`; unset = single-layer. Builds a TWO-LAYER quantize+rerank store (see below) |
 | `embeddingUrl`   | *(optional)* embedding endpoint bound to this index (see below) |
 | `embeddingModel` | *(optional)* model name sent to that endpoint; also names the index's embedding space for the typed-query-vector comparability check (see "Typed query vectors") |
@@ -127,13 +127,35 @@ flat stores with identical row order:
   `i8`, the existing quantization path, unchanged). This is what brute-force
   candidate scans and the HNSW graph read.
 - `‹base›.vec.‹name›.rerank.data` — the fine **rerank** layer at the `rerank`
-  precision (`bf16`/`f16`/`f32`; never `i8` — it is the high-precision layer).
+  precision (`bf16`/`f16`/`f32`; never `i8`/`binary` — it is the
+  high-precision layer).
 
 Storage is the sum of the two layers (`i8` + `bf16` = 3 bytes per dimension —
 still 25 % less than a single `f32` store). Both layers carry the same metric;
 `i8` keeps its cosine-only restriction. The rerank precision is recorded in
 the `.meta` (`rerankScalar`); a `.meta` without the field is a normal
 single-layer index, so **existing indices load unchanged**.
+
+#### The `binary` scan layer (1 bit per component)
+
+`"scalar": "binary", "rerank": "bf16"` is the extreme rung of the same
+two-layer idea: the scan layer keeps only the **sign bit** of each component
+(bit set iff the component `> 0`, packed 8 per byte — a row is
+`⌈dim / 8⌉` bytes, e.g. **dim 768 = 96 bytes per vector**, 32× smaller than
+`f32`, 8× smaller than `i8`), and the coarse pass ranks candidates by the
+**Hamming distance** (the number of differing sign bits — an *angular proxy*,
+which is why `binary`, like `i8`, is **cosine-only**). The HNSW graph (if
+requested) is likewise built over the packed sign bits with the Hamming
+metric. Because 1-bit ranking is much coarser than `i8`, the default
+`vec:rerankK` widens from `max(10·k, 100)` to `max(50·k, 500)`.
+
+A `binary` index **wants a rerank layer**: without one, *every* distance the
+index can serve — searches, `vec:distance`, `vec:bindScore` — is the integer
+Hamming proxy, never an exact cosine (allowed, and the build logs a warning).
+And note the coarse-score caveat: on a binary index `vec:bindCoarseScore` is
+the raw Hamming distance (an integer in `[0, dim]`), which lives on a
+*different scale* than the fine cosine score — `ABS(?d - ?dc)` is **not** the
+quantization error there (unlike on an `i8` scan layer).
 
 What each layer serves at query time:
 

@@ -16,8 +16,8 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "services/vectorSearch/VectorQueryPoint.h"
-#include "util/Timer.h"
 #include "util/HashMap.h"
+#include "util/Timer.h"
 
 namespace {
 // Append a string to a cache key unambiguously (length-prefixed, so crafted
@@ -117,10 +117,13 @@ IdTable computeWholeIndexSearch(
     // (2) the rerank pass recomputes their distances EXACTLY on the fine
     // rerank matrix and keeps the top `k`. `maxDistance` filters on the FINE
     // distance only -- the coarse pass must not drop near-boundary candidates
-    // by their quantized distance.
-    const size_t rerankK = std::max(
-        config.rerankK_.value_or(std::max<size_t>(10 * config.k_, 100)),
-        config.k_);
+    // by their quantized distance. The default `rerankK` is scan-scalar
+    // dependent (`defaultRerankK`): the 1-bit binary layer pre-ranks far more
+    // coarsely than i8, so it keeps a wider candidate margin.
+    const size_t rerankK =
+        std::max(config.rerankK_.value_or(defaultRerankK(
+                     vidx->metadata().config_.scalar_, config.k_)),
+                 config.k_);
     ad_utility::Timer coarseTimer{ad_utility::Timer::Started};
     std::vector<ScoredEntity> coarse;
     if (queryEntity.has_value()) {
@@ -165,16 +168,18 @@ IdTable computeWholeIndexSearch(
     ad_utility::Timer scanTimer{ad_utility::Timer::Started};
     if (queryEntity.has_value()) {
       results =
-          useHnsw ? vidx->searchHnswByEntity(queryEntity.value(), config.k_,
-                                             config.maxDistance_, checkInterrupt)
-                  : vidx->searchExactByEntity(queryEntity.value(), config.k_,
-                                              std::nullopt, config.maxDistance_,
-                                              checkInterrupt);
+          useHnsw
+              ? vidx->searchHnswByEntity(queryEntity.value(), config.k_,
+                                         config.maxDistance_, checkInterrupt)
+              : vidx->searchExactByEntity(queryEntity.value(), config.k_,
+                                          std::nullopt, config.maxDistance_,
+                                          checkInterrupt);
     } else {
-      results = useHnsw ? vidx->searchHnsw(query, config.k_, config.maxDistance_,
-                                           checkInterrupt)
-                        : vidx->searchExact(query, config.k_, std::nullopt,
-                                            config.maxDistance_, checkInterrupt);
+      results = useHnsw
+                    ? vidx->searchHnsw(query, config.k_, config.maxDistance_,
+                                       checkInterrupt)
+                    : vidx->searchExact(query, config.k_, std::nullopt,
+                                        config.maxDistance_, checkInterrupt);
     }
     logVectorSearchPhase(
         config.indexName_, useHnsw ? "HNSW probe" : "brute-force scan",
