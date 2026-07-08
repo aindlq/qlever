@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -132,6 +133,44 @@ void writeNpyColumn(const std::string& npyPath,
             values.size() * sizeof(float));
 }
 
+// Write `rows` as a bf16 `.npy` (descr '<V2', the ml_dtypes bfloat16 on-disk
+// form: each value is the top 16 bits of its fp32, little-endian) + the IRIs.
+// Same bundle as `writeNpyBundle` but the exact input format the user builds
+// from -- the path none of the f32 tests exercise.
+void writeBf16NpyBundle(
+    const std::string& npyPath, const std::string& irisPath,
+    const std::vector<std::pair<std::string, std::vector<float>>>& rows) {
+  const size_t numRows = rows.size();
+  const size_t dim = rows.front().second.size();
+  std::string dict = "{'descr': '<V2', 'fortran_order': False, 'shape': (" +
+                     std::to_string(numRows) + ", " + std::to_string(dim) +
+                     "), }";
+  size_t pad = (64 - ((10 + dict.size() + 1) % 64)) % 64;
+  dict.append(pad, ' ');
+  dict.push_back('\n');
+  std::ofstream out{npyPath, std::ios::binary};
+  out.write("\x93NUMPY", 6);
+  char version[2] = {1, 0};
+  out.write(version, 2);
+  uint16_t headerLen = static_cast<uint16_t>(dict.size());
+  char lenBytes[2] = {static_cast<char>(headerLen & 0xff),
+                      static_cast<char>((headerLen >> 8) & 0xff)};
+  out.write(lenBytes, 2);
+  out.write(dict.data(), dict.size());
+  std::ofstream irisOut{irisPath};
+  for (const auto& [iri, vec] : rows) {
+    for (float v : vec) {
+      uint32_t bits = 0;
+      std::memcpy(&bits, &v, sizeof(bits));
+      auto bf16 = static_cast<uint16_t>(bits >> 16);  // truncate to bf16
+      char b[2] = {static_cast<char>(bf16 & 0xff),
+                   static_cast<char>((bf16 >> 8) & 0xff)};
+      out.write(b, 2);
+    }
+    irisOut << iri << "\n";
+  }
+}
+
 // The shared test context: THREE indices over the same vectors, built through
 // the REGISTERED build/load hooks (the `--service-index` path incl. the
 // csls keys of `parseSpec`):
@@ -150,7 +189,12 @@ QueryExecutionContext* qecWithCslsIndexes() {
   std::string npy = basename + ".input.npy";
   std::string iris = basename + ".input.iris";
   std::string rNpy = basename + ".input.r.npy";
+  std::string bnpy = basename + ".input.bf16.npy";
+  std::string bIris = basename + ".input.bf16.iris";
   writeNpyBundle(npy, iris, cslsTestVectors());
+  // Same vectors as `embc`, but fed as a bf16 `.npy` -- the exact input format
+  // the user builds from (the f32 path is otherwise the only one tested).
+  writeBf16NpyBundle(bnpy, bIris, cslsTestVectors());
   // The known r(d) column of the "embr" ingestion index, row-aligned with the
   // input rows a..e.
   writeNpyColumn(rNpy, {0.1f, 0.2f, 0.3f, 0.4f, 0.5f});
@@ -182,6 +226,15 @@ QueryExecutionContext* qecWithCslsIndexes() {
                                              {"metric", "cosine"},
                                              {"hnsw", true},
                                              {"csls", true},
+                                             {"cslsNeighbors", 2}},
+                              nlohmann::json{{"name", "embbf16"},
+                                             {"npy", bnpy},
+                                             {"iris", bIris},
+                                             {"metric", "cosine"},
+                                             {"scalar", "binary"},
+                                             {"rerank", "bf16"},
+                                             {"hnsw", false},
+                                             {"csls", true},
                                              {"cslsNeighbors", 2}}})}};
   for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
     hook(qec->getIndex(), basename, spec);
@@ -196,7 +249,8 @@ QueryExecutionContext* qecWithCslsIndexes() {
   qec->setLocatedTriplesForEvaluation(
       impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
   // The load hook memory-maps everything; the directory entries can go.
-  for (std::string_view name : {"embc", "embr", "embplain", "embchnsw"}) {
+  for (std::string_view name :
+       {"embc", "embr", "embplain", "embchnsw", "embbf16"}) {
     for (std::string_view suffix :
          {".meta", ".keys", ".rowmap", ".data", ".rerank.data", ".iris",
           ".hnsw", ".csls"}) {
@@ -206,7 +260,8 @@ QueryExecutionContext* qecWithCslsIndexes() {
     }
   }
   for (std::string_view suffix :
-       {".input.npy", ".input.iris", ".input.r.npy"}) {
+       {".input.npy", ".input.iris", ".input.r.npy", ".input.bf16.npy",
+        ".input.bf16.iris"}) {
     std::error_code ec;
     std::filesystem::remove(basename + std::string{suffix}, ec);
   }
@@ -423,6 +478,28 @@ TEST(VectorCsls, cslsLeavesMainGraphDefaultsUntouched) {
   ASSERT_TRUE(plain != nullptr);
   EXPECT_EQ(plain->metadata().config_.hnswConnectivity_, 16u);
   EXPECT_EQ(plain->metadata().config_.hnswExpansionAdd_, 128u);
+}
+
+// _____________________________________________________________________________
+// r(d) from a BF16 `.npy` input (binary+bf16 -- the user's exact build format)
+// must match the f32-input r(d) for the SAME vectors. A saturated (~1.0) result
+// here would pin the bug on the bf16 input path, not the data.
+TEST(VectorCsls, bf16NpyInputRdMatchesF32Input) {
+  auto* qec = qecWithCslsIndexes();
+  auto getId = makeGetId(qec->getIndex());
+  auto f32 = qlever::vector::getVectorIndex(qec->getIndex(), "embc");
+  auto bf16 = qlever::vector::getVectorIndex(qec->getIndex(), "embbf16");
+  ASSERT_TRUE(f32 != nullptr);
+  ASSERT_TRUE(bf16 != nullptr);
+  for (std::string_view iri : {"<a>", "<b>", "<c>", "<d>", "<e>"}) {
+    Id e = getId(std::string{iri});
+    auto rf = f32->cslsRForEntity(e);
+    auto rb = bf16->cslsRForEntity(e);
+    ASSERT_TRUE(rf.has_value()) << iri;
+    ASSERT_TRUE(rb.has_value()) << iri;
+    EXPECT_NEAR(rb.value(), rf.value(), 3e-2f)
+        << iri << ": bf16 r(d)=" << rb.value() << " vs f32 r(d)=" << rf.value();
+  }
 }
 
 // _____________________________________________________________________________
@@ -1065,3 +1142,4 @@ TEST(VectorCsls, parseErrors) {
                       "vec:bindCsls ?x .")),
       HasSubstr("must be different"));
 }
+
