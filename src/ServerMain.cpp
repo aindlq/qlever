@@ -17,6 +17,7 @@
 #include "global/Constants.h"
 #include "global/RuntimeParameters.h"
 #include "libqlever/Qlever.h"
+#include "util/JemallocLibraryHooks.h"
 #include "util/MemorySize/MemorySize.h"
 #include "util/ParseableDuration.h"
 #include "util/ProgramOptionsHelpers.h"
@@ -29,6 +30,7 @@ namespace po = boost::program_options;
 
 // Main function.
 int main(int argc, char** argv) {
+  ad_utility::installLibraryAllocatorHooks();
   // TODO<joka921> This is a hack, because the unit tests currently don't work
   // with the strip-columns feature.
   setRuntimeParameter<&RuntimeParameters::stripColumns_>(true);
