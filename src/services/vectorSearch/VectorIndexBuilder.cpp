@@ -154,6 +154,92 @@ void logCslsDistribution(const std::string& indexName,
   }
 }
 
+// Write a self-contained CSLS r(d) diagnostic to `logPath`. Enabled by setting
+// the `CSLS_DEBUG_LOG` environment variable at index time. For a spread of
+// sample rows it records: the fine-store size vs. what the row stride implies,
+// the self-distance (must be ~0), the generation's r(d), an EXACT brute-force
+// r(d) (full scan over the fine layer -- the ground truth), and the dedicated
+// graph's returned candidates. If the generation r(d) is ~1.0 while the
+// brute-force r(d) is much lower, the dedicated graph is returning wrong
+// candidates; if BOTH are ~1.0, the fine layer itself reads identical/aliased
+// rows; if they agree, r(d) is genuinely that value.
+void writeCslsDebugLog(const std::string& logPath, const std::string& name,
+                       const std::vector<float>& cslsR, const CslsFineLayer& fine,
+                       size_t n, size_t k, size_t numThreads,
+                       const std::vector<std::string>& graphCands) {
+  std::ofstream log{logPath, std::ios::trunc};
+  if (!log.is_open()) {
+    AD_LOG_WARN << "CSLS_DEBUG_LOG: could not open " << logPath << std::endl;
+    return;
+  }
+  log << "=== CSLS r(d) diagnostic: index '" << name << "' ===\n";
+  const size_t expected = n * fine.rowBytes_;
+  const size_t actual = fine.data_.size();
+  log << "n=" << n << "  cslsNeighbors(k)=" << k
+      << "  fineRowBytes=" << fine.rowBytes_ << "\n";
+  log << "fine store: stride implies " << expected << " bytes, mmapped "
+      << actual << " bytes -> "
+      << (expected == actual ? "OK" : "*** MISMATCH / CORRUPT ***") << "\n\n";
+
+  std::vector<size_t> samples;
+  for (size_t t = 0; t <= 20 && n > 0; ++t) {
+    samples.push_back((n - 1) * t / 20);
+    if (n <= 20) break;
+  }
+
+  {
+    std::vector<float> s = cslsR;
+    ql::ranges::sort(s);
+    log << "generation r(d): min=" << s.front() << " p50=" << s[s.size() / 2]
+        << " p95=" << s[std::min(s.size() - 1, (s.size() * 95) / 100)]
+        << " max=" << s.back() << "\n\n";
+  }
+
+  log << "=== self-distance fine.distance(row,row) (must be ~0) ===\n";
+  for (size_t row : samples) {
+    log << "  row " << row << "  selfDist=" << fine.distance(row, row)
+        << "  gen_r(d)=" << cslsR[row] << "\n";
+  }
+  log << "\n=== EXACT brute-force r(d) (full fine scan) vs generation r(d) ===\n";
+  std::vector<std::string> lines(samples.size());
+  parallelOverRows(
+      samples.size(), std::max<size_t>(1, std::min(numThreads, samples.size())),
+      [&](size_t, size_t first, size_t last, auto&) {
+        for (size_t si = first; si < last; ++si) {
+          const size_t row = samples[si];
+          CslsNeighborhood top{k};
+          float nearest = 2.0f;
+          size_t nearestRow = row;
+          for (size_t j = 0; j < n; ++j) {
+            if (j == row) continue;
+            const float d = fine.distance(row, j);
+            top.offer(d);
+            if (d < nearest) {
+              nearest = d;
+              nearestRow = j;
+            }
+          }
+          lines[si] = "  row " + std::to_string(row) + "  brute_r(d)=" +
+                      std::to_string(top.meanCosSim()) + "  gen_r(d)=" +
+                      std::to_string(cslsR[row]) + "  true_nearest_cos=" +
+                      std::to_string(1.0f - nearest) + "  (nearestRow=" +
+                      std::to_string(nearestRow) + ")";
+        }
+      });
+  for (const auto& l : lines) {
+    log << l << "\n";
+  }
+  if (!graphCands.empty()) {
+    log << "\n=== dedicated-graph candidates for sample rows "
+           "(key(d=fine cosine dist)) ===\n";
+    for (const auto& c : graphCands) {
+      log << "  " << c << "\n";
+    }
+  }
+  log << "\n(end of diagnostic)\n";
+  log.flush();
+}
+
 }  // namespace
 
 // ____________________________________________________________________________
@@ -628,6 +714,16 @@ VectorIndexMetadata VectorIndexBuilder::build() {
       const CslsFineLayer fine = openFineLayer();
       const size_t k = config_.cslsNeighbors_;
       cslsR.assign(n, 0.f);
+      // Optional diagnostic (env `CSLS_DEBUG_LOG`): capture the dedicated
+      // graph's candidates for a spread of sample rows, then dump a full
+      // diagnostic file next to the index. Inert unless the env var is set.
+      const bool cslsDebug = std::getenv("CSLS_DEBUG_LOG") != nullptr;
+      std::mutex cslsDebugMutex;
+      std::vector<std::string> cslsDebugCands;
+      auto isCslsDebugRow = [&, n](size_t row) {
+        return cslsDebug &&
+               (row == 0 || row + 1 == n || (n >= 20 && row % (n / 20) == 0));
+      };
       if (n < cslsBruteForceMax_) {
         // EXACT r(d): for each row, scan every row's fine distance and keep
         // the top-k (self-excluded). O(n^2), but exact -- the preferred path
@@ -739,11 +835,31 @@ VectorIndexMetadata VectorIndexBuilder::build() {
                   top.offer(fine.distance(row, cand[i]));
                 }
                 cslsR[row] = top.meanCosSim();
+                if (isCslsDebugRow(row)) {
+                  std::string dbg = "graph row " + std::to_string(row) +
+                                    " count=" + std::to_string(count) +
+                                    " gen_r=" + std::to_string(cslsR[row]) +
+                                    " cands:";
+                  for (size_t i = 0; i < count && i < 12; ++i) {
+                    dbg += " k=" + std::to_string(cand[i]) +
+                           (cand[i] == row ? "[self]" : "") + "(d=" +
+                           std::to_string(fine.distance(row, cand[i])) + ")";
+                  }
+                  std::lock_guard<std::mutex> lg{cslsDebugMutex};
+                  cslsDebugCands.push_back(std::move(dbg));
+                }
               }
             });
         // `fineGraph` is discarded here: it is a build-time tool only and is
         // never persisted (the on-disk `.hnsw`, if any, is the main
         // query-time graph of step 6).
+      }
+      if (cslsDebug) {
+        writeCslsDebugLog(cslsPath + ".debug.txt", config_.name_, cslsR, fine, n,
+                          k, numThreads, cslsDebugCands);
+        AD_LOG_WARN << "Vector index \"" << config_.name_
+                    << "\": wrote CSLS r(d) diagnostic to " << cslsPath
+                    << ".debug.txt (CSLS_DEBUG_LOG set)" << std::endl;
       }
     }
     AD_CORRECTNESS_CHECK(cslsR.size() == n);
