@@ -8,6 +8,8 @@
 #ifndef QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORQUERYPOINT_H
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORQUERYPOINT_H
 
+#include <optional>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -41,6 +43,14 @@ using QueryPoint = std::variant<std::monostate, std::vector<float>, Id>;
 QueryPoint resolveQueryPoint(const VectorSearchConfiguration& config,
                              const VectorIndex& vidx, const IndexImpl& index,
                              ad_utility::SharedCancellationHandle handle);
+
+// Log one phase of a vector SERVICE search at INFO (mirroring the `vec:distance`
+// timing line), so a SERVICE query reports where its time went: query embedding,
+// the brute-force/coarse scan, and the rerank pass. `numVectors`, when given, is
+// the number of vectors that phase touched.
+void logVectorSearchPhase(std::string_view indexName, std::string_view phase,
+                          double milliseconds,
+                          std::optional<size_t> numVectors = std::nullopt);
 
 }  // namespace qlever::vector
 

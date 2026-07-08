@@ -17,8 +17,21 @@
 #include "rdfTypes/Iri.h"
 #include "services/vectorSearch/EmbeddingClient.h"
 #include "services/vectorSearch/VectorIndex.h"
+#include "util/Log.h"
+#include "util/Timer.h"
 
 namespace qlever::vector {
+
+// _____________________________________________________________________________
+void logVectorSearchPhase(std::string_view indexName, std::string_view phase,
+                          double milliseconds,
+                          std::optional<size_t> numVectors) {
+  std::string count = numVectors.has_value()
+                          ? absl::StrCat(" ", numVectors.value(), " vec")
+                          : std::string{};
+  AD_LOG_INFO << "vec:search[" << indexName << "]: " << phase << count << " "
+              << milliseconds << " ms" << std::endl;
+}
 
 namespace {
 // Turn an image query into the payload sent to the embedding endpoint: a URL is
@@ -58,8 +71,11 @@ QueryPoint resolveQueryPoint(const VectorSearchConfiguration& config,
           "' has no embedding endpoint configured, so `vec:queryText` cannot "
           "be used.")};
     }
+    ad_utility::Timer embedTimer{ad_utility::Timer::Started};
     query = embedTextOpenAI(meta.embeddingUrl_, meta.embeddingModel_,
                             config.queryText_.value(), std::move(handle));
+    logVectorSearchPhase(config.indexName_, "query embedding (text)",
+                         embedTimer.value().count() / 1000.0);
   } else if (config.queryImage_.has_value()) {
     const auto& meta = vidx.metadata().config_;
     if (meta.embeddingUrl_.empty()) {
@@ -68,9 +84,12 @@ QueryPoint resolveQueryPoint(const VectorSearchConfiguration& config,
           "' has no embedding endpoint configured, so image queries cannot be "
           "used.")};
     }
+    ad_utility::Timer embedTimer{ad_utility::Timer::Started};
     query = embedImageOpenAI(meta.embeddingUrl_, meta.embeddingModel_,
                              buildImagePayload(config.queryImage_.value()),
                              std::move(handle));
+    logVectorSearchPhase(config.indexName_, "query embedding (image)",
+                         embedTimer.value().count() / 1000.0);
   } else {
     TripleComponent tc{ad_utility::triple_component::Iri::fromIriref(
         config.queryEntityIri_.value())};

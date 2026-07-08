@@ -16,6 +16,7 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "services/vectorSearch/VectorQueryPoint.h"
+#include "util/Timer.h"
 #include "services/vectorSearch/VectorSearch.h"
 #include "util/HashMap.h"
 #include "util/HashSet.h"
@@ -413,12 +414,16 @@ void VectorSearchJoin::computePreFilterRows(
     const size_t rerankK = std::max(
         config_.rerankK_.value_or(std::max<size_t>(10 * effectiveK, 100)),
         effectiveK);
+    ad_utility::Timer coarseTimer{ad_utility::Timer::Started};
     auto coarse = queryEntity.has_value()
                       ? vidx.searchExactCoarseByEntity(
                             queryEntity.value(), rerankK, candidates,
                             std::nullopt, checkInterrupt)
                       : vidx.searchExactCoarse(query, rerankK, candidates,
                                                std::nullopt, checkInterrupt);
+    qlever::vector::logVectorSearchPhase(
+        config_.indexName_, "brute-force scan (coarse layer, candidate set)",
+        coarseTimer.value().count() / 1000.0, candidates.size());
     std::vector<Id> pruned;
     pruned.reserve(coarse.size());
     for (const auto& hit : coarse) {
@@ -427,19 +432,28 @@ void VectorSearchJoin::computePreFilterRows(
         coarseDistances[hit.entity_] = hit.distance_;
       }
     }
+    ad_utility::Timer rerankTimer{ad_utility::Timer::Started};
     scored =
         queryEntity.has_value()
             ? vidx.searchExactByEntity(queryEntity.value(), effectiveK, pruned,
                                        config_.maxDistance_, checkInterrupt)
             : vidx.searchExact(query, effectiveK, pruned, config_.maxDistance_,
                                checkInterrupt);
+    qlever::vector::logVectorSearchPhase(config_.indexName_,
+                                         "rerank (fine layer)",
+                                         rerankTimer.value().count() / 1000.0,
+                                         pruned.size());
   } else {
+    ad_utility::Timer scanTimer{ad_utility::Timer::Started};
     scored = queryEntity.has_value()
                  ? vidx.searchExactByEntity(queryEntity.value(), effectiveK,
                                             candidates, config_.maxDistance_,
                                             checkInterrupt)
                  : vidx.searchExact(query, effectiveK, candidates,
                                     config_.maxDistance_, checkInterrupt);
+    qlever::vector::logVectorSearchPhase(
+        config_.indexName_, "brute-force scan (candidate set)",
+        scanTimer.value().count() / 1000.0, candidates.size());
   }
 
   // The fine distance of every KEPT candidate.

@@ -16,6 +16,7 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "services/vectorSearch/VectorQueryPoint.h"
+#include "util/Timer.h"
 #include "util/HashMap.h"
 
 namespace {
@@ -120,6 +121,7 @@ IdTable computeWholeIndexSearch(
     const size_t rerankK = std::max(
         config.rerankK_.value_or(std::max<size_t>(10 * config.k_, 100)),
         config.k_);
+    ad_utility::Timer coarseTimer{ad_utility::Timer::Started};
     std::vector<ScoredEntity> coarse;
     if (queryEntity.has_value()) {
       coarse = useHnsw ? vidx->searchHnswByEntity(queryEntity.value(), rerankK,
@@ -133,6 +135,12 @@ IdTable computeWholeIndexSearch(
                        : vidx->searchExactCoarse(query, rerankK, std::nullopt,
                                                  std::nullopt, checkInterrupt);
     }
+    logVectorSearchPhase(
+        config.indexName_,
+        useHnsw ? "coarse HNSW probe" : "brute-force scan (coarse layer)",
+        coarseTimer.value().count() / 1000.0,
+        useHnsw ? std::optional<size_t>{}
+                : std::optional<size_t>{vidx->numLiveVectors()});
     std::vector<Id> candidates;
     candidates.reserve(coarse.size());
     for (const auto& hit : coarse) {
@@ -143,24 +151,36 @@ IdTable computeWholeIndexSearch(
     }
     // Fine pass: exact distances over exactly the coarse candidates (the
     // restricted `searchExact` merge-joins them against the id-sorted store).
+    ad_utility::Timer rerankTimer{ad_utility::Timer::Started};
     results = queryEntity.has_value()
                   ? vidx->searchExactByEntity(queryEntity.value(), config.k_,
                                               candidates, config.maxDistance_,
                                               checkInterrupt)
                   : vidx->searchExact(query, config.k_, candidates,
                                       config.maxDistance_, checkInterrupt);
-  } else if (queryEntity.has_value()) {
-    results =
-        useHnsw ? vidx->searchHnswByEntity(queryEntity.value(), config.k_,
-                                           config.maxDistance_, checkInterrupt)
-                : vidx->searchExactByEntity(queryEntity.value(), config.k_,
-                                            std::nullopt, config.maxDistance_,
-                                            checkInterrupt);
+    logVectorSearchPhase(config.indexName_, "rerank (fine layer)",
+                         rerankTimer.value().count() / 1000.0,
+                         candidates.size());
   } else {
-    results = useHnsw ? vidx->searchHnsw(query, config.k_, config.maxDistance_,
-                                         checkInterrupt)
-                      : vidx->searchExact(query, config.k_, std::nullopt,
-                                          config.maxDistance_, checkInterrupt);
+    ad_utility::Timer scanTimer{ad_utility::Timer::Started};
+    if (queryEntity.has_value()) {
+      results =
+          useHnsw ? vidx->searchHnswByEntity(queryEntity.value(), config.k_,
+                                             config.maxDistance_, checkInterrupt)
+                  : vidx->searchExactByEntity(queryEntity.value(), config.k_,
+                                              std::nullopt, config.maxDistance_,
+                                              checkInterrupt);
+    } else {
+      results = useHnsw ? vidx->searchHnsw(query, config.k_, config.maxDistance_,
+                                           checkInterrupt)
+                        : vidx->searchExact(query, config.k_, std::nullopt,
+                                            config.maxDistance_, checkInterrupt);
+    }
+    logVectorSearchPhase(
+        config.indexName_, useHnsw ? "HNSW probe" : "brute-force scan",
+        scanTimer.value().count() / 1000.0,
+        useHnsw ? std::optional<size_t>{}
+                : std::optional<size_t>{vidx->numLiveVectors()});
   }
 
   idTable.resize(results.size());
