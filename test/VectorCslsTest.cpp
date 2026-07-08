@@ -442,6 +442,61 @@ TEST(VectorCsls, binaryScanRdReScoresOnBf16NotCoarse) {
 }
 
 // _____________________________________________________________________________
+// The binary self-kNN AT SCALE: with N (1200) > the fetch (500), the binary
+// Hamming HNSW search actually drives candidate selection (unlike the small
+// case that fetches everything). For varied vectors r(d) must stay SPREAD --
+// a saturated r(d) here would prove the binary-search path corrupts the bf16
+// score. (dim 48 -> binary codes are ~unique, so no collision artefacts.)
+TEST(VectorCsls, binaryScanRdNotSaturatedWhenFetchBelowN) {
+  constexpr size_t N = 1200;
+  constexpr size_t D = 48;
+  std::mt19937 rng{777};
+  std::normal_distribution<float> g{0.f, 1.f};
+  std::vector<std::vector<float>> vecs(N, std::vector<float>(D));
+  for (auto& v : vecs) {
+    float norm = 0;
+    for (auto& x : v) {
+      x = g(rng);
+      norm += x * x;
+    }
+    norm = std::sqrt(norm);
+    for (auto& x : v) x /= norm;
+  }
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = "csbinbig";
+  cfg.dimensions_ = D;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.buildHnsw_ = true;
+  cfg.csls_ = true;
+  cfg.cslsNeighbors_ = 10;
+  cfg.scalar_ = VectorScalar::Binary;
+  cfg.rerankScalar_ = VectorScalar::Bf16;
+  VectorIndexBuilder builder{basename, cfg};
+  for (size_t i = 0; i < N; ++i) {
+    builder.add(mkId(1000 + i * 7),
+                "<http://ex/" + std::to_string(i) + ">", vecs[i]);
+  }
+  builder.build();
+  VectorIndex idx;
+  idx.open(basename, "csbinbig");
+  size_t saturated = 0;
+  for (size_t i = 0; i < N; ++i) {
+    auto r = idx.cslsRForEntity(mkId(1000 + i * 7));
+    ASSERT_TRUE(r.has_value());
+    if (r.value() > 0.95f) {
+      ++saturated;
+    }
+  }
+  // Random unit vectors in dim-48 have moderate neighbour cosines (~0.4-0.6),
+  // so almost nothing should saturate; a wall of ~1.0 would be a binary-path
+  // bug, not the data.
+  EXPECT_LT(saturated, N / 10)
+      << saturated << "/" << N << " rows r(d) > 0.95 (binary path corrupts?)";
+  cleanupTmp(basename, "csbinbig");
+}
+
+// _____________________________________________________________________________
 // Direct-builder `cslsR` ingestion: the given values are stored VERBATIM in
 // the `.csls` sidecar, following the rows through the id sort (rows are added
 // in descending id order here).
