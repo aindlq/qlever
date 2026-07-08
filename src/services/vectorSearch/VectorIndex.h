@@ -41,6 +41,17 @@ struct ScoredEntity {
   float distance_;
 };
 
+// One survivor of a CSLS-filtered search (`searchCsls*`): the entity, its
+// COSINE DISTANCE to the query (what `vec:bindScore` binds and what results
+// sort by -- CSLS is the cut, not the score), and its CSLS value
+// `2 * cos_sim(q, d) - r(q) - r(d)` (>= the caller's threshold; what
+// `vec:bindCsls` binds).
+struct CslsScoredEntity {
+  Id entity_;
+  float distance_;
+  float csls_;
+};
+
 // A callback that long-running searches invoke periodically so the caller can
 // throw on query cancellation/timeout (see `Operation::checkCancellation`).
 // An empty function disables the checks.
@@ -156,6 +167,21 @@ class VectorIndex {
   // next to the coarse scan `.data`; see the class comment).
   bool hasRerankLayer() const;
 
+  // True iff this index was built with `csls: true` (a row-aligned `.csls`
+  // hubness sidecar exists; a `.meta` without the field loads as
+  // `hasCsls() == false`, so old indexes are unaffected).
+  bool hasCsls() const;
+  // The neighbour count k of the CSLS r-terms (both the persisted r(d) and
+  // the query-time default for r(q)). Only meaningful with `hasCsls()`.
+  size_t cslsNeighbors() const;
+  // The persisted hubness r(d) of `row` (mean cosine similarity to its
+  // `cslsNeighbors()` nearest corpus neighbours, self-excluded).
+  // Preconditions: `hasCsls()` and `row < numVectors()`.
+  float cslsRForRow(size_t row) const;
+  // The same by entity (one `.rowmap` lookup); `nullopt` for an entity
+  // without a (live) vector. Precondition: `hasCsls()`.
+  std::optional<float> cslsRForEntity(Id entity) const;
+
   // True iff this index stores a (live) vector for `entity`.
   bool hasVector(Id entity) const;
 
@@ -236,6 +262,40 @@ class VectorIndex {
   std::vector<ScoredEntity> searchHnswByEntity(
       Id entity, size_t k, std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
+
+  // CSLS-filtered search (`vec:cslsThreshold`); requires `hasCsls()` and the
+  // cosine metric (both guaranteed at build time; violated preconditions
+  // throw). A FULL scan on the FINE layer -- CSLS needs every candidate's
+  // cosine, so there is no coarse/HNSW shortcut:
+  //  1. compute the cosine distance from the query to EVERY candidate (all
+  //     live vectors, or -- like `searchExact` -- only the `candidates` set);
+  //  2. r(q) = mean cosine similarity (`1 - distance`) of the query to its
+  //     top-`neighbors` nearest candidates, EXCLUDING one exact self-match
+  //     (distance ~ 0 -- the query entity itself when it is a candidate);
+  //  3. keep candidate `d` iff
+  //     `CSLS = 2 * cos_sim(q, d) - r(q) - r(d) >= threshold`
+  //     (and `distance <= maxDistance`, if set; r(q) is computed BEFORE the
+  //     maxDistance filter -- it describes the retrieval geometry).
+  // Returns ALL survivors ascending by cosine DISTANCE (CSLS is the cut, not
+  // the score); the caller applies any top-k cap. `numScored`, if set,
+  // receives the number of candidates that were scored (the live set, or the
+  // members among `candidates`).
+  std::vector<CslsScoredEntity> searchCsls(
+      ql::span<const float> query, float threshold, size_t neighbors,
+      std::optional<ql::span<const Id>> candidates = std::nullopt,
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {},
+      size_t* numScored = nullptr) const;
+
+  // The same with a STORED entity's vector as the query point (its fine-layer
+  // bytes are used directly); the entity's own row is the excluded self-match.
+  // An entity without a (live) vector yields an empty result.
+  std::vector<CslsScoredEntity> searchCslsByEntity(
+      Id entity, float threshold, size_t neighbors,
+      std::optional<ql::span<const Id>> candidates = std::nullopt,
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {},
+      size_t* numScored = nullptr) const;
 
   // A reusable per-query distance functor. It encodes the query point ONCE
   // (into the FINE layer's storage scalar -- the rerank matrix when present,

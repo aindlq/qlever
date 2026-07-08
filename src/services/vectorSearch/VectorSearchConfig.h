@@ -90,6 +90,26 @@ struct VectorSearchConfiguration {
   // Optional upper bound on the distance of returned neighbours.
   std::optional<float> maxDistance_;
 
+  // CSLS retrieval cut (`vec:cslsThreshold`, requires an index built with
+  // `csls: true` and a query point): replace the hardcoded top-k with the
+  // query-adaptive filter `2 * cos_sim(q, d) - r(q) - r(d) >= threshold`.
+  // The search becomes a FULL scan on the fine layer (CSLS needs every
+  // candidate's cosine; the coarse/HNSW layer is not used), and the result
+  // cardinality is variable: every candidate that "stands out" past the
+  // threshold survives. `vec:bindScore` stays the COSINE DISTANCE (CSLS is
+  // the cut, not the score) and results still sort by it ascending.
+  std::optional<float> cslsThreshold_;
+  // Optional variable bound to each survivor's CSLS value (`vec:bindCsls`).
+  std::optional<Variable> cslsVariable_;
+  // Optional override of the index's persisted `cslsNeighbors` for the
+  // query-side r(q) (`vec:cslsNeighbors`); unset = the index's build value.
+  std::optional<size_t> cslsNeighbors_;
+  // With `cslsThreshold_`: the `vec:k` value iff it was EXPLICITLY given (a
+  // cap on the tau-survivors); unset = return ALL survivors (the variable
+  // cardinality that is the point of the cut). The non-csls paths keep using
+  // `k_` (with its default of 10).
+  std::optional<size_t> cslsKCap_;
+
   // Optional algorithm override: force exact or approximate search. If unset,
   // the index decides (HNSW if available, else exact).
   enum class Algorithm { Automatic, Exact, Hnsw };

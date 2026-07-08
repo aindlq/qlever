@@ -149,6 +149,31 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
           "distance of returned neighbours)."};
     }
     maxDistance_ = static_cast<float>(value.value());
+  } else if (pred == "cslsThreshold") {
+    std::optional<double> value;
+    if (object.isInt()) {
+      value = static_cast<double>(object.getInt());
+    } else if (object.isDouble()) {
+      value = object.getDouble();
+    }
+    if (!value.has_value() || !std::isfinite(value.value())) {
+      throw VectorSearchException{
+          "The parameter `<cslsThreshold>` expects a finite number (the CSLS "
+          "cut: candidates with `2*cos_sim - r(q) - r(d)` below it are "
+          "dropped; 0 is a balanced starting point, negative values keep "
+          "more)."};
+    }
+    cslsThreshold_ = static_cast<float>(value.value());
+  } else if (pred == "bindCsls") {
+    setVariable("bindCsls", object, cslsVar_);
+  } else if (pred == "cslsNeighbors") {
+    if (!object.isInt() || object.getInt() <= 0) {
+      throw VectorSearchException{
+          "The parameter `<cslsNeighbors>` expects a positive integer (the "
+          "neighbour count of the query-side r(q); default: the index's "
+          "build-time `cslsNeighbors`)."};
+    }
+    cslsNeighbors_ = static_cast<size_t>(object.getInt());
   } else if (pred == "algorithm") {
     if (!object.isIri()) {
       throw VectorSearchException{
@@ -173,9 +198,9 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
         ">` in vector search; supported: `<index>`, `<query>`, "
         "`<queryVector>`, `<queryText>`, `<imageUrl>`, `<imageBase64>`, "
         "`<candidates>` (alias `<left>`), `<result>`/`<right>`, "
-        "`<bindScore>`, `<bindCoarseScore>`, `<k>` (alias "
+        "`<bindScore>`, `<bindCoarseScore>`, `<bindCsls>`, `<k>` (alias "
         "`<numNearestNeighbors>`), `<rerankK>`, `<maxDistance>`, "
-        "`<algorithm>`.")};
+        "`<cslsThreshold>`, `<cslsNeighbors>`, `<algorithm>`.")};
   }
 }
 
@@ -252,6 +277,43 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
             "not supported in the entity-to-entity `<candidates>` form "
             "(no query point).");
   }
+  // The CSLS cut: needs a fixed query point (FORM W / FORM P; it is
+  // meaningless per-candidate in FORM E), and it is a FULL fine-layer scan,
+  // so the coarse-pass parameters and the HNSW override contradict it.
+  throwIf(cslsThreshold_.has_value() && numQueryPoints == 0,
+          "The `<cslsThreshold>` parameter requires a query point "
+          "(`<queryVector>`, `<query>`, `<queryText>`, or "
+          "`<imageUrl>`/`<imageBase64>`); it is not supported in the "
+          "entity-to-entity `<candidates>` form (no query point).");
+  throwIf(
+      cslsThreshold_.has_value() &&
+          algo_ == qlever::vector::VectorSearchConfiguration::Algorithm::Hnsw,
+      "The `<cslsThreshold>` cut computes every candidate's cosine on "
+      "the fine layer (a full scan), so it cannot be combined with "
+      "`<algorithm>` `vectorSearch:hnsw`.");
+  throwIf(cslsThreshold_.has_value() && coarseScoreVar_.has_value(),
+          "The `<cslsThreshold>` cut is a full fine-layer scan; the coarse "
+          "scan layer is not used, so `<bindCoarseScore>` cannot be combined "
+          "with it.");
+  throwIf(cslsThreshold_.has_value() && rerankK_.has_value(),
+          "The `<cslsThreshold>` cut is a full fine-layer scan; there is no "
+          "coarse candidate pass, so `<rerankK>` cannot be combined with "
+          "it.");
+  throwIf(cslsVar_.has_value() && !cslsThreshold_.has_value(),
+          "The `<bindCsls>` parameter requires `<cslsThreshold>` (the CSLS "
+          "value is only computed for the CSLS cut).");
+  throwIf(cslsNeighbors_.has_value() && !cslsThreshold_.has_value(),
+          "The `<cslsNeighbors>` parameter requires `<cslsThreshold>`.");
+  throwIf(cslsVar_.has_value() && cslsVar_ == resultVar_,
+          "The `<bindCsls>` and `<result>` variables of a vector search must "
+          "be different.");
+  throwIf(cslsVar_.has_value() && leftVar_.has_value() && cslsVar_ == leftVar_,
+          "The `<bindCsls>` and `<candidates>`/`<left>` variables of a "
+          "vector search must be different.");
+  throwIf(
+      cslsVar_.has_value() && scoreVar_.has_value() && cslsVar_ == scoreVar_,
+      "The `<bindCsls>` and `<bindScore>` variables of a vector search "
+      "must be different.");
   throwIf(scoreVar_.has_value() && scoreVar_ == resultVar_,
           "The `<bindScore>` and `<result>` variables of a vector search must "
           "be different.");
@@ -286,6 +348,13 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   config.keepAllCandidates_ = annotateForm && !k_.has_value();
   config.rerankK_ = rerankK_;
   config.maxDistance_ = maxDistance_;
+  config.cslsThreshold_ = cslsThreshold_;
+  config.cslsVariable_ = cslsVar_;
+  config.cslsNeighbors_ = cslsNeighbors_;
+  // With the CSLS cut, an EXPLICIT `<k>` caps the survivors; without one ALL
+  // survivors are returned (variable cardinality -- the point of the cut).
+  config.cslsKCap_ =
+      cslsThreshold_.has_value() && k_.has_value() ? k_ : std::nullopt;
   config.algorithm_ = algo_;
   return config;
 }

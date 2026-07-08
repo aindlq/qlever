@@ -17,11 +17,19 @@
 
 namespace qlever::vector {
 
+class VectorIndex;
+
 // Append the query-point fields of `config` to a cache key, each value
 // length-prefixed / bit-exact so distinct query points never share a key.
 // Shared by `VectorSearch` and `VectorSearchJoin`.
 void appendQueryPointToCacheKey(std::string* key,
                                 const VectorSearchConfiguration& config);
+
+// Throw a clear user-facing error when `vec:cslsThreshold` targets an index
+// that was not built with `csls: true`. Shared by the FORM W and FORM P
+// paths.
+void validateCslsIsAvailable(const VectorSearchConfiguration& config,
+                             const VectorIndex& vidx);
 
 // The WHOLE-INDEX top-k search of `config` (FORM W): resolve the query point
 // against the index `config.indexName_` and return the k nearest entities as

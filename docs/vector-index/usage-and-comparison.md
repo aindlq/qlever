@@ -322,6 +322,55 @@ index IRI (`vidx:emb`).
   `vec:bindCoarseScore` is not available (no fixed query point to rerank
   against).
 
+### Use case 7b — the CSLS cut (`vec:cslsThreshold`): drop the hardcoded top-k
+
+On an index built with `"csls": true` (see `indexing.md`), the SERVICE can
+replace `vec:k` with a **query-adaptive "stand-out" filter** that also
+suppresses hubs — documents whose vectors are near *everything* and therefore
+pollute every top-k:
+
+```sparql
+SELECT ?nn ?d ?c WHERE {
+  SERVICE vec: {
+    _:c vec:index "emb" ;
+        vec:queryText "a red bicycle" ;
+        vec:result ?nn ;
+        vec:bindScore ?d ;          # STILL the cosine distance (the score)
+        vec:bindCsls ?c ;           # optional: the CSLS value (the cut)
+        vec:cslsThreshold 0.0 .     # keep iff 2·cos_sim − r(q) − r(d) ≥ τ
+  }
+} ORDER BY ?d
+```
+
+A candidate `d` survives iff `CSLS(q, d) = 2·cos_sim(q, d) − r(q) − r(d) ≥ τ`,
+where `r(d)` is the document's precomputed hubness (mean cosine similarity to
+its `cslsNeighbors` nearest corpus neighbours, from the build-time sidecar)
+and `r(q)` is the same statistic for the *query* over the retrieved candidate
+set, computed per query (an exact self-match — the query entity itself — is
+excluded). Intuition: a match only counts if it is closer to the query than
+both sides' "usual" neighbourhoods — generic hub documents need a much higher
+raw similarity to pass, and for a query in a dense region everything must
+stand out more.
+
+- **The τ lever**: `0` is a balanced starting point; `-0.1` / `-0.2` keep
+  progressively more (broader recall); positive values keep only strong
+  stand-outs. Tune it on your data — the useful range depends on the
+  embedding space (watch the build's `csls r(d)` distribution log line).
+- **CSLS is the cut, cosine is the score**: `vec:bindScore` stays the plain
+  cosine distance and results still sort by it ascending; `vec:bindCsls`
+  exposes the CSLS value if you want it.
+- **Variable cardinality — the point**: without `vec:k` you get *all*
+  survivors — an easy query returns 3, a hard one 300. An explicit `vec:k`
+  additionally caps the survivors (top-k by cosine distance).
+- **Cost**: the cut needs *every* candidate's cosine, so it runs one full
+  scan on the fine layer (like the FORM P annotate path) — no HNSW / coarse
+  shortcut. It works in FORM W (whole index) and FORM P (bound candidates;
+  `r(q)` then comes from the bound set). `vec:cslsNeighbors` optionally
+  overrides the index's neighbour count for `r(q)`.
+- Not combinable with `vec:algorithm vectorSearch:hnsw`, `vec:rerankK`, or
+  `vec:bindCoarseScore` (there is no coarse pass); requires a query point and
+  an index built with `"csls": true` (clear errors otherwise).
+
 **Coexist / compare.** `vec:distance` (fine, exact) and the SERVICE (coarse
 scan → fine rerank) work on the *same* two-layer index, so one query can put
 the exact baseline and the accelerated scores side by side:

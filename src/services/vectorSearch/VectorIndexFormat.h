@@ -13,6 +13,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "util/json.h"
 
@@ -49,6 +50,12 @@
 //                   index; the vectors themselves are NOT duplicated into this
 //                   file -- distance computations read them from `.data`.
 //                   IMMUTABLE after the build.
+//   B.vec.N.csls    OPTIONAL (only with `csls: true`): `numVectors` f32 in ROW
+//                   order -- the per-document CSLS hubness `r(d)`, the mean
+//                   cosine similarity of each row to its `cslsNeighbors`
+//                   nearest corpus neighbours (self-excluded). Row-aligned
+//                   like `.data`, so it survives a remap unchanged. IMMUTABLE
+//                   after the build.
 //
 // Remapping: the entity ids stored in `.keys`/`.rowmap` are vocabulary
 // positions, which shift whenever the RDF data is re-indexed. Because `.data`,
@@ -195,6 +202,44 @@ inline size_t defaultRerankK(VectorScalar scanScalar, size_t k) {
                                             : std::max<size_t>(10 * k, 100);
 }
 
+// The CSLS r-term primitive, shared by the build-time r(d) and the query-time
+// r(q): keep the `k` SMALLEST cosine DISTANCES offered, and average them as
+// cosine SIMILARITIES via `cos_sim = 1 - distance` (the usearch/NumKong
+// angular-distance convention -- CSLS works in similarity space).
+class CslsNeighborhood {
+ public:
+  explicit CslsNeighborhood(size_t k) : k_{k} {}
+  void offer(float distance) {
+    if (k_ == 0) {
+      return;
+    }
+    if (heap_.size() < k_) {
+      heap_.push_back(distance);
+      std::push_heap(heap_.begin(), heap_.end());
+    } else if (distance < heap_.front()) {
+      std::pop_heap(heap_.begin(), heap_.end());
+      heap_.back() = distance;
+      std::push_heap(heap_.begin(), heap_.end());
+    }
+  }
+  // Mean cosine similarity of the kept neighbours; fewer than `k` neighbours
+  // average what there is, no neighbours at all (a lone vector) -> 0.
+  float meanCosSim() const {
+    if (heap_.empty()) {
+      return 0.f;
+    }
+    double sum = 0;
+    for (float d : heap_) {
+      sum += 1.0 - static_cast<double>(d);
+    }
+    return static_cast<float>(sum / static_cast<double>(heap_.size()));
+  }
+
+ private:
+  size_t k_;
+  std::vector<float> heap_;  // max-heap of the k smallest distances
+};
+
 // String conversions (used both for the SPARQL surface and the JSON metadata).
 inline std::string toString(VectorMetric m) {
   switch (m) {
@@ -256,6 +301,30 @@ struct VectorIndexConfig {
   // bytes + rerank bytes (e.g. i8 + bf16 = 3 bytes per dimension; binary +
   // bf16 = 2.125 bytes per dimension).
   std::optional<VectorScalar> rerankScalar_;
+  // CSLS (Cross-domain Similarity Local Scaling) hub suppression: when true,
+  // the build additionally computes -- or ingests, see `cslsRPath_` -- the
+  // per-document hubness `r(d)` = the mean COSINE SIMILARITY of each stored
+  // vector to its `cslsNeighbors_` nearest corpus neighbours (self-excluded),
+  // persisted as the row-aligned f32 sidecar `.csls`. At query time
+  // `vec:cslsThreshold` then keeps a candidate `d` iff
+  // `2 * cos_sim(q, d) - r(q) - r(d) >= threshold` -- a query-adaptive
+  // "stand-out" cut that replaces a hardcoded top-k and penalises hub
+  // documents that are near everything. Cosine-only: `cos_sim = 1 - distance`
+  // holds only for the cosine metric (usearch/NumKong angular distance), so
+  // the builder rejects `csls` for `l2sq`/`innerProduct` (and for a `binary`
+  // store without a rerank layer, whose only distances are Hamming).
+  bool csls_ = false;
+  // The neighbour count k of the CSLS r-terms: both the build-time r(d) and
+  // the query-time r(q) average the top-k cosine similarities. Persisted in
+  // the `.meta` (only when `csls_` is set).
+  uint32_t cslsNeighbors_ = 10;
+  // Optional path to a PRECOMPUTED r(d) as an `.npy` of f32 (shape `(N,)` or
+  // `(N, 1)`), row-aligned with the `npy` input matrix -- the "GPU path" for
+  // corpora where the build-time self-kNN is too slow. When set, the build
+  // ingests the values verbatim (following the input rows through the usual
+  // skip/dedup) instead of computing the self-kNN. Build-time only, never
+  // persisted (like `buildThreads_`).
+  std::string cslsRPath_;
   bool buildHnsw_ = true;
   // HNSW (usearch) build parameters.
   uint32_t hnswConnectivity_ = 16;     // a.k.a. M
@@ -361,6 +430,10 @@ inline std::string vectorHnswFile(const std::string& base,
                                   const std::string& name) {
   return base + ".vec." + name + ".hnsw";
 }
+inline std::string vectorCslsFile(const std::string& base,
+                                  const std::string& name) {
+  return base + ".vec." + name + ".csls";
+}
 
 // JSON (de)serialization of the metadata (uses QLever's bundled
 // nlohmann::json).
@@ -384,6 +457,13 @@ inline void to_json(nlohmann::json& j, const VectorIndexMetadata& m) {
   if (m.config_.rerankScalar_.has_value()) {
     j["rerankScalar"] = toString(m.config_.rerankScalar_.value());
   }
+  // The CSLS neighbour count is only written for a csls-enabled index; its
+  // PRESENCE is what marks the index as csls-enabled at load (`from_json`), so
+  // a non-csls `.meta` stays byte-compatible with older builds. (`cslsRPath_`
+  // is a build-time input path, deliberately not persisted.)
+  if (m.config_.csls_) {
+    j["cslsNeighbors"] = m.config_.cslsNeighbors_;
+  }
   // NOTE: `embeddingUrl`/`embeddingModel`/`preload` are deliberately NOT
   // persisted -- they are serving concerns set at server start from the
   // `QLEVER_VECTOR_SEARCH_ENDPOINTS` environment variable (see
@@ -403,6 +483,10 @@ inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
   } else {
     m.config_.rerankScalar_ = std::nullopt;
   }
+  // Absent (the back-compat default) = no csls sidecar, exactly the old
+  // format; present = csls-enabled with that neighbour count (see `to_json`).
+  m.config_.csls_ = j.contains("cslsNeighbors");
+  m.config_.cslsNeighbors_ = j.value("cslsNeighbors", uint32_t{10});
   j.at("numVectors").get_to(m.numVectors_);
   m.numTombstones_ = j.value("numTombstones", uint64_t{0});
   j.at("hasHnsw").get_to(m.hasHnsw_);

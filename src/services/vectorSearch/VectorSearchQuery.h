@@ -89,6 +89,13 @@ struct VectorSearchQuery : MagicServiceQuery {
   // Coarse candidate count of the two-layer rerank pass (`vec:rerankK`).
   std::optional<size_t> rerankK_;
   std::optional<float> maxDistance_;
+  // The CSLS cut (`vec:cslsThreshold` tau, requires an index built with
+  // `csls: true`): keep a candidate iff `2*cos_sim - r(q) - r(d) >= tau`.
+  std::optional<float> cslsThreshold_;
+  // Each survivor's CSLS value (`vec:bindCsls`).
+  std::optional<Variable> cslsVar_;
+  // Query-side override of the index's `cslsNeighbors` (`vec:cslsNeighbors`).
+  std::optional<size_t> cslsNeighbors_;
   qlever::vector::VectorSearchConfiguration::Algorithm algo_ =
       qlever::vector::VectorSearchConfiguration::Algorithm::Automatic;
 

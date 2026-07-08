@@ -200,6 +200,9 @@ struct VectorIndex::Impl {
   MatrixLayer scan_;
   // The fine rerank matrix `.rerank.data`, iff `meta_.config_.rerankScalar_`.
   std::optional<MatrixLayer> rerank_;
+  // The row-aligned csls hubness sidecar `.csls` (one f32 r(d) per row), iff
+  // `meta_.config_.csls_`.
+  ad_utility::MmapVectorView<float> cslsR_;
   std::optional<GraphIndex> graph_;  // present iff meta_.hasHnsw_
   std::unique_ptr<SearchSlotPool> searchSlots_;
   // Sticky safety net for the sequential-read hint of the merge-join gather.
@@ -390,6 +393,18 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
     rerank.casts_ = uu::casts_punned_t::make(toUsearchScalar(rerankScalar));
   }
 
+  // 3c. The optional csls hubness sidecar `.csls`: one f32 r(d) per row,
+  //     aligned to the flat store. (Reset first so re-opening a non-csls
+  //     index over a csls one never keeps a stale mapping.)
+  impl.cslsR_ = ad_utility::MmapVectorView<float>{};
+  if (impl.meta_.config_.csls_) {
+    openMmap(impl.cslsR_, vectorCslsFile(basename, name),
+             ad_utility::AccessPattern::Random);
+    if (impl.cslsR_.size() != impl.meta_.numVectors_) {
+      complainInterrupted("the csls sidecar size on disk");
+    }
+  }
+
   // 4. The optional HNSW graph, memory-mapped read-only via usearch `view`.
   //    The graph is keyed by row; vectors come from the flat store above.
   if (impl.meta_.hasHnsw_) {
@@ -567,6 +582,24 @@ VectorMetric VectorIndex::metric() const {
 }
 bool VectorIndex::hasHnsw() const { return impl_->meta_.hasHnsw_; }
 bool VectorIndex::hasRerankLayer() const { return impl_->rerank_.has_value(); }
+
+// ____________________________________________________________________________
+bool VectorIndex::hasCsls() const { return impl_->meta_.config_.csls_; }
+size_t VectorIndex::cslsNeighbors() const {
+  return impl_->meta_.config_.cslsNeighbors_;
+}
+float VectorIndex::cslsRForRow(size_t row) const {
+  AD_CONTRACT_CHECK(hasCsls() && row < impl_->meta_.numVectors_);
+  return impl_->cslsR_[row];
+}
+std::optional<float> VectorIndex::cslsRForEntity(Id entity) const {
+  AD_CONTRACT_CHECK(hasCsls());
+  auto row = impl_->rowOf(entity);
+  if (!row.has_value()) {
+    return std::nullopt;
+  }
+  return impl_->cslsR_[row.value()];
+}
 
 // ____________________________________________________________________________
 bool VectorIndex::hasVector(Id entity) const {
@@ -932,6 +965,32 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
 }
 }  // namespace
 
+// RAII: advise the flat store of `layer` for a SEQUENTIAL scan while an
+// ordered scan runs, restoring RANDOM (the gather default) on exit. This is a
+// purely advisory `madvise` read-ahead hint on the memory-mapped store; it
+// never affects results. Callers skip it (pass `active = false`) when the
+// store is a resident aligned RAM copy (no paging to advise). We call
+// `advise()` (a stateless `madvise`) rather than `setAccessPattern()` on
+// purpose: the search methods are logically const but share one `Impl` across
+// concurrent query threads, and `setAccessPattern` would write the vector's
+// non-atomic `_pattern` member (a data race). Concurrent `advise()` calls
+// only issue overlapping advisory hints, which is harmless.
+template <typename LayerT>
+struct SeqScanHint {
+  LayerT& layer_;
+  bool active_;
+  SeqScanHint(LayerT& layer, bool active) : layer_{layer}, active_{active} {
+    if (active_) {
+      layer_.data_.adviseAccessPattern(ad_utility::AccessPattern::Sequential);
+    }
+  }
+  ~SeqScanHint() {
+    if (active_) {
+      layer_.data_.adviseAccessPattern(ad_utility::AccessPattern::Random);
+    }
+  }
+};
+
 // ____________________________________________________________________________
 // The scalar-agnostic core of the exact search: `queryBytes` is already in the
 // storage representation of `layer` -- the FINE layer for `searchExact*` (the
@@ -963,31 +1022,6 @@ std::vector<ScoredEntity> searchExactBytes(
     return {};
   }
   TopK top{k};
-
-  // RAII: advise the flat store for a SEQUENTIAL scan while the ordered scan
-  // below runs, restoring RANDOM (the gather default) on exit. This is a purely
-  // advisory `madvise` read-ahead hint on the memory-mapped store; it never
-  // affects results. Skipped when the store is a resident aligned RAM copy (no
-  // paging to advise). We call `advise()` (a stateless `madvise`) rather than
-  // `setAccessPattern()` on purpose: the search methods are logically const but
-  // share one `Impl` across concurrent query threads, and `setAccessPattern`
-  // would write the vector's non-atomic `_pattern` member (a data race).
-  // Concurrent `advise()` calls only issue overlapping advisory hints, which is
-  // harmless.
-  struct SeqScanHint {
-    LayerT& layer_;
-    bool active_;
-    SeqScanHint(LayerT& layer, bool active) : layer_{layer}, active_{active} {
-      if (active_) {
-        layer_.data_.adviseAccessPattern(ad_utility::AccessPattern::Sequential);
-      }
-    }
-    ~SeqScanHint() {
-      if (active_) {
-        layer_.data_.adviseAccessPattern(ad_utility::AccessPattern::Random);
-      }
-    }
-  };
 
   if (!candidates.has_value()) {
     // Whole-index brute force: rows are visited in order, so it is sequential.
@@ -1234,6 +1268,219 @@ std::vector<ScoredEntity> VectorIndex::searchHnswByEntity(
   }
   return searchHnswBytes(impl, impl.scan_.rowPtr(row.value()), k, maxDistance,
                          checkInterrupt);
+}
+
+namespace {
+// A raw-vector query counts a candidate as the query's exact self-match (and
+// excludes it from the r(q) neighbourhood) iff its cosine distance is below
+// this. Identical bytes give a distance of exactly 0; the epsilon only covers
+// the sqrt rounding of the norm terms. Distinct real embeddings are never
+// this close, so at most the genuine self is excluded. (An entity query point
+// excludes its own ROW instead -- exact, no epsilon.)
+constexpr float CSLS_SELF_EPSILON = 1e-6f;
+}  // namespace
+
+// ____________________________________________________________________________
+// The core of the CSLS-filtered search (see the header comment of
+// `searchCsls`): a FULL cosine-distance sweep of the scoring set on the FINE
+// layer, then the query-adaptive cut `2 * cos_sim - r(q) - r(d) >=
+// threshold`, with `cos_sim = 1 - distance` (the usearch/NumKong angular
+// convention -- the cosine metric is guaranteed by the caller). `selfRow`,
+// when set, is the query entity's own row, excluded from the r(q)
+// neighbourhood by identity; for a raw query vector the single nearest
+// candidate is excluded iff its distance is < `CSLS_SELF_EPSILON`.
+template <typename ImplT, typename LayerT>
+std::vector<CslsScoredEntity> searchCslsBytes(
+    ImplT& impl, LayerT& layer, const char* queryBytes,
+    std::optional<size_t> selfRow, float threshold, size_t neighbors,
+    std::optional<ql::span<const Id>> candidates,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored) {
+  // 1. The scoring set as (row, id) pairs: all live rows, or -- exactly like
+  //    the restricted `searchExact` -- the merge-join of the candidate ids
+  //    against the id-sorted rowmap (which dedups and drops non-members).
+  std::vector<std::pair<size_t, uint64_t>> matched;
+  if (!candidates.has_value()) {
+    matched.reserve(impl.numLive());
+    for (size_t row = 0; row < impl.meta_.numVectors_; ++row) {
+      uint64_t id = impl.keys_[row];
+      if (id != TOMBSTONE_KEY) {
+        matched.emplace_back(row, id);
+      }
+    }
+  } else {
+    std::vector<uint64_t> candBits;
+    candBits.reserve(candidates->size());
+    for (Id c : candidates.value()) {
+      candBits.push_back(c.getBits());
+    }
+    if (!std::is_sorted(candBits.begin(), candBits.end())) {
+      std::sort(candBits.begin(), candBits.end());
+    }
+    matched.reserve(candBits.size());
+    mergeJoinRowmap(candBits.begin(), candBits.end(), impl.rowmap_.begin(),
+                    impl.rowmap_.end(), [&](size_t row, uint64_t id) {
+                      matched.emplace_back(row, id);
+                    });
+  }
+  if (numScored != nullptr) {
+    *numScored = matched.size();
+  }
+  if (matched.empty()) {
+    return {};
+  }
+
+  // 2. The full fine-layer distance sweep (CSLS needs EVERY cosine, so there
+  //    is no top-k shortcut). Rows come out of step 1 (near-)ascending, so
+  //    the sequential read-ahead hint applies; the mmap-heavy SIMD work runs
+  //    in parallel above the usual threshold.
+  const size_t n = matched.size();
+  std::vector<float> dists(n);
+  SeqScanHint hint{layer, !layer.alignedBuf_};
+#ifdef _OPENMP
+  const int numThreads = vectorSearchThreadCap();
+  if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+    std::atomic<bool> cancelled{false};
+#pragma omp parallel for schedule(dynamic, VEC_SEARCH_PARALLEL_CHUNK) \
+    num_threads(numThreads)
+    for (size_t i = 0; i < n; ++i) {
+      // An exception must never unwind out of the OpenMP region: poll the
+      // (throwing) interrupt once per chunk, latch, re-raise after.
+      if (cancelled.load(std::memory_order_relaxed)) {
+        continue;
+      }
+      if (checkInterrupt && i % VEC_SEARCH_PARALLEL_CHUNK == 0) {
+        try {
+          checkInterrupt();
+        } catch (...) {
+          cancelled.store(true, std::memory_order_relaxed);
+          continue;
+        }
+      }
+      dists[i] = layer.distanceToRow(queryBytes, matched[i].first);
+    }
+    if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+      checkInterrupt();  // re-raise outside the parallel region
+    }
+  } else
+#endif
+  {
+    size_t sinceCheck = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+        sinceCheck = 0;
+        checkInterrupt();
+      }
+      dists[i] = layer.distanceToRow(queryBytes, matched[i].first);
+    }
+  }
+
+  // 3. r(q): the mean cosine similarity of the query to its top-`neighbors`
+  //    nearest SCORED candidates, the exact self-match excluded. Computed
+  //    BEFORE any `maxDistance` filter (it describes the retrieval geometry).
+  size_t excluded = n;  // index into `matched`/`dists`; `n` = none
+  if (selfRow.has_value()) {
+    for (size_t i = 0; i < n; ++i) {
+      if (matched[i].first == selfRow.value()) {
+        excluded = i;
+        break;
+      }
+    }
+  } else {
+    size_t best = 0;
+    for (size_t i = 1; i < n; ++i) {
+      if (dists[i] < dists[best]) {
+        best = i;
+      }
+    }
+    if (dists[best] < CSLS_SELF_EPSILON) {
+      excluded = best;
+    }
+  }
+  CslsNeighborhood neighborhood{neighbors};
+  for (size_t i = 0; i < n; ++i) {
+    if (i != excluded) {
+      neighborhood.offer(dists[i]);
+    }
+  }
+  const float rq = neighborhood.meanCosSim();
+
+  // 4. The cut: keep candidate d iff `2 * cos_sim(q, d) - r(q) - r(d) >=
+  //    threshold` (and its cosine distance passes `maxDistance`, if set).
+  //    ALL survivors are returned, ascending by cosine DISTANCE -- CSLS is
+  //    the cut, the cosine distance stays the score; the caller applies any
+  //    top-k cap.
+  std::vector<CslsScoredEntity> out;
+  for (size_t i = 0; i < n; ++i) {
+    const float d = dists[i];
+    if (maxDistance.has_value() && d > maxDistance.value()) {
+      continue;
+    }
+    const float csls = static_cast<float>(
+        2.0 * (1.0 - static_cast<double>(d)) - static_cast<double>(rq) -
+        static_cast<double>(impl.cslsR_[matched[i].first]));
+    if (csls >= threshold) {
+      out.push_back(CslsScoredEntity{Id::fromBits(matched[i].second), d, csls});
+    }
+  }
+  ql::ranges::sort(out,
+                   [](const CslsScoredEntity& a, const CslsScoredEntity& b) {
+                     return a.distance_ != b.distance_
+                                ? a.distance_ < b.distance_
+                                : a.entity_.getBits() < b.entity_.getBits();
+                   });
+  return out;
+}
+
+// ____________________________________________________________________________
+std::vector<CslsScoredEntity> VectorIndex::searchCsls(
+    ql::span<const float> query, float threshold, size_t neighbors,
+    std::optional<ql::span<const Id>> candidates,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+  // Non-const so the sweep can toggle the flat store's (advisory) access-
+  // pattern hint; all result-affecting state stays read-only.
+  auto& impl = *impl_;
+  AD_CONTRACT_CHECK(impl.meta_.config_.csls_,
+                    "searchCsls called on an index without csls data.");
+  // Guaranteed by the build (`csls` is rejected for non-cosine metrics).
+  AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
+  auto& layer = impl.fine();
+  if (query.size() != impl.dim()) {
+    AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
+             ", but vector index \"" + impl.meta_.config_.name_ +
+             "\" has dimension " + std::to_string(impl.dim()) + ".");
+  }
+  std::vector<char> buffer;
+  const char* queryBytes = layer.encodeQuery(query, buffer);
+  return searchCslsBytes(impl, layer, queryBytes, std::nullopt, threshold,
+                         neighbors, candidates, maxDistance, checkInterrupt,
+                         numScored);
+}
+
+// ____________________________________________________________________________
+std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
+    Id entity, float threshold, size_t neighbors,
+    std::optional<ql::span<const Id>> candidates,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+  // Non-const so the sweep can toggle the flat store's (advisory) access-
+  // pattern hint; all result-affecting state stays read-only.
+  auto& impl = *impl_;
+  AD_CONTRACT_CHECK(impl.meta_.config_.csls_,
+                    "searchCslsByEntity called on an index without csls data.");
+  AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
+  auto& layer = impl.fine();
+  auto row = impl.rowOf(entity);
+  if (!row.has_value()) {
+    if (numScored != nullptr) {
+      *numScored = 0;
+    }
+    return {};
+  }
+  return searchCslsBytes(impl, layer, layer.rowPtr(row.value()), row, threshold,
+                         neighbors, candidates, maxDistance, checkInterrupt,
+                         numScored);
 }
 
 }  // namespace qlever::vector

@@ -103,6 +103,9 @@ array (e.g. one for image embeddings, one for text).
 | `hnsw`    | `true` builds the ANN graph; `false` = exact/flat store only   |
 | `scalar`  | *(optional)* storage precision `f32` (default) \| `f16` \| `bf16` \| `i8` \| `binary` (1-bit sign-packed, see below) |
 | `rerank`  | *(optional)* second-layer **rerank precision** `bf16` \| `f16` \| `f32`; unset = single-layer. Builds a TWO-LAYER quantize+rerank store (see below) |
+| `csls`    | *(optional, cosine-only)* `true` precomputes the per-document **CSLS hubness `r(d)`** sidecar, enabling the query-time `vec:cslsThreshold` cut (see below) |
+| `cslsNeighbors` | *(optional, default 10)* neighbour count `k` of the CSLS r-terms — both the build-time `r(d)` and the query-time `r(q)` average the top-`k` cosine similarities. Persisted in the `.meta` |
+| `cslsR`   | *(optional)* path to a **precomputed `r(d)`** as a float32 `.npy` of shape `(N,)` (or `(N, 1)`), row-aligned with the `npy` input — the "GPU path"; skips the build-time self-kNN |
 | `embeddingUrl`   | *(optional)* embedding endpoint bound to this index (see below) |
 | `embeddingModel` | *(optional)* model name sent to that endpoint; also names the index's embedding space for the typed-query-vector comparability check (see "Typed query vectors") |
 
@@ -165,6 +168,56 @@ What each layer serves at query time:
   candidates off the cheap `i8` bytes, then their distances are recomputed
   exactly on the `bf16` layer and the top `k` by fine distance are returned
   (see `usage-and-comparison.md`, use case 7).
+
+### CSLS hub suppression (`csls`, `cslsNeighbors`, `cslsR`)
+
+```json
+{ "name": "emb", "npy": "emb.npy", "iris": "emb.iris",
+  "metric": "cosine", "hnsw": true, "csls": true, "cslsNeighbors": 10 }
+```
+
+CSLS (Cross-domain Similarity Local Scaling) turns the SERVICE's top-k into a
+**query-adaptive cut** that also suppresses *hub* documents (vectors that are
+near everything). At build time, `"csls": true` precomputes each document's
+**hubness**
+
+> `r(d)` = the mean **cosine similarity** of `d`'s stored vector to its
+> `cslsNeighbors` nearest corpus neighbours, **self-excluded**
+
+and stores it as the row-aligned f32 sidecar `‹base›.vec.‹name›.csls` (it is
+row-keyed like `.data`, so a cheap remap keeps it valid). At query time,
+`vec:cslsThreshold τ` then keeps a candidate `d` iff
+
+> `CSLS(q, d) = 2·cos_sim(q, d) − r(q) − r(d) ≥ τ`
+
+(see `usage-and-comparison.md` for the query surface). How `r(d)` is computed:
+
+- **`hnsw: true`** (recommended): a *self-kNN* against the just-built graph —
+  every row searches its own stored vector with a **recall-tuned expansion**
+  `max(200, 20·cslsNeighbors)` (on a two-layer index the coarse candidates are
+  re-scored on the fine layer with the SERVICE's rerank margin), the self hit
+  is dropped by row identity, and the top-`cslsNeighbors` cosine similarities
+  are averaged.
+- **no HNSW**: an exact brute-force fallback, **only for indices below 50 000
+  vectors** (it is O(n²)); larger builds fail with a clear error asking for
+  `hnsw: true` or a precomputed `cslsR`.
+- **`cslsR` (the GPU path)**: skip the self-kNN entirely and ingest a
+  precomputed `r(d)` — a float32 `.npy` of shape `(N,)`, **row-aligned with
+  the input matrix** (compute it offline, e.g. batched on a GPU; remember to
+  self-exclude and to average *similarities*, not distances). The values are
+  validated (row count, finiteness) and stored verbatim, following the rows
+  through the usual skip/dedup.
+
+Restrictions: `csls` is **cosine-only** (the cut converts stored distances
+back via `cos_sim = 1 − distance`, which only holds for the cosine metric),
+and a `binary` store needs a `rerank` layer (Hamming-only distances carry no
+cosine to compute the terms from).
+
+**Saturation caveat.** After computing `r(d)` the build logs its distribution
+(`csls r(d): min/p50/p95/max = …`) and **warns when the median is ≥ 0.95**:
+an embedding space where every vector's neighbours sit at cosine ≈ 1 makes
+`CSLS ≈ 0` for *every* candidate, so a threshold cut carries almost no signal
+there — check the log line before relying on `vec:cslsThreshold`.
 
 ### Embedding endpoint (`embeddingUrl` + `embeddingModel`)
 

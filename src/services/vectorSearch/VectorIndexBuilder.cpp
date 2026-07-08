@@ -9,7 +9,9 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <filesystem>
 #include <mutex>
 #include <numeric>
@@ -96,6 +98,57 @@ void parallelOverRows(size_t n, size_t numThreads, const Job& job) {
   }
 }
 
+// Above this store size the O(n^2) brute-force r(d) fallback is refused; the
+// build then needs `hnsw: true` (the self-kNN searches the graph) or a
+// precomputed `cslsR` sidecar (the GPU path).
+constexpr size_t CSLS_BRUTE_FORCE_MAX = 50'000;
+
+// The FINE layer of the just-written flat store(s): what the csls r(d)
+// cosine distances are computed on -- the rerank matrix of a two-layer build,
+// else the single scan store -- matching the query-time exact baseline, which
+// reads the same layer.
+struct CslsFineLayer {
+  ad_utility::MmapVectorView<char> data_;
+  uu::metric_punned_t metric_;
+  size_t rowBytes_;
+  const char* ptr(size_t row) const { return data_.data() + row * rowBytes_; }
+  float distance(size_t a, size_t b) const {
+    return static_cast<float>(
+        metric_(reinterpret_cast<const uu::byte_t*>(ptr(a)),
+                reinterpret_cast<const uu::byte_t*>(ptr(b))));
+  }
+};
+
+// Log the r(d) distribution, and WARN when the embedding space is
+// near-saturated (median cosine similarity to the nearest neighbours >= 0.95:
+// cos ~ 1 everywhere makes CSLS ~ 0 for every candidate, so the threshold cut
+// carries almost no signal -- the documented CSLS failure mode).
+void logCslsDistribution(const std::string& indexName,
+                         const std::vector<float>& r) {
+  if (r.empty()) {
+    return;
+  }
+  std::vector<float> sorted = r;
+  ql::ranges::sort(sorted);
+  const size_t n = sorted.size();
+  const float min = sorted.front();
+  const float p50 = sorted[n / 2];
+  const float p95 = sorted[std::min(n - 1, (n * 95) / 100)];
+  const float max = sorted.back();
+  AD_LOG_INFO << "Vector index \"" << indexName
+              << "\": csls r(d): min/p50/p95/max = " << min << "/" << p50 << "/"
+              << p95 << "/" << max << std::endl;
+  if (p50 >= 0.95f) {
+    AD_LOG_WARN
+        << "Vector index \"" << indexName
+        << "\": the embedding space is near-saturated (median r(d) = " << p50
+        << " >= 0.95, i.e. cosine similarity ~ 1 everywhere). CSLS ~ 0 for "
+           "every candidate then, so a `vec:cslsThreshold` cut carries "
+           "little signal on this index."
+        << std::endl;
+  }
+}
+
 }  // namespace
 
 // ____________________________________________________________________________
@@ -125,6 +178,26 @@ VectorIndexBuilder::VectorIndexBuilder(std::string basename,
   if (!vecSpill_.is_open() || !iriSpill_.is_open()) {
     AD_THROW("Could not create temporary build files for vector index \"" +
              config_.name_ + "\" next to " + basename_);
+  }
+  // CSLS is cosine-specific: the query-time cut converts the stored distance
+  // back to a similarity as `cos_sim = 1 - distance`, which only holds for
+  // the cosine metric (validated upstream in `parseSpec`; checked again here
+  // for direct builder users).
+  if (config_.csls_ && config_.metric_ != VectorMetric::Cosine) {
+    AD_THROW("Vector index \"" + config_.name_ +
+             "\": `csls` works in cosine-similarity space, so it requires "
+             "`metric: cosine` (got `" +
+             toString(config_.metric_) + "`).");
+  }
+  // A `binary` store without a rerank layer serves only integer HAMMING
+  // distances -- there is no exact cosine anywhere to compute r(d) or the
+  // query-time CSLS from.
+  if (config_.csls_ && config_.scalar_ == VectorScalar::Binary &&
+      !config_.rerankScalar_.has_value()) {
+    AD_THROW("Vector index \"" + config_.name_ +
+             "\": `csls` needs exact cosine distances, but a `binary` store "
+             "without a `rerank` layer only serves Hamming distances. Add "
+             "e.g. `\"rerank\": \"bf16\"`.");
   }
   // The optional fine rerank layer: a second, independently encoded spill of
   // the SAME input rows (validated i8/binary-free upstream in `parseSpec`;
@@ -168,12 +241,36 @@ VectorIndexBuilder::~VectorIndexBuilder() {
 
 // ____________________________________________________________________________
 void VectorIndexBuilder::add(Id entity, std::string_view iri,
-                             ql::span<const float> vector) {
+                             ql::span<const float> vector,
+                             std::optional<float> cslsR) {
   if (vector.size() != config_.dimensions_) {
     AD_THROW("A vector with dimension " + std::to_string(vector.size()) +
              " was added to vector index \"" + config_.name_ +
              "\", which is configured with dimension " +
              std::to_string(config_.dimensions_) + ".");
+  }
+  // Ingested r(d) values are all-or-nothing: a row with a value while earlier
+  // rows had none (or vice versa) would silently misalign the sidecar.
+  if (cslsR.has_value()) {
+    if (!config_.csls_) {
+      AD_THROW("A cslsR value was added to vector index \"" + config_.name_ +
+               "\", which is not configured with `csls: true`.");
+    }
+    if (cslsRInput_.size() != ids_.size()) {
+      AD_THROW("Vector index \"" + config_.name_ +
+               "\": some rows carry a cslsR value and some do not; the "
+               "precomputed r(d) must cover every row.");
+    }
+    if (!std::isfinite(cslsR.value())) {
+      AD_THROW("Vector index \"" + config_.name_ + "\": row " +
+               std::to_string(ids_.size() + 1) +
+               " has a non-finite cslsR value.");
+    }
+    cslsRInput_.push_back(cslsR.value());
+  } else if (!cslsRInput_.empty()) {
+    AD_THROW("Vector index \"" + config_.name_ +
+             "\": some rows carry a cslsR value and some do not; the "
+             "precomputed r(d) must cover every row.");
   }
   // Convert to the storage scalar (no-op for f32). The `binary` sign-pack
   // cast (usearch's f32 -> b1x8) memsets only the `dim / 8` WHOLE output
@@ -316,8 +413,25 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   const std::string rerankPath = vectorRerankDataFile(basename_, config_.name_);
   const std::string irisPath = vectorIrisFile(basename_, config_.name_);
   const std::string hnswPath = vectorHnswFile(basename_, config_.name_);
+  const std::string cslsPath = vectorCslsFile(basename_, config_.name_);
   const std::string metaPath = vectorMetaFile(basename_, config_.name_);
   auto tmp = [](const std::string& path) { return path + ".tmp"; };
+
+  // Open the FINE layer of the just-gathered store(s) for the csls r(d)
+  // computation (see `CslsFineLayer`). Only called after step 3 has written
+  // the matrices.
+  auto openFineLayer = [&]() {
+    CslsFineLayer fine;
+    fine.data_.open(twoLayer ? tmp(rerankPath) : tmp(dataPath),
+                    ad_utility::AccessPattern::Random);
+    fine.rowBytes_ = twoLayer ? rerankRowBytes_ : rowBytes_;
+    const VectorScalar fineScalar = config_.rerankScalar_.value_or(
+        config_.scalar_);  // never `binary` with csls (rejected in the ctor)
+    fine.metric_ = uu::metric_punned_t{config_.dimensions_,
+                                       toUsearchMetric(config_.metric_),
+                                       toUsearchScalar(fineScalar)};
+    return fine;
+  };
 
   // Gather one flat matrix from its spill file in sorted `rows` order
   // (parallel positional reads directly into the memory-mapped destination).
@@ -407,6 +521,12 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   //    vectors read from the just-written memory-mapped flat store: neither
   //    the build nor the resulting file contains a second copy of the vectors.
   bool hasHnsw = config_.buildHnsw_ && n > 0;
+  // The per-final-row csls r(d) (filled iff `config_.csls_`): ingested from
+  // `add`'s cslsR values, or computed by a self-kNN -- against the in-RAM
+  // HNSW graph below when there is one, else by the (small-store) brute
+  // force of step 6b.
+  std::vector<float> cslsR;
+  const bool cslsSelfKnn = config_.csls_ && cslsRInput_.empty();
   if (hasHnsw) {
     outputsCleanup.track(tmp(hnswPath));
     ad_utility::MmapVectorView<char> data;
@@ -438,7 +558,8 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     uu::index_limits_t limits;
     limits.members = n;
     limits.threads_add = numThreads;
-    limits.threads_search = 1;
+    // The csls self-kNN below searches the graph from all build threads.
+    limits.threads_search = cslsSelfKnn ? numThreads : 1;
     if (!graph.try_reserve(limits)) {
       AD_THROW("Could not allocate the HNSW graph for vector index \"" +
                config_.name_ + "\" (" + std::to_string(n) + " nodes).");
@@ -462,6 +583,59 @@ VectorIndexMetadata VectorIndexBuilder::build() {
             }
           }
         });
+    if (cslsSelfKnn) {
+      // csls r(d) via the in-RAM graph: search every row's OWN stored vector,
+      // drop the self hit (by row identity), and average the cosine
+      // similarity `1 - distance` of the top-`cslsNeighbors` neighbours ON
+      // THE FINE LAYER. The graph ranks by the COARSE scan metric (i8 cosine
+      // or binary Hamming on a two-layer build), so a two-layer build
+      // over-fetches with the SERVICE's rerank margin (`defaultRerankK`) and
+      // re-scores the candidates exactly on the fine layer; a single-layer
+      // graph already ranks in the fine metric, so `k + 1` (the self hit)
+      // suffices.
+      const CslsFineLayer fine = openFineLayer();
+      const size_t k = config_.cslsNeighbors_;
+      const size_t fetch = std::min(
+          n, twoLayer ? std::max(defaultRerankK(config_.scalar_, k), k + 1)
+                      : k + 1);
+      // RECALL-tuned search expansion (efSearch): the self-kNN feeds a
+      // persisted statistic, so it uses `max(200, 20 * k, fetch)` rather than
+      // the (typically much smaller) query-time `hnswExpansionSearch_`.
+      const size_t expansion = std::max({size_t{200}, 20 * k, fetch});
+      AD_LOG_INFO << "Vector index \"" << config_.name_
+                  << "\": computing csls r(d) via the HNSW graph (" << n
+                  << " vectors, " << k << " neighbours, expansion " << expansion
+                  << ") ..." << std::endl;
+      cslsR.assign(n, 0.f);
+      parallelOverRows(
+          n, numThreads, [&](size_t t, size_t first, size_t last, auto& stop) {
+            std::vector<uint64_t> cand(fetch);
+            std::vector<uu::distance_punned_t> coarseDists(fetch);
+            for (size_t row = first; row < last; ++row) {
+              if (stop.load(std::memory_order_relaxed)) return;
+              uu::index_search_config_t searchConfig;
+              searchConfig.thread = t;
+              searchConfig.expansion = expansion;
+              auto found = graph.search(graphMetric.rowPtr(row), fetch,
+                                        graphMetric, searchConfig);
+              if (!found) {
+                throw std::runtime_error{
+                    std::string{"The csls r(d) self-search on the HNSW graph "
+                                "failed: "} +
+                    found.error.what()};
+              }
+              size_t count = found.dump_to(cand.data(), coarseDists.data());
+              CslsNeighborhood top{k};
+              for (size_t i = 0; i < count; ++i) {
+                if (cand[i] == row) {
+                  continue;  // SELF-EXCLUDED, by row identity
+                }
+                top.offer(fine.distance(row, cand[i]));
+              }
+              cslsR[row] = top.meanCosSim();
+            }
+          });
+    }
     std::ofstream hnswOut{tmp(hnswPath), std::ios::binary | std::ios::trunc};
     bool streamOk = true;
     auto saved = graph.save_to_stream([&](const void* buffer, size_t length) {
@@ -475,6 +649,56 @@ VectorIndexMetadata VectorIndexBuilder::build() {
       AD_THROW("Could not save the HNSW graph of vector index \"" +
                config_.name_ + "\" (disk full?): " +
                (saved ? "stream write failed" : saved.error.what()));
+    }
+  }
+
+  // 6b. The csls r(d) sidecar. The HNSW self-kNN above already filled `cslsR`
+  //     when there was a graph; otherwise the values are ingested verbatim
+  //     (the precomputed `cslsR` GPU path) or brute-forced for a small store.
+  if (config_.csls_) {
+    if (!cslsRInput_.empty()) {
+      // Ingested: `add` enforced one value per row, so the permutation below
+      // is total. Carried verbatim through the same sort/dedup as the rows.
+      AD_CORRECTNESS_CHECK(cslsRInput_.size() == ids_.size());
+      cslsR.resize(n);
+      for (size_t i = 0; i < n; ++i) {
+        cslsR[i] = cslsRInput_[rows[i]];
+      }
+    } else if (!hasHnsw) {
+      if (n >= CSLS_BRUTE_FORCE_MAX) {
+        AD_THROW("Vector index \"" + config_.name_ +
+                 "\": csls needs `hnsw: true` or a precomputed `cslsR` for "
+                 "indexes with >= " +
+                 std::to_string(CSLS_BRUTE_FORCE_MAX) +
+                 " vectors (the brute-force r(d) fallback is O(n^2); got " +
+                 std::to_string(n) + " vectors).");
+      }
+      // Small store: EXACT r(d) by brute force over the fine layer.
+      const CslsFineLayer fine = openFineLayer();
+      const size_t k = config_.cslsNeighbors_;
+      cslsR.assign(n, 0.f);
+      parallelOverRows(n, numThreads,
+                       [&](size_t, size_t first, size_t last, auto& stop) {
+                         for (size_t row = first; row < last; ++row) {
+                           if (stop.load(std::memory_order_relaxed)) return;
+                           CslsNeighborhood top{k};
+                           for (size_t j = 0; j < n; ++j) {
+                             if (j == row) {
+                               continue;  // SELF-EXCLUDED, by row identity
+                             }
+                             top.offer(fine.distance(row, j));
+                           }
+                           cslsR[row] = top.meanCosSim();
+                         }
+                       });
+    }
+    AD_CORRECTNESS_CHECK(cslsR.size() == n);
+    logCslsDistribution(config_.name_, cslsR);
+    {
+      outputsCleanup.track(tmp(cslsPath));
+      ad_utility::MmapVector<float> out;
+      out.open(n, tmp(cslsPath));
+      ql::ranges::copy(cslsR, out.begin());
     }
   }
 
@@ -503,8 +727,8 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   }
 
   // 8. Rename everything into place (metadata last, see above). A stale
-  //    `.hnsw`/`.rerank.data` file from a previous build is removed if this
-  //    build has none.
+  //    `.hnsw`/`.rerank.data`/`.csls` file from a previous build is removed
+  //    if this build has none.
   std::filesystem::rename(tmp(dataPath), dataPath);
   if (twoLayer) {
     std::filesystem::rename(tmp(rerankPath), rerankPath);
@@ -520,6 +744,12 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   } else {
     std::error_code ec;
     std::filesystem::remove(hnswPath, ec);
+  }
+  if (config_.csls_) {
+    std::filesystem::rename(tmp(cslsPath), cslsPath);
+  } else {
+    std::error_code ec;
+    std::filesystem::remove(cslsPath, ec);
   }
   std::filesystem::rename(tmp(metaPath), metaPath);
   outputsCleanup.dismiss();

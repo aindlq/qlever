@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -205,6 +206,9 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
                                         "metric",
                                         "scalar",
                                         "rerank",
+                                        "csls",
+                                        "cslsNeighbors",
+                                        "cslsR",
                                         "hnsw",
                                         "hnswConnectivity",
                                         "hnswExpansionAdd",
@@ -215,8 +219,9 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
     if (ql::ranges::find(knownKeys, key) == knownKeys.end()) {
       AD_THROW("Unknown key \"" + key +
                "\" in a vectorSearch build spec. Known keys: name, iris, npy, "
-               "dimensions, metric, scalar, rerank, hnsw, hnswConnectivity, "
-               "hnswExpansionAdd, hnswExpansionSearch, buildThreads, remap. "
+               "dimensions, metric, scalar, rerank, csls, cslsNeighbors, "
+               "cslsR, hnsw, hnswConnectivity, hnswExpansionAdd, "
+               "hnswExpansionSearch, buildThreads, remap. "
                "(The query-time embedding endpoint/model and the RAM "
                "residency are serving concerns, set at server start via the "
                "QLEVER_VECTOR_SEARCH_ENDPOINTS environment variable, not at "
@@ -244,6 +249,9 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
         !rerank.empty()) {
       spec.config_.rerankScalar_ = vectorScalarFromString(rerank);
     }
+    spec.config_.csls_ = obj.value("csls", false);
+    spec.config_.cslsNeighbors_ = obj.value("cslsNeighbors", uint32_t{10});
+    spec.config_.cslsRPath_ = obj.value("cslsR", std::string{});
     spec.config_.buildHnsw_ = obj.value("hnsw", true);
     spec.config_.hnswConnectivity_ =
         obj.value("hnswConnectivity", uint32_t{16});
@@ -286,6 +294,35 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
         "high-precision layer the rerank pass and `vec:distance` read); `" +
         toString(spec.config_.rerankScalar_.value()) +
         "` belongs in the `scalar` scan layer.");
+  }
+  // CSLS is cosine-specific: the query-time cut converts distances back to
+  // similarities as `cos_sim = 1 - distance`, which only holds for the
+  // cosine metric.
+  if (spec.config_.csls_ && spec.config_.metric_ != VectorMetric::Cosine) {
+    AD_THROW(
+        "`csls` works in cosine-similarity space (the cut converts distances "
+        "back via `cos_sim = 1 - distance`), so it requires `metric: cosine` "
+        "(got `" +
+        toString(spec.config_.metric_) + "`).");
+  }
+  // A `binary` store without a rerank layer serves only Hamming distances --
+  // no exact cosine anywhere to compute the CSLS terms from.
+  if (spec.config_.csls_ && spec.config_.scalar_ == VectorScalar::Binary &&
+      !spec.config_.rerankScalar_.has_value()) {
+    AD_THROW(
+        "`csls` needs exact cosine distances, but `scalar: binary` without a "
+        "`rerank` layer only serves Hamming distances. Add e.g. `\"rerank\": "
+        "\"bf16\"`.");
+  }
+  // The csls sub-keys without `csls: true` would silently do nothing.
+  if (!spec.config_.csls_ &&
+      (obj.contains("cslsNeighbors") || obj.contains("cslsR"))) {
+    AD_THROW(
+        "The `cslsNeighbors`/`cslsR` keys require `\"csls\": true` in the "
+        "same vectorSearch build spec.");
+  }
+  if (spec.config_.csls_ && spec.config_.cslsNeighbors_ == 0) {
+    AD_THROW("`cslsNeighbors` must be a positive integer.");
   }
   // A binary index WITHOUT a rerank layer is allowed but every distance it
   // can serve is the Hamming sign-bit proxy -- point that out at build time.
@@ -381,6 +418,27 @@ VectorIndexMetadata buildFromReader(const Index& index,
   VectorIndexBuilder builder{basename, config};
   builder.setVocabSize(vocabFingerprint(index.getImpl()));
   builder.setCollationLocale(collationFingerprint(index.getImpl()));
+  // The optional PRECOMPUTED csls r(d) column (the `cslsR` GPU path): one f32
+  // per INPUT row, in the input's row order. Each value follows its row
+  // through the resolve/skip below (and the builder's dedup/sort), so the
+  // final `.csls` sidecar stays row-aligned with the store.
+  std::vector<float> cslsRColumn;
+  if (config.csls_ && !config.cslsRPath_.empty()) {
+    cslsRColumn = readNpyFloatColumn(config.cslsRPath_);
+    if (cslsRColumn.size() != reader.numRows()) {
+      AD_THROW("The cslsR file " + config.cslsRPath_ + " has " +
+               std::to_string(cslsRColumn.size()) +
+               " values, but the vector input has " +
+               std::to_string(reader.numRows()) +
+               " rows; the two must be row-aligned.");
+    }
+    for (size_t i = 0; i < cslsRColumn.size(); ++i) {
+      if (!std::isfinite(cslsRColumn[i])) {
+        AD_THROW("Row " + std::to_string(i + 1) + " of the cslsR file " +
+                 config.cslsRPath_ + " is not a finite number.");
+      }
+    }
+  }
   const size_t dim = config.dimensions_;
   std::vector<std::string> iris;
   std::vector<float> vectors;  // batch, row-major
@@ -414,8 +472,15 @@ VectorIndexMetadata buildFromReader(const Index& index,
     auto ids = resolveBatch(index, iris, lineNumber, numThreads);
     for (size_t i = 0; i < iris.size(); ++i) {
       if (ids[i].has_value()) {
+        // The absolute (0-based) input row of this batch entry, indexing the
+        // row-aligned cslsR column.
+        const size_t inputRow = static_cast<size_t>(lineNumber - 1) + i;
+        std::optional<float> cslsR =
+            cslsRColumn.empty() ? std::nullopt
+                                : std::optional<float>{cslsRColumn[inputRow]};
         builder.add(ids[i].value(), iris[i],
-                    ql::span<const float>{vectors.data() + i * dim, dim});
+                    ql::span<const float>{vectors.data() + i * dim, dim},
+                    cslsR);
         ++resolved;
       } else {
         ++skipped;
@@ -711,7 +776,11 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                 ? " + rerank " +
                       toString(idx.metadata().config_.rerankScalar_.value())
                 : "")
-        << ", HNSW=" << (idx.hasHnsw() ? "yes" : "no") << ")" << std::endl;
+        << ", HNSW=" << (idx.hasHnsw() ? "yes" : "no")
+        << (idx.hasCsls()
+                ? ", csls(k=" + std::to_string(idx.cslsNeighbors()) + ")"
+                : "")
+        << ")" << std::endl;
     // Apply the endpoint fields of the environment override BEFORE the
     // metadata fields are collected, so the `vec:model` metadata triple
     // reflects the effective model. (The "preload" field was already applied

@@ -57,6 +57,11 @@ class NpyVectorInputReader : public VectorInputReader {
   std::ifstream iris_;
 };
 
+// Read a little-endian float32 `.npy` of shape `(N,)` or `(N, 1)` fully into
+// memory. The loader of the precomputed csls r(d) input (the `cslsR` build
+// key): one f32 per row of the vector `.npy`, in the same row order.
+std::vector<float> readNpyFloatColumn(const std::string& npyPath);
+
 }  // namespace qlever::vector
 
 #endif  // QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINPUTREADER_H

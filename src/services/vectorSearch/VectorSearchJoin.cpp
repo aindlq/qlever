@@ -36,6 +36,9 @@ VectorSearchJoin::VectorSearchJoin(
   AD_CONTRACT_CHECK(
       config_.hasQueryPoint() || !config_.coarseScoreVariable_.has_value(),
       "`<bindCoarseScore>` requires a query point.");
+  AD_CONTRACT_CHECK(
+      config_.hasQueryPoint() || !config_.cslsThreshold_.has_value(),
+      "`<cslsThreshold>` requires a query point.");
   if (!child_) {
     // INCOMPLETE form: the subtree binding `<candidates>` comes from the
     // surrounding query. Expose the variables as possibly-undefined columns
@@ -56,6 +59,10 @@ VectorSearchJoin::VectorSearchJoin(
     }
     if (config_.coarseScoreVariable_.has_value()) {
       variableColumns_[config_.coarseScoreVariable_.value()] =
+          makePossiblyUndefinedColumn(ColumnIndex{next++});
+    }
+    if (config_.cslsVariable_.has_value()) {
+      variableColumns_[config_.cslsVariable_.value()] =
           makePossiblyUndefinedColumn(ColumnIndex{next++});
     }
     return;
@@ -92,10 +99,13 @@ VectorSearchJoin::VectorSearchJoin(
     checkNotBoundByChild(config_.coarseScoreVariable_.value(),
                          "bindCoarseScore");
   }
+  if (config_.cslsVariable_.has_value()) {
+    checkNotBoundByChild(config_.cslsVariable_.value(), "bindCsls");
+  }
 
   // Output columns: all child columns, then `?result` (unless it annotates
-  // the candidates column in place), then the optional `?score` and
-  // `?coarseScore`.
+  // the candidates column in place), then the optional `?score`,
+  // `?coarseScore`, and `?csls`.
   variableColumns_ = childCols;
   size_t next = child_->getResultWidth();
   if (!annotatesCandidatesInPlace()) {
@@ -108,6 +118,10 @@ VectorSearchJoin::VectorSearchJoin(
   }
   if (config_.coarseScoreVariable_.has_value()) {
     variableColumns_[config_.coarseScoreVariable_.value()] =
+        makeAlwaysDefinedColumn(ColumnIndex{next++});
+  }
+  if (config_.cslsVariable_.has_value()) {
+    variableColumns_[config_.cslsVariable_.value()] =
         makeAlwaysDefinedColumn(ColumnIndex{next++});
   }
 }
@@ -148,7 +162,8 @@ size_t VectorSearchJoin::getResultWidth() const {
   size_t ownColumns =
       static_cast<size_t>(!annotatesCandidatesInPlace()) +
       static_cast<size_t>(config_.scoreVariable_.has_value()) +
-      static_cast<size_t>(config_.coarseScoreVariable_.has_value());
+      static_cast<size_t>(config_.coarseScoreVariable_.has_value()) +
+      static_cast<size_t>(config_.cslsVariable_.has_value());
   if (!child_) {
     // Incomplete: `<candidates>`, plus the own columns.
     return 1 + ownColumns;
@@ -257,6 +272,16 @@ std::string VectorSearchJoin::getCacheKeyImpl() const {
     absl::StrAppend(
         &key, " maxDist=",
         absl::Hex(absl::bit_cast<uint32_t>(config_.maxDistance_.value())));
+  }
+  if (config_.cslsThreshold_.has_value()) {
+    absl::StrAppend(
+        &key, " cslsThreshold=",
+        absl::Hex(absl::bit_cast<uint32_t>(config_.cslsThreshold_.value())),
+        " csls=", config_.cslsVariable_.has_value(),
+        " cslsKCap=", config_.cslsKCap_.value_or(0));
+    if (config_.cslsNeighbors_.has_value()) {
+      absl::StrAppend(&key, " cslsNeighbors=", config_.cslsNeighbors_.value());
+    }
   }
   qlever::vector::appendQueryPointToCacheKey(&key, config_);
   if (child_) {
@@ -423,8 +448,48 @@ void VectorSearchJoin::computePreFilterRows(
 
   const bool withCoarseScore = config_.coarseScoreVariable_.has_value();
   ad_utility::HashMap<Id, float> coarseDistances;
+  // The CSLS value of every kept candidate, iff `vec:cslsThreshold` is set.
+  ad_utility::HashMap<Id, float> cslsValues;
   std::vector<qlever::vector::ScoredEntity> scored;
-  if (vidx.hasRerankLayer()) {
+  if (config_.cslsThreshold_.has_value()) {
+    // CSLS cut over the BOUND set: one full fine-layer sweep of exactly the
+    // candidate members (like the annotate path -- no coarse pass), r(q) from
+    // the top-`cslsNeighbors` of that set, then the tau filter. Survivors
+    // keep their COSINE distance as the score; `vec:k` (if explicitly given)
+    // caps them, otherwise all survivors are kept (variable cardinality).
+    qlever::vector::validateCslsIsAvailable(config_, vidx);
+    const float threshold = config_.cslsThreshold_.value();
+    const size_t neighbors =
+        config_.cslsNeighbors_.value_or(vidx.cslsNeighbors());
+    ad_utility::Timer cslsTimer{ad_utility::Timer::Started};
+    size_t numScored = 0;
+    auto hits =
+        queryEntity.has_value()
+            ? vidx.searchCslsByEntity(queryEntity.value(), threshold, neighbors,
+                                      candidates, config_.maxDistance_,
+                                      checkInterrupt, &numScored)
+            : vidx.searchCsls(query, threshold, neighbors, candidates,
+                              config_.maxDistance_, checkInterrupt, &numScored);
+    const double ms = cslsTimer.value().count() / 1000.0;
+    qlever::vector::logVectorSearchPhase(config_.indexName_,
+                                         "full fine scan (csls, index members)",
+                                         ms, numScored);
+    qlever::vector::logVectorSearchPhase(
+        config_.indexName_,
+        absl::StrCat("csls filter: ", numScored, " candidates -> ", hits.size(),
+                     " kept"),
+        ms);
+    if (config_.cslsKCap_.has_value() &&
+        hits.size() > config_.cslsKCap_.value()) {
+      hits.resize(config_.cslsKCap_.value());
+    }
+    scored.reserve(hits.size());
+    for (const auto& hit : hits) {
+      scored.push_back(
+          qlever::vector::ScoredEntity{hit.entity_, hit.distance_});
+      cslsValues[hit.entity_] = hit.csls_;
+    }
+  } else if (vidx.hasRerankLayer()) {
     // Coarse pass over exactly the bound set, then the fine rerank pass over
     // the coarse survivors (never below `effectiveK`, so the annotate form
     // without `<k>` keeps every candidate). `maxDistance` filters on the
@@ -493,6 +558,7 @@ void VectorSearchJoin::computePreFilterRows(
   // `?result` column (unless annotating in place) and the score column(s).
   const bool annotate = annotatesCandidatesInPlace();
   const bool withScore = config_.scoreVariable_.has_value();
+  const bool withCsls = config_.cslsVariable_.has_value();
   const size_t childWidth = childTable.numColumns();
   for (size_t row = 0; row < childTable.numRows(); ++row) {
     checkCancellation();
@@ -518,6 +584,13 @@ void VectorSearchJoin::computePreFilterRows(
       auto coarseIt = coarseDistances.find(candidate);
       (*result)(outRow, next++) = Id::makeFromDouble(
           coarseIt != coarseDistances.end() ? coarseIt->second : it->second);
+    }
+    if (withCsls) {
+      // Every kept candidate came out of the csls cut, so the lookup always
+      // hits (`vec:bindCsls` requires `vec:cslsThreshold` at parse time).
+      auto cslsIt = cslsValues.find(candidate);
+      AD_CORRECTNESS_CHECK(cslsIt != cslsValues.end());
+      (*result)(outRow, next++) = Id::makeFromDouble(cslsIt->second);
     }
   }
 }

@@ -28,8 +28,10 @@ uint64_t parseUnsigned(std::string_view s, std::string_view what) {
   return value;
 }
 
-// Parse the `'shape': (N, D)` tuple out of a NumPy header dictionary string.
-std::pair<uint64_t, uint32_t> parseShape(const std::string& header) {
+// Parse the `'shape': (...)` tuple out of a NumPy header dictionary string
+// into its (non-empty) fields; a trailing comma (the 1-D form `(N,)`) yields
+// a single field.
+std::vector<uint64_t> parseShapeFields(const std::string& header) {
   auto pos = header.find("'shape'");
   if (pos == std::string::npos) {
     AD_THROW("The .npy header has no shape field.");
@@ -42,9 +44,7 @@ std::pair<uint64_t, uint32_t> parseShape(const std::string& header) {
   }
   std::string tuple = header.substr(pos + 1, end - pos - 1);
   // `tuple` is like "200, 16" (possibly with a trailing comma for 1-D).
-  uint64_t n = 0;
-  uint32_t d = 0;
-  int field = 0;
+  std::vector<uint64_t> fields;
   std::string cur;
   auto flush = [&]() {
     // Trim whitespace; skip empty fields (e.g. after a trailing comma).
@@ -52,12 +52,7 @@ std::pair<uint64_t, uint32_t> parseShape(const std::string& header) {
     if (first == std::string::npos) return;
     auto last = cur.find_last_not_of(" \t");
     std::string_view token{cur.data() + first, last - first + 1};
-    if (field == 0) {
-      n = parseUnsigned(token, "number of rows");
-    } else if (field == 1) {
-      d = static_cast<uint32_t>(parseUnsigned(token, "dimension"));
-    }
-    ++field;
+    fields.push_back(parseUnsigned(token, "shape field"));
     cur.clear();
   };
   for (char c : tuple) {
@@ -68,29 +63,24 @@ std::pair<uint64_t, uint32_t> parseShape(const std::string& header) {
     }
   }
   flush();
-  if (field != 2) {
-    AD_THROW("The .npy input must be a 2-D array of shape (N, D); got shape (" +
-             tuple + ")");
-  }
-  return {n, d};
+  return fields;
 }
-}  // namespace
 
-// ____________________________________________________________________________
-NpyVectorInputReader::NpyVectorInputReader(const std::string& npyPath,
-                                           const std::string& irisPath)
-    : npy_{npyPath, std::ios::binary}, iris_{irisPath} {
-  if (!npy_.is_open()) {
-    AD_THROW("Could not open the .npy file " + npyPath);
+// Parse the `'shape': (N, D)` tuple out of a NumPy header dictionary string.
+std::pair<uint64_t, uint32_t> parseShape(const std::string& header) {
+  std::vector<uint64_t> fields = parseShapeFields(header);
+  if (fields.size() != 2) {
+    AD_THROW("The .npy input must be a 2-D array of shape (N, D).");
   }
-  if (!iris_.is_open()) {
-    AD_THROW("Could not open the IRI list file " + irisPath);
-  }
+  return {fields[0], static_cast<uint32_t>(fields[1])};
+}
 
-  // Magic string + version.
+// Read the `.npy` prelude (magic string, version, header length) and return
+// the header dictionary, leaving `in` positioned at the first data byte.
+std::string readNpyHeader(std::ifstream& in, const std::string& npyPath) {
   std::array<char, 8> prelude{};
-  npy_.read(prelude.data(), prelude.size());
-  if (npy_.gcount() != 8 || prelude[0] != '\x93' || prelude[1] != 'N' ||
+  in.read(prelude.data(), prelude.size());
+  if (in.gcount() != 8 || prelude[0] != '\x93' || prelude[1] != 'N' ||
       prelude[2] != 'U' || prelude[3] != 'M' || prelude[4] != 'P' ||
       prelude[5] != 'Y') {
     AD_THROW("Not a valid .npy file: " + npyPath);
@@ -105,16 +95,16 @@ NpyVectorInputReader::NpyVectorInputReader(const std::string& npyPath,
   uint32_t headerLen = 0;
   if (major == 1) {
     std::array<uint8_t, 2> b{};
-    npy_.read(reinterpret_cast<char*>(b.data()), 2);
-    if (npy_.gcount() != 2) {
+    in.read(reinterpret_cast<char*>(b.data()), 2);
+    if (in.gcount() != 2) {
       AD_THROW("Unexpected end of file in the .npy header of " + npyPath);
     }
     headerLen =
         static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8);
   } else {
     std::array<uint8_t, 4> b{};
-    npy_.read(reinterpret_cast<char*>(b.data()), 4);
-    if (npy_.gcount() != 4) {
+    in.read(reinterpret_cast<char*>(b.data()), 4);
+    if (in.gcount() != 4) {
       AD_THROW("Unexpected end of file in the .npy header of " + npyPath);
     }
     headerLen = static_cast<uint32_t>(b[0]) |
@@ -129,35 +119,52 @@ NpyVectorInputReader::NpyVectorInputReader(const std::string& npyPath,
              std::to_string(headerLen) + " bytes).");
   }
   std::string header(headerLen, '\0');
-  npy_.read(header.data(), headerLen);
-  if (npy_.gcount() != static_cast<std::streamsize>(headerLen)) {
+  in.read(header.data(), headerLen);
+  if (in.gcount() != static_cast<std::streamsize>(headerLen)) {
     AD_THROW("Unexpected end of file in the .npy header of " + npyPath);
   }
+  return header;
+}
+
+// Whether the header's `descr` VALUE is exactly `value` (a substring check
+// would accept a structured dtype that merely contains such a field and then
+// silently misread the row stride).
+bool npyDescrIs(const std::string& header, std::string_view value) {
+  size_t pos = header.find("'descr'");
+  if (pos == std::string::npos) return false;
+  pos = header.find(':', pos);
+  if (pos == std::string::npos) return false;
+  pos = header.find_first_not_of(" ", pos + 1);
+  if (pos == std::string::npos) return false;
+  for (std::string_view quote : {"'", "\""}) {
+    std::string quoted =
+        std::string{quote} + std::string{value} + std::string{quote};
+    if (header.compare(pos, quoted.size(), quoted) == 0) return true;
+  }
+  return false;
+}
+}  // namespace
+
+// ____________________________________________________________________________
+NpyVectorInputReader::NpyVectorInputReader(const std::string& npyPath,
+                                           const std::string& irisPath)
+    : npy_{npyPath, std::ios::binary}, iris_{irisPath} {
+  if (!npy_.is_open()) {
+    AD_THROW("Could not open the .npy file " + npyPath);
+  }
+  if (!iris_.is_open()) {
+    AD_THROW("Could not open the IRI list file " + irisPath);
+  }
+
+  const std::string header = readNpyHeader(npy_, npyPath);
 
   // We only support little-endian C-order matrices of float32 ('<f4') or --
   // for bfloat16 matrices written via `ml_dtypes` (numpy has no native bf16
   // type code) -- the opaque 2-byte void '<V2', whose value bytes are the
-  // little-endian bf16 bit pattern (the top 16 bits of the fp32). Match the
-  // `descr` VALUE exactly (a substring check would accept a structured dtype
-  // that merely contains such a field and then silently misread the row
-  // stride).
-  auto descrIs = [&header](std::string_view value) {
-    size_t pos = header.find("'descr'");
-    if (pos == std::string::npos) return false;
-    pos = header.find(':', pos);
-    if (pos == std::string::npos) return false;
-    pos = header.find_first_not_of(" ", pos + 1);
-    if (pos == std::string::npos) return false;
-    for (std::string_view quote : {"'", "\""}) {
-      std::string quoted =
-          std::string{quote} + std::string{value} + std::string{quote};
-      if (header.compare(pos, quoted.size(), quoted) == 0) return true;
-    }
-    return false;
-  };
-  if (descrIs("<f4")) {
+  // little-endian bf16 bit pattern (the top 16 bits of the fp32).
+  if (npyDescrIs(header, "<f4")) {
     bytesPerScalar_ = sizeof(float);
-  } else if (descrIs("<V2")) {
+  } else if (npyDescrIs(header, "<V2")) {
     bytesPerScalar_ = 2;
   } else {
     AD_THROW(
@@ -251,6 +258,40 @@ bool NpyVectorInputReader::next(std::string& iri, std::vector<float>& vector) {
   }
   ++rowsRead_;
   return true;
+}
+
+// ____________________________________________________________________________
+std::vector<float> readNpyFloatColumn(const std::string& npyPath) {
+  std::ifstream in{npyPath, std::ios::binary};
+  if (!in.is_open()) {
+    AD_THROW("Could not open the .npy file " + npyPath);
+  }
+  const std::string header = readNpyHeader(in, npyPath);
+  if (!npyDescrIs(header, "<f4")) {
+    AD_THROW("The .npy file " + npyPath +
+             " must be little-endian float32 ('<f4'). Header: " +
+             header.substr(0, 200));
+  }
+  if (header.find("'fortran_order': False") == std::string::npos) {
+    AD_THROW("The .npy file " + npyPath +
+             " must be C-order (fortran_order: False).");
+  }
+  std::vector<uint64_t> fields = parseShapeFields(header);
+  const bool columnShape =
+      fields.size() == 1 || (fields.size() == 2 && fields[1] == 1);
+  if (!columnShape) {
+    AD_THROW("The .npy file " + npyPath +
+             " must be a single float column of shape (N,) or (N, 1).");
+  }
+  const uint64_t n = fields.empty() ? 0 : fields[0];
+  std::vector<float> out(n);
+  const auto bytes = static_cast<std::streamsize>(n * sizeof(float));
+  in.read(reinterpret_cast<char*>(out.data()), bytes);
+  if (in.gcount() != bytes) {
+    AD_THROW("Unexpected end of data in the .npy file " + npyPath + " (" +
+             std::to_string(n) + " float32 values expected).");
+  }
+  return out;
 }
 
 }  // namespace qlever::vector

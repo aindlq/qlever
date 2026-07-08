@@ -56,6 +56,17 @@ void appendQueryPointToCacheKey(std::string* key,
 }
 
 // ____________________________________________________________________________
+void validateCslsIsAvailable(const VectorSearchConfiguration& config,
+                             const VectorIndex& vidx) {
+  if (!vidx.hasCsls()) {
+    throw std::runtime_error{absl::StrCat(
+        "`vec:cslsThreshold` requires an index built with `\"csls\": true`, "
+        "but vector index '",
+        config.indexName_, "' was not built with csls:true.")};
+  }
+}
+
+// ____________________________________________________________________________
 IdTable computeWholeIndexSearch(
     const VectorSearchConfiguration& config, QueryExecutionContext* qec,
     const ad_utility::SharedCancellationHandle& handle) {
@@ -67,10 +78,14 @@ IdTable computeWholeIndexSearch(
         "There is no loaded vector index named '", config.indexName_,
         "'. Was the index built with `--service-index`?")};
   }
+  if (config.cslsThreshold_.has_value()) {
+    validateCslsIsAvailable(config, *vidx);
+  }
 
   const size_t width =
       1 + static_cast<size_t>(config.scoreVariable_.has_value()) +
-      static_cast<size_t>(config.coarseScoreVariable_.has_value());
+      static_cast<size_t>(config.coarseScoreVariable_.has_value()) +
+      static_cast<size_t>(config.cslsVariable_.has_value());
   IdTable idTable{width, qec->getAllocator()};
 
   // Resolve the query point (shared with the `vec:distance` function): an
@@ -98,6 +113,54 @@ IdTable computeWholeIndexSearch(
                      config.indexName_, "' has no HNSW structure.")};
   }
   auto checkInterrupt = [&handle]() { handle->throwIfCancelled(); };
+
+  if (config.cslsThreshold_.has_value()) {
+    // CSLS cut over the WHOLE index: one FULL scan on the fine layer (CSLS
+    // needs every candidate's cosine, so the coarse/HNSW layer is not used),
+    // then the query-adaptive `2*cos_sim - r(q) - r(d) >= tau` filter.
+    // `vec:bindScore` stays the cosine distance; survivors sort by it.
+    const float threshold = config.cslsThreshold_.value();
+    const size_t neighbors =
+        config.cslsNeighbors_.value_or(vidx->cslsNeighbors());
+    ad_utility::Timer cslsTimer{ad_utility::Timer::Started};
+    size_t numScored = 0;
+    std::vector<CslsScoredEntity> hits =
+        queryEntity.has_value()
+            ? vidx->searchCslsByEntity(
+                  queryEntity.value(), threshold, neighbors, std::nullopt,
+                  config.maxDistance_, checkInterrupt, &numScored)
+            : vidx->searchCsls(query, threshold, neighbors, std::nullopt,
+                               config.maxDistance_, checkInterrupt, &numScored);
+    const double ms = cslsTimer.value().count() / 1000.0;
+    logVectorSearchPhase(config.indexName_,
+                         "full fine scan (csls; coarse layer unused)", ms,
+                         numScored);
+    logVectorSearchPhase(config.indexName_,
+                         absl::StrCat("csls filter: ", numScored,
+                                      " candidates -> ", hits.size(), " kept"),
+                         ms);
+    // An EXPLICIT `vec:k` caps the survivors (they are already ascending by
+    // cosine distance); without one ALL survivors are returned.
+    if (config.cslsKCap_.has_value() &&
+        hits.size() > config.cslsKCap_.value()) {
+      hits.resize(config.cslsKCap_.value());
+    }
+    idTable.resize(hits.size());
+    const bool withScoreCsls = config.scoreVariable_.has_value();
+    // Column layout: `?result`[, `?score`][, `?csls`] (`vec:bindCoarseScore`
+    // is rejected together with the csls cut at parse time).
+    const size_t cslsCol = 1 + static_cast<size_t>(withScoreCsls);
+    for (size_t i = 0; i < hits.size(); ++i) {
+      idTable(i, 0) = hits[i].entity_;
+      if (withScoreCsls) {
+        idTable(i, 1) = Id::makeFromDouble(hits[i].distance_);
+      }
+      if (config.cslsVariable_.has_value()) {
+        idTable(i, cslsCol) = Id::makeFromDouble(hits[i].csls_);
+      }
+    }
+    return idTable;
+  }
 
   // Whole-index search (by the stored vector for the entity form -- no
   // decode/re-encode through f32).
@@ -215,8 +278,8 @@ VectorSearch::VectorSearch(QueryExecutionContext* qec,
                            qlever::vector::VectorSearchConfiguration config)
     : Operation{qec}, config_{std::move(config)} {
   // Column layout: `?result`, then the optional fine `?score`, then the
-  // optional coarse `?coarseScore` (each occupying the next column iff
-  // present).
+  // optional coarse `?coarseScore`, then the optional `?csls` (each occupying
+  // the next column iff present).
   size_t next = 0;
   variableColumns_[config_.resultVariable_] =
       makeAlwaysDefinedColumn(ColumnIndex{next++});
@@ -226,6 +289,10 @@ VectorSearch::VectorSearch(QueryExecutionContext* qec,
   }
   if (config_.coarseScoreVariable_.has_value()) {
     variableColumns_[config_.coarseScoreVariable_.value()] =
+        makeAlwaysDefinedColumn(ColumnIndex{next++});
+  }
+  if (config_.cslsVariable_.has_value()) {
+    variableColumns_[config_.cslsVariable_.value()] =
         makeAlwaysDefinedColumn(ColumnIndex{next++});
   }
 }
@@ -239,7 +306,8 @@ std::string VectorSearch::getDescriptor() const {
 // ____________________________________________________________________________
 size_t VectorSearch::getResultWidth() const {
   return 1 + static_cast<size_t>(config_.scoreVariable_.has_value()) +
-         static_cast<size_t>(config_.coarseScoreVariable_.has_value());
+         static_cast<size_t>(config_.coarseScoreVariable_.has_value()) +
+         static_cast<size_t>(config_.cslsVariable_.has_value());
 }
 
 // ____________________________________________________________________________
@@ -288,6 +356,16 @@ std::string VectorSearch::getCacheKeyImpl() const {
     absl::StrAppend(
         &key, " maxDist=",
         absl::Hex(absl::bit_cast<uint32_t>(config_.maxDistance_.value())));
+  }
+  if (config_.cslsThreshold_.has_value()) {
+    absl::StrAppend(
+        &key, " cslsThreshold=",
+        absl::Hex(absl::bit_cast<uint32_t>(config_.cslsThreshold_.value())),
+        " csls=", config_.cslsVariable_.has_value(),
+        " cslsKCap=", config_.cslsKCap_.value_or(0));
+    if (config_.cslsNeighbors_.has_value()) {
+      absl::StrAppend(&key, " cslsNeighbors=", config_.cslsNeighbors_.value());
+    }
   }
   qlever::vector::appendQueryPointToCacheKey(&key, config_);
   return key;

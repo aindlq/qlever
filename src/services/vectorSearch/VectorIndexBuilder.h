@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -78,7 +79,15 @@ class VectorIndexBuilder {
   // configured storage scalar). `vector.size()` must equal
   // `config.dimensions_`. The `iri` is persisted row-aligned so that the index
   // can be cheaply remapped after the knowledge graph is re-indexed.
-  void add(Id entity, std::string_view iri, ql::span<const float> vector);
+  //
+  // `cslsR`, if given, is this row's PRECOMPUTED CSLS hubness r(d) (the
+  // ingestion "GPU path" of `config.cslsRPath_`): it follows the row through
+  // the dedup/sort and is written verbatim into the `.csls` sidecar, and
+  // `build()` then skips the self-kNN. All-or-nothing per builder (a mix of
+  // rows with and without a value throws), and only valid with
+  // `config.csls_`.
+  void add(Id entity, std::string_view iri, ql::span<const float> vector,
+           std::optional<float> cslsR = std::nullopt);
 
   // Number of vectors added so far (before deduplication).
   size_t size() const { return ids_.size(); }
@@ -107,6 +116,9 @@ class VectorIndexBuilder {
   std::vector<uint64_t> ids_;         // entity ids, insertion order
   std::vector<uint64_t> iriOffsets_;  // byte offset of the IRI in the temp file
   std::vector<uint32_t> iriLengths_;  // byte length of the IRI (no newline)
+  // Ingested per-row r(d) values (the `cslsR` arguments of `add`, insertion
+  // order); empty when `build()` computes the self-kNN itself.
+  std::vector<float> cslsRInput_;
 
   // Unsorted temporary spill files fed by `add`.
   std::string vecSpillPath_;
