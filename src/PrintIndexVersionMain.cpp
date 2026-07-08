@@ -7,7 +7,9 @@
 #include <iostream>
 
 #include "index/IndexFormatVersion.h"
+#include "util/JemallocLibraryHooks.h"
 
 int main() {
+  ad_utility::installLibraryAllocatorHooks();
   std::cout << nlohmann::json{qlever::indexFormatVersion}.dump(4) << std::endl;
 }
