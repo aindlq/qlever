@@ -98,10 +98,15 @@ void parallelOverRows(size_t n, size_t numThreads, const Job& job) {
   }
 }
 
-// Above this store size the O(n^2) brute-force r(d) fallback is refused; the
-// build then needs `hnsw: true` (the self-kNN searches the graph) or a
-// precomputed `cslsR` sidecar (the GPU path).
-constexpr size_t CSLS_BRUTE_FORCE_MAX = 50'000;
+// Recall-favouring parameters of the DEDICATED fine-layer HNSW graph that
+// computes the csls r(d) self-kNN for stores at or above the brute-force
+// bound (`VectorIndexBuilder::CSLS_BRUTE_FORCE_MAX`): r(d) is computed once
+// and gates every query, so this one-time, never-persisted graph spends on
+// recall (M 32 / efConstruction 256 vs the usearch stock 16 / 128).
+// Deliberately independent of the user's `hnsw*` keys, which configure the
+// MAIN query-time graph.
+constexpr size_t CSLS_GRAPH_CONNECTIVITY = 32;
+constexpr size_t CSLS_GRAPH_EXPANSION_ADD = 256;
 
 // The FINE layer of the just-written flat store(s): what the csls r(d)
 // cosine distances are computed on -- the rerank matrix of a two-layer build,
@@ -517,16 +522,13 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     }
   }
 
-  // 6. Optionally build and save the HNSW graph, keyed by ROW INDEX, with the
-  //    vectors read from the just-written memory-mapped flat store: neither
-  //    the build nor the resulting file contains a second copy of the vectors.
+  // 6. Optionally build and save the MAIN (query-time) HNSW graph, keyed by
+  //    ROW INDEX, with the vectors read from the just-written memory-mapped
+  //    flat store: neither the build nor the resulting file contains a second
+  //    copy of the vectors. This graph serves QUERIES only -- the csls r(d)
+  //    self-kNN of step 6b never touches it (it ranks by the coarse SCAN
+  //    metric, the wrong distance for r(d) on a two-layer index).
   bool hasHnsw = config_.buildHnsw_ && n > 0;
-  // The per-final-row csls r(d) (filled iff `config_.csls_`): ingested from
-  // `add`'s cslsR values, or computed by a self-kNN -- against the in-RAM
-  // HNSW graph below when there is one, else by the (small-store) brute
-  // force of step 6b.
-  std::vector<float> cslsR;
-  const bool cslsSelfKnn = config_.csls_ && cslsRInput_.empty();
   if (hasHnsw) {
     outputsCleanup.track(tmp(hnswPath));
     ad_utility::MmapVectorView<char> data;
@@ -558,8 +560,7 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     uu::index_limits_t limits;
     limits.members = n;
     limits.threads_add = numThreads;
-    // The csls self-kNN below searches the graph from all build threads.
-    limits.threads_search = cslsSelfKnn ? numThreads : 1;
+    limits.threads_search = 1;
     if (!graph.try_reserve(limits)) {
       AD_THROW("Could not allocate the HNSW graph for vector index \"" +
                config_.name_ + "\" (" + std::to_string(n) + " nodes).");
@@ -583,63 +584,6 @@ VectorIndexMetadata VectorIndexBuilder::build() {
             }
           }
         });
-    if (cslsSelfKnn) {
-      // csls r(d) via the in-RAM graph: search every row's OWN stored vector,
-      // drop the self hit (by row identity), and average the cosine
-      // similarity `1 - distance` of the top-`cslsNeighbors` neighbours ON
-      // THE FINE LAYER. The graph ranks by the COARSE scan metric (i8 cosine
-      // or binary Hamming on a two-layer build), so a two-layer build
-      // over-fetches with the SERVICE's rerank margin (`defaultRerankK`) and
-      // re-scores the candidates exactly on the fine layer; a single-layer
-      // graph already ranks in the fine metric, so `k + 1` (the self hit)
-      // suffices.
-      const CslsFineLayer fine = openFineLayer();
-      const size_t k = config_.cslsNeighbors_;
-      const size_t fetch = std::min(
-          n, twoLayer ? std::max(defaultRerankK(config_.scalar_, k), k + 1)
-                      : k + 1);
-      // HIGH-RECALL search expansion (efSearch): the self-kNN is a ONE-TIME
-      // pass whose r(d) output is a persisted statistic feeding EVERY query, so
-      // it spends aggressively on recall -- `max(1024, 100 * k, 4 * fetch)`,
-      // far above the query-time `hnswExpansionSearch_`. The graph itself is
-      // also built recall-favouring for a csls index (higher M/efConstruction
-      // defaults; see `parseSpec`), since efSearch cannot exceed the graph's
-      // recall ceiling.
-      const size_t expansion = std::max({size_t{1024}, 100 * k, 4 * fetch});
-      AD_LOG_INFO << "Vector index \"" << config_.name_
-                  << "\": computing csls r(d) via the HNSW graph (" << n
-                  << " vectors, " << k << " neighbours, expansion " << expansion
-                  << ") ..." << std::endl;
-      cslsR.assign(n, 0.f);
-      parallelOverRows(
-          n, numThreads, [&](size_t t, size_t first, size_t last, auto& stop) {
-            std::vector<uint64_t> cand(fetch);
-            std::vector<uu::distance_punned_t> coarseDists(fetch);
-            for (size_t row = first; row < last; ++row) {
-              if (stop.load(std::memory_order_relaxed)) return;
-              uu::index_search_config_t searchConfig;
-              searchConfig.thread = t;
-              searchConfig.expansion = expansion;
-              auto found = graph.search(graphMetric.rowPtr(row), fetch,
-                                        graphMetric, searchConfig);
-              if (!found) {
-                throw std::runtime_error{
-                    std::string{"The csls r(d) self-search on the HNSW graph "
-                                "failed: "} +
-                    found.error.what()};
-              }
-              size_t count = found.dump_to(cand.data(), coarseDists.data());
-              CslsNeighborhood top{k};
-              for (size_t i = 0; i < count; ++i) {
-                if (cand[i] == row) {
-                  continue;  // SELF-EXCLUDED, by row identity
-                }
-                top.offer(fine.distance(row, cand[i]));
-              }
-              cslsR[row] = top.meanCosSim();
-            }
-          });
-    }
     std::ofstream hnswOut{tmp(hnswPath), std::ios::binary | std::ios::trunc};
     bool streamOk = true;
     auto saved = graph.save_to_stream([&](const void* buffer, size_t length) {
@@ -656,10 +600,22 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     }
   }
 
-  // 6b. The csls r(d) sidecar. The HNSW self-kNN above already filled `cslsR`
-  //     when there was a graph; otherwise the values are ingested verbatim
-  //     (the precomputed `cslsR` GPU path) or brute-forced for a small store.
+  // 6b. The csls r(d) sidecar: the per-row mean cosine similarity to the
+  //     top-`cslsNeighbors` nearest neighbours, ALWAYS measured on the FINE
+  //     layer (the bf16/f16/f32 rerank matrix of a two-layer index, the scan
+  //     matrix of a single-layer one) -- NEVER through the main query graph.
+  //     That graph ranks by the COARSE scan metric (Hamming for a `binary`
+  //     store), and on real anisotropic embeddings the sign codes collapse
+  //     into near-degenerate Hamming neighbourhoods whose "nearest
+  //     neighbours" are not the fine-nearest at all: r(d) computed through it
+  //     came out saturated (~1.0), which is impossible for a true mean of
+  //     nearest-neighbour cosines. r(d) is therefore fully DECOUPLED from
+  //     `hnsw:`: ingested verbatim when `add` got precomputed values (the
+  //     `cslsR` GPU path), else EXACT brute force on the fine layer below
+  //     `cslsBruteForceMax_`, else a DEDICATED recall-tuned fine-layer HNSW
+  //     (built, self-searched, and discarded -- never persisted).
   if (config_.csls_) {
+    std::vector<float> cslsR;
     if (!cslsRInput_.empty()) {
       // Ingested: `add` enforced one value per row, so the permutation below
       // is total. Carried verbatim through the same sort/dedup as the rows.
@@ -668,33 +624,127 @@ VectorIndexMetadata VectorIndexBuilder::build() {
       for (size_t i = 0; i < n; ++i) {
         cslsR[i] = cslsRInput_[rows[i]];
       }
-    } else if (!hasHnsw) {
-      if (n >= CSLS_BRUTE_FORCE_MAX) {
-        AD_THROW("Vector index \"" + config_.name_ +
-                 "\": csls needs `hnsw: true` or a precomputed `cslsR` for "
-                 "indexes with >= " +
-                 std::to_string(CSLS_BRUTE_FORCE_MAX) +
-                 " vectors (the brute-force r(d) fallback is O(n^2); got " +
-                 std::to_string(n) + " vectors).");
-      }
-      // Small store: EXACT r(d) by brute force over the fine layer.
+    } else {
       const CslsFineLayer fine = openFineLayer();
       const size_t k = config_.cslsNeighbors_;
       cslsR.assign(n, 0.f);
-      parallelOverRows(n, numThreads,
-                       [&](size_t, size_t first, size_t last, auto& stop) {
-                         for (size_t row = first; row < last; ++row) {
-                           if (stop.load(std::memory_order_relaxed)) return;
-                           CslsNeighborhood top{k};
-                           for (size_t j = 0; j < n; ++j) {
-                             if (j == row) {
-                               continue;  // SELF-EXCLUDED, by row identity
+      if (n < cslsBruteForceMax_) {
+        // EXACT r(d): for each row, scan every row's fine distance and keep
+        // the top-k (self-excluded). O(n^2), but exact -- the preferred path
+        // whenever the store is small enough.
+        AD_LOG_INFO << "Vector index \"" << config_.name_
+                    << "\": computing csls r(d) by exact brute force on the "
+                       "fine layer ("
+                    << n << " vectors, " << k << " neighbours) ..."
+                    << std::endl;
+        parallelOverRows(n, numThreads,
+                         [&](size_t, size_t first, size_t last, auto& stop) {
+                           for (size_t row = first; row < last; ++row) {
+                             if (stop.load(std::memory_order_relaxed)) return;
+                             CslsNeighborhood top{k};
+                             for (size_t j = 0; j < n; ++j) {
+                               if (j == row) {
+                                 continue;  // SELF-EXCLUDED, by row identity
+                               }
+                               top.offer(fine.distance(row, j));
                              }
-                             top.offer(fine.distance(row, j));
+                             cslsR[row] = top.meanCosSim();
                            }
-                           cslsR[row] = top.meanCosSim();
-                         }
-                       });
+                         });
+      } else {
+        // Too large for O(n^2): build a DEDICATED HNSW over the FINE layer
+        // (fine scalar, fine metric -- for a binary+bf16 index that is a
+        // bf16 COSINE graph, not the Hamming scan graph), self-search it, and
+        // discard it. Recall-tuned (M/efConstruction; see the constants) plus
+        // a high self-search expansion: r(d) is computed once and gates every
+        // query, so the one-time build spends on recall.
+        if (uint64_t ram = totalPhysicalMemoryBytes();
+            ram != 0 && n * fine.rowBytes_ > ram) {
+          AD_LOG_WARN << "Vector index \"" << config_.name_ << "\": the "
+                      << (n * fine.rowBytes_ >> 30)
+                      << " GiB fine store exceeds physical memory ("
+                      << (ram >> 30)
+                      << " GiB); the csls r(d) self-kNN will be disk-bound."
+                      << std::endl;
+        }
+        FlatStoreMetric fineMetric{fine.data_.data(), fine.rowBytes_, n,
+                                   fine.metric_};
+        GraphIndex fineGraph{uu::index_config_t{CSLS_GRAPH_CONNECTIVITY,
+                                                CSLS_GRAPH_CONNECTIVITY * 2}};
+        uu::index_limits_t limits;
+        limits.members = n;
+        limits.threads_add = numThreads;
+        limits.threads_search = numThreads;
+        if (!fineGraph.try_reserve(limits)) {
+          AD_THROW(
+              "Could not allocate the csls fine-layer HNSW graph for vector "
+              "index \"" +
+              config_.name_ + "\" (" + std::to_string(n) + " nodes).");
+        }
+        // The graph ranks by the fine metric itself, so `k + 1` results (the
+        // self hit plus the k nearest others) suffice; recall comes from the
+        // HIGH search expansion (efSearch) -- far above the query-time
+        // `hnswExpansionSearch_` -- not from over-fetching.
+        const size_t fetch = std::min(n, k + 1);
+        const size_t expansion = std::max({size_t{1024}, 100 * k, 4 * fetch});
+        AD_LOG_INFO << "Vector index \"" << config_.name_
+                    << "\": computing csls r(d) via a dedicated fine-layer "
+                       "HNSW self-kNN ("
+                    << n << " vectors, " << k << " neighbours, expansion "
+                    << expansion << ") ..." << std::endl;
+        parallelOverRows(
+            n, numThreads,
+            [&](size_t t, size_t first, size_t last, auto& stop) {
+              uu::index_update_config_t updateConfig;
+              updateConfig.thread = t;
+              updateConfig.expansion = CSLS_GRAPH_EXPANSION_ADD;
+              for (size_t row = first; row < last; ++row) {
+                if (stop.load(std::memory_order_relaxed)) return;
+                auto added = fineGraph.add(row, fineMetric.rowPtr(row),
+                                           fineMetric, updateConfig);
+                if (!added) {
+                  throw std::runtime_error{
+                      std::string{"Could not add a vector to the csls "
+                                  "fine-layer HNSW graph: "} +
+                      added.error.what()};
+                }
+              }
+            });
+        parallelOverRows(
+            n, numThreads,
+            [&](size_t t, size_t first, size_t last, auto& stop) {
+              std::vector<uint64_t> cand(fetch);
+              std::vector<uu::distance_punned_t> dists(fetch);
+              for (size_t row = first; row < last; ++row) {
+                if (stop.load(std::memory_order_relaxed)) return;
+                uu::index_search_config_t searchConfig;
+                searchConfig.thread = t;
+                searchConfig.expansion = expansion;
+                auto found = fineGraph.search(fineMetric.rowPtr(row), fetch,
+                                              fineMetric, searchConfig);
+                if (!found) {
+                  throw std::runtime_error{
+                      std::string{"The csls r(d) self-search on the "
+                                  "fine-layer HNSW graph failed: "} +
+                      found.error.what()};
+                }
+                size_t count = found.dump_to(cand.data(), dists.data());
+                CslsNeighborhood top{k};
+                for (size_t i = 0; i < count; ++i) {
+                  if (cand[i] == row) {
+                    continue;  // SELF-EXCLUDED, by row identity
+                  }
+                  // Re-scored on the same fine layer (== the graph's own
+                  // metric; kept explicit so the r(d) source is unambiguous).
+                  top.offer(fine.distance(row, cand[i]));
+                }
+                cslsR[row] = top.meanCosSim();
+              }
+            });
+        // `fineGraph` is discarded here: it is a build-time tool only and is
+        // never persisted (the on-disk `.hnsw`, if any, is the main
+        // query-time graph of step 6).
+      }
     }
     AD_CORRECTNESS_CHECK(cslsR.size() == n);
     logCslsDistribution(config_.name_, cslsR);

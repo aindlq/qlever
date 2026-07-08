@@ -7,15 +7,17 @@
 
 // Tests of the CSLS (Cross-domain Similarity Local Scaling) retrieval cut:
 // the `csls`/`cslsNeighbors`/`cslsR` build keys (the `.csls` r(d) sidecar --
-// brute-force, HNSW self-kNN, and verbatim ingestion), the r(d) distribution
-// / saturation log, and the query-time `vec:cslsThreshold` filter
-// (`vec:bindCsls`, FORM W and FORM P, variable cardinality, cosine stays the
-// score).
+// exact brute force on the FINE layer, the dedicated fine-layer HNSW
+// self-kNN, and verbatim ingestion; always independent of the main query
+// graph and of `hnsw:`), the r(d) distribution / saturation log, and the
+// query-time `vec:cslsThreshold` filter (`vec:bindCsls`, FORM W and FORM P,
+// variable cardinality, cosine stays the score).
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -297,7 +299,8 @@ std::vector<double> referenceRd(const std::vector<std::vector<float>>& vecs,
 std::string buildRandomCslsIndex(
     bool withHnsw, const std::string& name,
     VectorScalar scalar = VectorScalar::F32,
-    std::optional<VectorScalar> rerank = std::nullopt) {
+    std::optional<VectorScalar> rerank = std::nullopt,
+    std::optional<size_t> bruteForceMaxForTesting = std::nullopt) {
   std::string basename = uniqueTmpBasename();
   VectorIndexConfig cfg;
   cfg.name_ = name;
@@ -309,6 +312,9 @@ std::string buildRandomCslsIndex(
   cfg.scalar_ = scalar;
   cfg.rerankScalar_ = rerank;
   VectorIndexBuilder builder{basename, cfg};
+  if (bruteForceMaxForTesting.has_value()) {
+    builder.setCslsBruteForceMaxForTesting(bruteForceMaxForTesting.value());
+  }
   auto vecs = makeRandomUnitVectors();
   for (size_t i = 0; i < vecs.size(); ++i) {
     builder.add(mkId(1000 + i * 7), "<http://ex/" + std::to_string(i) + ">",
@@ -322,11 +328,13 @@ std::string buildRandomCslsIndex(
 // _____________________________________________________________________________
 // The csls build writes the `.csls` sidecar (one f32 per row) and records
 // `cslsNeighbors` in the `.meta`; the loaded r(d) EXACTLY matches the
-// hand-computed brute-force mean-of-top-k-self-cosine (self-excluded) --
-// the brute-force fallback runs because the fixture has no HNSW and fewer
-// than 50000 vectors.
+// hand-computed brute-force mean-of-top-k-self-cosine (self-excluded). The
+// exact brute force runs because the store is below the brute-force bound --
+// and it needs NO main graph at all: `hnsw: false` builds the sidecar and no
+// `.hnsw` file (csls is decoupled from the query-time ANN).
 TEST(VectorCsls, bruteForceRdMatchesHandComputed) {
   std::string basename = buildRandomCslsIndex(/*withHnsw=*/false, "csbf");
+  EXPECT_FALSE(std::filesystem::exists(vectorHnswFile(basename, "csbf")));
 
   // Sidecar payload: RD_ROWS f32 (plus at most one page of `MmapVector`
   // rounding + its trailer).
@@ -363,15 +371,23 @@ TEST(VectorCsls, bruteForceRdMatchesHandComputed) {
 }
 
 // _____________________________________________________________________________
-// The HNSW self-kNN path (recall-tuned expansion max(200, 20*k)) agrees with
-// the exact brute-force reference: at this size the expansion covers the
-// whole graph, so recall is essentially perfect.
-TEST(VectorCsls, hnswRdMatchesBruteForce) {
-  std::string basename = buildRandomCslsIndex(/*withHnsw=*/true, "cshnsw");
+// The DEDICATED fine-layer HNSW self-kNN path (stores at or above the
+// brute-force bound; forced here by lowering the bound below RD_ROWS) agrees
+// with the exact brute-force reference -- WITHOUT any main graph
+// (`hnsw: false`, no `.hnsw` file): csls builds, self-searches, and discards
+// its own graph. At this size the recall-tuned expansion covers the whole
+// graph, so recall is essentially perfect.
+TEST(VectorCsls, dedicatedFineGraphRdMatchesBruteForce) {
+  std::string basename = buildRandomCslsIndex(
+      /*withHnsw=*/false, "csdedic", VectorScalar::F32, std::nullopt,
+      /*bruteForceMaxForTesting=*/10);
+  // Decoupling: the dedicated csls graph is never persisted, and no main
+  // graph was requested.
+  EXPECT_FALSE(std::filesystem::exists(vectorHnswFile(basename, "csdedic")));
   VectorIndex idx;
-  idx.open(basename, "cshnsw");
+  idx.open(basename, "csdedic");
   ASSERT_TRUE(idx.hasCsls());
-  ASSERT_TRUE(idx.hasHnsw());
+  ASSERT_FALSE(idx.hasHnsw());
 
   auto vecs = makeRandomUnitVectors();
   auto expected = referenceRd(vecs, 3);
@@ -387,20 +403,22 @@ TEST(VectorCsls, hnswRdMatchesBruteForce) {
   // At least 95% of the rows must match the exact value (an occasional HNSW
   // recall miss on a tie is tolerated).
   EXPECT_GE(tight, (RD_ROWS * 95) / 100);
-  cleanupTmp(basename, "cshnsw");
+  cleanupTmp(basename, "csdedic");
 }
 
 // _____________________________________________________________________________
-// A csls index defaults to recall-favouring HNSW graph parameters (M 16->32,
-// efConstruction 128->256) through `parseSpec`: r(d) is computed once and gates
-// every query, so the one-time build spends on recall. A non-csls index keeps
-// the usearch stock defaults (16/128).
-TEST(VectorCsls, cslsRaisesHnswRecallDefaults) {
+// The `hnsw*` keys and their defaults concern the MAIN query-time graph only:
+// a csls index keeps the usearch stock defaults (16/128) exactly like a plain
+// index. (The recall-favouring parameters -- M 32, efConstruction 256, plus
+// the high self-search expansion -- now live on the DEDICATED fine-layer
+// graph the builder creates and discards for the r(d) self-kNN; they are not
+// a property of the persisted index.)
+TEST(VectorCsls, cslsLeavesMainGraphDefaultsUntouched) {
   auto* qec = qecWithCslsIndexes();
   auto csls = qlever::vector::getVectorIndex(qec->getIndex(), "embchnsw");
   ASSERT_TRUE(csls != nullptr);
-  EXPECT_EQ(csls->metadata().config_.hnswConnectivity_, 32u);
-  EXPECT_EQ(csls->metadata().config_.hnswExpansionAdd_, 256u);
+  EXPECT_EQ(csls->metadata().config_.hnswConnectivity_, 16u);
+  EXPECT_EQ(csls->metadata().config_.hnswExpansionAdd_, 128u);
   auto plain = qlever::vector::getVectorIndex(qec->getIndex(), "embplain");
   ASSERT_TRUE(plain != nullptr);
   EXPECT_EQ(plain->metadata().config_.hnswConnectivity_, 16u);
@@ -408,17 +426,22 @@ TEST(VectorCsls, cslsRaisesHnswRecallDefaults) {
 }
 
 // _____________________________________________________________________________
-// Binary scan + bf16 rerank: the r(d) self-kNN finds candidates through the
-// binary Hamming graph but RE-SCORES them on the FINE bf16 (cosine) layer, so
-// r(d) is a real cosine similarity tracking the exact reference -- NOT the
-// binary/Hamming score (which would collapse toward saturation). Regression
-// for a coarse-layer leak into CSLS on a low-precision index.
-TEST(VectorCsls, binaryScanRdReScoresOnBf16NotCoarse) {
+// Binary scan + bf16 rerank WITHOUT a main graph (`hnsw: false`): the r(d)
+// self-kNN runs entirely on the FINE bf16 (cosine) layer -- the coarse binary
+// Hamming bytes never participate -- so csls builds a correct `.csls` (and no
+// `.hnsw`) on a two-layer index with no query-time ANN at all. r(d) is a real
+// cosine similarity tracking the exact reference, NOT a Hamming-derived score
+// (which would collapse toward saturation). Regression for a coarse-layer
+// leak into CSLS on a low-precision index.
+TEST(VectorCsls, binaryScanRdComputedOnBf16WithoutMainGraph) {
   std::string basename = buildRandomCslsIndex(
-      /*withHnsw=*/true, "csbin", VectorScalar::Binary, VectorScalar::Bf16);
+      /*withHnsw=*/false, "csbin", VectorScalar::Binary, VectorScalar::Bf16);
+  EXPECT_FALSE(std::filesystem::exists(vectorHnswFile(basename, "csbin")));
+  EXPECT_TRUE(std::filesystem::exists(vectorCslsFile(basename, "csbin")));
   VectorIndex idx;
   idx.open(basename, "csbin");
   ASSERT_TRUE(idx.hasCsls());
+  ASSERT_FALSE(idx.hasHnsw());
   auto expected = referenceRd(makeRandomUnitVectors(), 3);
   size_t tight = 0;
   size_t saturated = 0;
@@ -432,22 +455,105 @@ TEST(VectorCsls, binaryScanRdReScoresOnBf16NotCoarse) {
       ++saturated;
     }
   }
-  // Tracks the exact bf16-cosine reference for the vast majority (the binary
-  // self-kNN over 200 vectors fetches ~all, so the bf16 rescore is exact up to
-  // bf16 precision), and is NOT saturated -- a collapse to ~1.0 would be the
-  // fine rescore leaking onto the binary Hamming layer.
+  // Tracks the exact bf16-cosine reference for the vast majority (the exact
+  // brute force runs on the bf16 layer, so the only error is bf16 precision),
+  // and is NOT saturated -- a collapse to ~1.0 would be a coarse-layer leak.
   EXPECT_GE(tight, (RD_ROWS * 85) / 100);
   EXPECT_LT(saturated, RD_ROWS / 4) << "r(d) saturated -- coarse-layer leak?";
   cleanupTmp(basename, "csbin");
 }
 
 // _____________________________________________________________________________
-// The binary self-kNN AT SCALE: with N (1200) > the fetch (500), the binary
-// Hamming HNSW search actually drives candidate selection (unlike the small
-// case that fetches everything). For varied vectors r(d) must stay SPREAD --
-// a saturated r(d) here would prove the binary-search path corrupts the bf16
-// score. (dim 48 -> binary codes are ~unique, so no collision artefacts.)
-TEST(VectorCsls, binaryScanRdNotSaturatedWhenFetchBelowN) {
+// THE anisotropic regression (reproduce-then-fix): real embedding spaces are
+// anisotropic -- every vector sits near a common direction, so the 1-bit sign
+// codes of a `binary` scan layer nearly COLLIDE (here: all components of the
+// common direction are +0.125, the per-component noise sd is 0.06, so < 5% of
+// all sign bits flip and the Hamming neighbourhoods are near-degenerate ties)
+// while the bf16 cosines stay GRADED (nearest-other well below 1). The old
+// build computed the r(d) self-kNN through the MAIN Hamming graph, whose
+// "nearest neighbours" on such data are not the bf16-nearest at all -- r(d)
+// came out wrong (saturated on real corpora), which is impossible: r(d) is a
+// MEAN of the top-k neighbour cosines, so it can never exceed the true top-k
+// mean. The fix computes r(d) via a DEDICATED bf16-cosine HNSW over the FINE
+// layer (forced here by lowering the brute-force bound below N), so it must
+// match the exact brute-force fine reference and stay un-saturated.
+TEST(VectorCsls, anisotropicBinaryRdMatchesFineReferenceNotSaturated) {
+  constexpr size_t N = 1500;
+  constexpr size_t D = 64;
+  constexpr size_t K = 8;
+  std::mt19937 rng{20260708};
+  std::normal_distribution<float> noise{0.f, 0.06f};
+  // All vectors = common unit direction (1,...,1)/8 + small noise.
+  std::vector<std::vector<float>> vecs(N, std::vector<float>(D));
+  size_t negativeComponents = 0;
+  for (auto& v : vecs) {
+    for (auto& x : v) {
+      x = 0.125f + noise(rng);
+      if (x <= 0.f) ++negativeComponents;
+    }
+  }
+  // Fixture guard 1: the sign codes nearly collide (almost all bits are 1).
+  EXPECT_LT(negativeComponents, (N * D) / 20);
+  // Fixture guard 2: the fine cosines are GRADED -- the exact reference r(d)
+  // is itself well below saturation everywhere.
+  auto expected = referenceRd(vecs, K);
+  EXPECT_LT(*std::max_element(expected.begin(), expected.end()), 0.95);
+
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = "csaniso";
+  cfg.dimensions_ = D;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.buildHnsw_ = false;  // csls needs NO main graph anymore
+  cfg.csls_ = true;
+  cfg.cslsNeighbors_ = K;
+  cfg.scalar_ = VectorScalar::Binary;
+  cfg.rerankScalar_ = VectorScalar::Bf16;
+  VectorIndexBuilder builder{basename, cfg};
+  // Force the dedicated fine-layer HNSW path (N >= the bound).
+  builder.setCslsBruteForceMaxForTesting(100);
+  for (size_t i = 0; i < N; ++i) {
+    builder.add(mkId(1000 + i * 7), "<http://ex/" + std::to_string(i) + ">",
+                vecs[i]);
+  }
+  builder.build();
+  EXPECT_FALSE(std::filesystem::exists(vectorHnswFile(basename, "csaniso")));
+
+  VectorIndex idx;
+  idx.open(basename, "csaniso");
+  ASSERT_TRUE(idx.hasCsls());
+  size_t tight = 0;
+  size_t saturated = 0;
+  double sumAbsErr = 0;
+  for (size_t i = 0; i < N; ++i) {
+    auto r = idx.cslsRForEntity(mkId(1000 + i * 7));
+    ASSERT_TRUE(r.has_value()) << i;
+    const double err = r.value() - expected[i];
+    // r(d) is a mean of top-K neighbour cosines: it can NEVER exceed the
+    // exact reference (+ bf16 truncation slack). The old Hamming-graph path
+    // violated this on anisotropic data.
+    EXPECT_LE(err, 2e-2) << "row " << i;
+    // ... and an HNSW recall miss may only lose a little.
+    EXPECT_GE(err, -5e-2) << "row " << i;
+    sumAbsErr += std::abs(err);
+    if (std::abs(err) < 1e-2) ++tight;
+    if (r.value() > 0.95f) ++saturated;
+  }
+  EXPECT_GE(tight, (N * 90) / 100);
+  EXPECT_LT(sumAbsErr / N, 5e-3);
+  EXPECT_EQ(saturated, 0u)
+      << saturated << "/" << N
+      << " rows r(d) > 0.95 -- the coarse Hamming layer leaked into r(d)?";
+  cleanupTmp(basename, "csaniso");
+}
+
+// _____________________________________________________________________________
+// The dedicated fine self-kNN AT SCALE on isotropic data: N (1200) far above
+// the (lowered) brute-force bound, binary+bf16, no main graph. r(d) must stay
+// SPREAD and track the exact reference -- random unit vectors in dim-48 have
+// moderate neighbour cosines (~0.4-0.6), so a wall of ~1.0 would be a
+// coarse-path bug, not the data.
+TEST(VectorCsls, binaryScanRdAtScaleTracksReference) {
   constexpr size_t N = 1200;
   constexpr size_t D = 48;
   std::mt19937 rng{777};
@@ -467,32 +573,36 @@ TEST(VectorCsls, binaryScanRdNotSaturatedWhenFetchBelowN) {
   cfg.name_ = "csbinbig";
   cfg.dimensions_ = D;
   cfg.metric_ = VectorMetric::Cosine;
-  cfg.buildHnsw_ = true;
+  cfg.buildHnsw_ = false;
   cfg.csls_ = true;
   cfg.cslsNeighbors_ = 10;
   cfg.scalar_ = VectorScalar::Binary;
   cfg.rerankScalar_ = VectorScalar::Bf16;
   VectorIndexBuilder builder{basename, cfg};
+  builder.setCslsBruteForceMaxForTesting(100);
   for (size_t i = 0; i < N; ++i) {
-    builder.add(mkId(1000 + i * 7),
-                "<http://ex/" + std::to_string(i) + ">", vecs[i]);
+    builder.add(mkId(1000 + i * 7), "<http://ex/" + std::to_string(i) + ">",
+                vecs[i]);
   }
   builder.build();
   VectorIndex idx;
   idx.open(basename, "csbinbig");
+  auto expected = referenceRd(vecs, 10);
+  size_t tight = 0;
   size_t saturated = 0;
   for (size_t i = 0; i < N; ++i) {
     auto r = idx.cslsRForEntity(mkId(1000 + i * 7));
     ASSERT_TRUE(r.has_value());
+    if (std::abs(r.value() - static_cast<float>(expected[i])) < 2e-2f) {
+      ++tight;  // bf16 truncation + rare HNSW-miss tolerance
+    }
     if (r.value() > 0.95f) {
       ++saturated;
     }
   }
-  // Random unit vectors in dim-48 have moderate neighbour cosines (~0.4-0.6),
-  // so almost nothing should saturate; a wall of ~1.0 would be a binary-path
-  // bug, not the data.
+  EXPECT_GE(tight, (N * 90) / 100);
   EXPECT_LT(saturated, N / 10)
-      << saturated << "/" << N << " rows r(d) > 0.95 (binary path corrupts?)";
+      << saturated << "/" << N << " rows r(d) > 0.95 (coarse-path leak?)";
   cleanupTmp(basename, "csbinbig");
 }
 
@@ -562,9 +672,10 @@ TEST(VectorCsls, cslsRIngestionMixRejected) {
 
 // _____________________________________________________________________________
 // Build-time validation: csls is cosine-only, and a binary store without a
-// rerank layer (Hamming-only distances) cannot carry it. Without HNSW and
-// without a precomputed cslsR, stores of >= 50000 vectors refuse the O(n^2)
-// brute-force fallback with a clear error.
+// rerank layer (Hamming-only distances) cannot carry it. There is NO
+// hnsw-related restriction: csls never needs the main graph (above the
+// brute-force bound it builds its own fine-layer self-kNN graph), so
+// `hnsw: false` is always fine -- covered by the build tests above.
 TEST(VectorCsls, buildValidationErrors) {
   {
     VectorIndexConfig cfg;
@@ -584,23 +695,6 @@ TEST(VectorCsls, buildValidationErrors) {
     cfg.csls_ = true;
     AD_EXPECT_THROW_WITH_MESSAGE((VectorIndexBuilder{uniqueTmpBasename(), cfg}),
                                  HasSubstr("Hamming"));
-  }
-  {
-    std::string basename = uniqueTmpBasename();
-    VectorIndexConfig cfg;
-    cfg.name_ = "big";
-    cfg.dimensions_ = 4;
-    cfg.metric_ = VectorMetric::Cosine;
-    cfg.buildHnsw_ = false;
-    cfg.csls_ = true;
-    VectorIndexBuilder builder{basename, cfg};
-    std::vector<float> v{1.f, 0.f, 0.f, 0.f};
-    for (size_t i = 0; i < 50000; ++i) {
-      v[1] = static_cast<float>(i % 97);
-      builder.add(mkId(100 + i), "<http://ex/" + std::to_string(i) + ">", v);
-    }
-    AD_EXPECT_THROW_WITH_MESSAGE(builder.build(), HasSubstr("hnsw"));
-    cleanupTmp(basename, "big");
   }
 }
 

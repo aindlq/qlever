@@ -53,6 +53,15 @@ namespace qlever::vector {
 // unaffected. Set `buildThreads_ = 1` for a deterministic build.
 class VectorIndexBuilder {
  public:
+  // Below this store size the csls r(d) self-kNN is computed by EXACT
+  // brute force over the FINE layer (O(n^2), but trustworthy and fast at this
+  // size); at or above it, `build()` constructs a DEDICATED recall-tuned HNSW
+  // over the fine layer instead (built, self-searched, then discarded). The
+  // r(d) computation never touches the main query-ANN graph (whose coarse
+  // scan metric -- Hamming for a `binary` store -- ranks by the wrong
+  // distance), so `csls` works with any `hnsw` setting.
+  static constexpr size_t CSLS_BRUTE_FORCE_MAX = 100'000;
+
   VectorIndexBuilder(std::string basename, VectorIndexConfig config);
   // Removes the temporary spill files, so that a builder abandoned without a
   // successful `build()` (e.g. because reading/embedding a later input batch
@@ -92,6 +101,13 @@ class VectorIndexBuilder {
   // Number of vectors added so far (before deduplication).
   size_t size() const { return ids_.size(); }
 
+  // TESTING ONLY: lower the store-size bound above which `build()` switches
+  // from the exact brute-force r(d) to the dedicated fine-layer HNSW
+  // self-kNN, so tests can exercise the graph path without 100k-row fixtures.
+  void setCslsBruteForceMaxForTesting(size_t bound) {
+    cslsBruteForceMax_ = bound;
+  }
+
   // Finalize and write all files. Returns the metadata that was persisted.
   VectorIndexMetadata build();
 
@@ -119,6 +135,9 @@ class VectorIndexBuilder {
   // Ingested per-row r(d) values (the `cslsR` arguments of `add`, insertion
   // order); empty when `build()` computes the self-kNN itself.
   std::vector<float> cslsRInput_;
+  // The brute-force-vs-dedicated-graph switchover of the csls r(d) self-kNN
+  // (see the class constant; only tests override it).
+  size_t cslsBruteForceMax_ = CSLS_BRUTE_FORCE_MAX;
 
   // Unsorted temporary spill files fed by `add`.
   std::string vecSpillPath_;

@@ -190,23 +190,31 @@ row-keyed like `.data`, so a cheap remap keeps it valid). At query time,
 
 > `CSLS(q, d) = 2·cos_sim(q, d) − r(q) − r(d) ≥ τ`
 
-(see `usage-and-comparison.md` for the query surface). How `r(d)` is computed:
+(see `usage-and-comparison.md` for the query surface). How `r(d)` is
+computed — always as a *self-kNN on the **fine** layer* (the `rerank` matrix
+of a two-layer index, the scan matrix of a single-layer one), **never**
+through the main query-time ANN graph: that graph ranks by the coarse *scan*
+metric (Hamming on a `binary` layer), and on real anisotropic embeddings the
+sign codes collapse into near-degenerate Hamming neighbourhoods whose
+"nearest neighbours" are not the fine-nearest at all — `r(d)` computed
+through it came out saturated (≈ 1.0), impossible for a true mean of
+nearest-neighbour cosines. `csls` is therefore **fully independent of
+`hnsw:`** (which only controls the query-time ANN):
 
-- **`hnsw: true`** (recommended): a *self-kNN* against the just-built graph.
-  Because `r(d)` is computed **once** and then feeds **every** query, a `csls`
-  index is tuned for recall, not build speed: unless you override them, the
-  graph defaults rise to **`hnswConnectivity` (M) = 32** and
-  **`hnswExpansionAdd` (efConstruction) = 256** (vs. the usual 16 / 128), and
-  the self-kNN searches with a **high expansion** `max(1024, 100·cslsNeighbors,
-  4·fetch)` — far above the query-time `hnswExpansionSearch`, since efSearch
-  can't exceed the graph's recall ceiling. On a two-layer index the coarse
-  candidates are re-scored on the fine layer with the SERVICE's rerank margin,
-  the self hit is dropped by row identity, and the top-`cslsNeighbors` cosine
-  similarities are averaged. The extra one-time build cost buys accurate `r(d)`
-  forever.
-- **no HNSW**: an exact brute-force fallback, **only for indices below 50 000
-  vectors** (it is O(n²)); larger builds fail with a clear error asking for
-  `hnsw: true` or a precomputed `cslsR`.
+- **below 100 000 vectors**: an **exact brute-force** self-kNN over the fine
+  layer (O(n²), but exact — the preferred path whenever the store is small
+  enough).
+- **at or above 100 000 vectors**: the build constructs a **dedicated,
+  recall-tuned HNSW over the fine layer** (fine scalar + cosine metric —
+  e.g. a *bf16 cosine* graph on a `binary`+`bf16` index; M = 32,
+  efConstruction = 256, and a self-search expansion of
+  `max(1024, 100·cslsNeighbors, 4·fetch)` — far above the query-time
+  `hnswExpansionSearch`), self-searches it with the self hit dropped by row
+  identity, re-scores the hits on the same fine layer, and **discards the
+  graph** — it is never persisted, and the `hnsw*` keys (which configure the
+  main query graph) do not affect it. Because `r(d)` is computed **once**
+  and then feeds **every** query, this one-time graph spends on recall, not
+  build speed.
 - **`cslsR` (the GPU path)**: skip the self-kNN entirely and ingest a
   precomputed `r(d)` — a float32 `.npy` of shape `(N,)`, **row-aligned with
   the input matrix** (compute it offline, e.g. batched on a GPU; remember to
