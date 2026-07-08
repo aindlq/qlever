@@ -192,12 +192,18 @@ row-keyed like `.data`, so a cheap remap keeps it valid). At query time,
 
 (see `usage-and-comparison.md` for the query surface). How `r(d)` is computed:
 
-- **`hnsw: true`** (recommended): a *self-kNN* against the just-built graph —
-  every row searches its own stored vector with a **recall-tuned expansion**
-  `max(200, 20·cslsNeighbors)` (on a two-layer index the coarse candidates are
-  re-scored on the fine layer with the SERVICE's rerank margin), the self hit
-  is dropped by row identity, and the top-`cslsNeighbors` cosine similarities
-  are averaged.
+- **`hnsw: true`** (recommended): a *self-kNN* against the just-built graph.
+  Because `r(d)` is computed **once** and then feeds **every** query, a `csls`
+  index is tuned for recall, not build speed: unless you override them, the
+  graph defaults rise to **`hnswConnectivity` (M) = 32** and
+  **`hnswExpansionAdd` (efConstruction) = 256** (vs. the usual 16 / 128), and
+  the self-kNN searches with a **high expansion** `max(1024, 100·cslsNeighbors,
+  4·fetch)` — far above the query-time `hnswExpansionSearch`, since efSearch
+  can't exceed the graph's recall ceiling. On a two-layer index the coarse
+  candidates are re-scored on the fine layer with the SERVICE's rerank margin,
+  the self hit is dropped by row identity, and the top-`cslsNeighbors` cosine
+  similarities are averaged. The extra one-time build cost buys accurate `r(d)`
+  forever.
 - **no HNSW**: an exact brute-force fallback, **only for indices below 50 000
   vectors** (it is O(n²)); larger builds fail with a clear error asking for
   `hnsw: true` or a precomputed `cslsR`.

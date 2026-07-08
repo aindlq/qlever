@@ -173,7 +173,14 @@ QueryExecutionContext* qecWithCslsIndexes() {
                                              {"npy", npy},
                                              {"iris", iris},
                                              {"metric", "cosine"},
-                                             {"hnsw", false}}})}};
+                                             {"hnsw", false}},
+                              nlohmann::json{{"name", "embchnsw"},
+                                             {"npy", npy},
+                                             {"iris", iris},
+                                             {"metric", "cosine"},
+                                             {"hnsw", true},
+                                             {"csls", true},
+                                             {"cslsNeighbors", 2}}})}};
   for (const auto& hook : IndexExtensionRegistry::get().buildHooks()) {
     hook(qec->getIndex(), basename, spec);
   }
@@ -187,7 +194,7 @@ QueryExecutionContext* qecWithCslsIndexes() {
   qec->setLocatedTriplesForEvaluation(
       impl.deltaTriplesManager().getCurrentLocatedTriplesSharedState());
   // The load hook memory-maps everything; the directory entries can go.
-  for (std::string_view name : {"embc", "embr", "embplain"}) {
+  for (std::string_view name : {"embc", "embr", "embplain", "embchnsw"}) {
     for (std::string_view suffix :
          {".meta", ".keys", ".rowmap", ".data", ".rerank.data", ".iris",
           ".hnsw", ".csls"}) {
@@ -376,6 +383,23 @@ TEST(VectorCsls, hnswRdMatchesBruteForce) {
   // recall miss on a tie is tolerated).
   EXPECT_GE(tight, (RD_ROWS * 95) / 100);
   cleanupTmp(basename, "cshnsw");
+}
+
+// _____________________________________________________________________________
+// A csls index defaults to recall-favouring HNSW graph parameters (M 16->32,
+// efConstruction 128->256) through `parseSpec`: r(d) is computed once and gates
+// every query, so the one-time build spends on recall. A non-csls index keeps
+// the usearch stock defaults (16/128).
+TEST(VectorCsls, cslsRaisesHnswRecallDefaults) {
+  auto* qec = qecWithCslsIndexes();
+  auto csls = qlever::vector::getVectorIndex(qec->getIndex(), "embchnsw");
+  ASSERT_TRUE(csls != nullptr);
+  EXPECT_EQ(csls->metadata().config_.hnswConnectivity_, 32u);
+  EXPECT_EQ(csls->metadata().config_.hnswExpansionAdd_, 256u);
+  auto plain = qlever::vector::getVectorIndex(qec->getIndex(), "embplain");
+  ASSERT_TRUE(plain != nullptr);
+  EXPECT_EQ(plain->metadata().config_.hnswConnectivity_, 16u);
+  EXPECT_EQ(plain->metadata().config_.hnswExpansionAdd_, 128u);
 }
 
 // _____________________________________________________________________________

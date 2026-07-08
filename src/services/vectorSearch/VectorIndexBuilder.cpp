@@ -598,10 +598,14 @@ VectorIndexMetadata VectorIndexBuilder::build() {
       const size_t fetch = std::min(
           n, twoLayer ? std::max(defaultRerankK(config_.scalar_, k), k + 1)
                       : k + 1);
-      // RECALL-tuned search expansion (efSearch): the self-kNN feeds a
-      // persisted statistic, so it uses `max(200, 20 * k, fetch)` rather than
-      // the (typically much smaller) query-time `hnswExpansionSearch_`.
-      const size_t expansion = std::max({size_t{200}, 20 * k, fetch});
+      // HIGH-RECALL search expansion (efSearch): the self-kNN is a ONE-TIME
+      // pass whose r(d) output is a persisted statistic feeding EVERY query, so
+      // it spends aggressively on recall -- `max(1024, 100 * k, 4 * fetch)`,
+      // far above the query-time `hnswExpansionSearch_`. The graph itself is
+      // also built recall-favouring for a csls index (higher M/efConstruction
+      // defaults; see `parseSpec`), since efSearch cannot exceed the graph's
+      // recall ceiling.
+      const size_t expansion = std::max({size_t{1024}, 100 * k, 4 * fetch});
       AD_LOG_INFO << "Vector index \"" << config_.name_
                   << "\": computing csls r(d) via the HNSW graph (" << n
                   << " vectors, " << k << " neighbours, expansion " << expansion

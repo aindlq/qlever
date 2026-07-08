@@ -253,10 +253,17 @@ VectorIndexBuildSpec parseSpec(const nlohmann::json& obj) {
     spec.config_.cslsNeighbors_ = obj.value("cslsNeighbors", uint32_t{10});
     spec.config_.cslsRPath_ = obj.value("cslsR", std::string{});
     spec.config_.buildHnsw_ = obj.value("hnsw", true);
+    // A csls index computes r(d) ONCE via the HNSW graph, and that statistic
+    // gates EVERY subsequent query -- so unless the user overrides them, its
+    // graph defaults to recall-favouring HNSW parameters (M 16->32,
+    // efConstruction 128->256; the self-kNN's efSearch is raised separately in
+    // the builder). The one-time build cost buys accurate r(d) forever.
+    const uint32_t defaultConnectivity = spec.config_.csls_ ? 32u : 16u;
+    const uint32_t defaultExpansionAdd = spec.config_.csls_ ? 256u : 128u;
     spec.config_.hnswConnectivity_ =
-        obj.value("hnswConnectivity", uint32_t{16});
+        obj.value("hnswConnectivity", defaultConnectivity);
     spec.config_.hnswExpansionAdd_ =
-        obj.value("hnswExpansionAdd", uint32_t{128});
+        obj.value("hnswExpansionAdd", defaultExpansionAdd);
     spec.config_.hnswExpansionSearch_ =
         obj.value("hnswExpansionSearch", uint32_t{64});
     spec.config_.buildThreads_ = obj.value("buildThreads", uint32_t{0});
