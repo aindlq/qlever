@@ -20,6 +20,7 @@
 #include "global/RuntimeParameters.h"
 #include "index/ConstantsIndexBuilding.h"
 #include "libqlever/Qlever.h"
+#include "util/JemallocLibraryHooks.h"
 #include "util/ProgramOptionsHelpers.h"
 #include "util/ReadableNumberFacet.h"
 #include "util/ResourceMonitor.h"
@@ -178,6 +179,7 @@ qlever::IndexBuilderConfig::WriteMaterializedViews parseMaterializedViewsJson(
 
 // Main function.
 int main(int argc, char** argv) {
+  ad_utility::installLibraryAllocatorHooks();
   // Copy the git hash and datetime of compilation (which require relinking)
   // to make them accessible to other parts of the code
   qlever::version::copyVersionInfo();
