@@ -15,7 +15,10 @@
 #include "index/IndexImpl.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
+#include "services/vectorSearch/VectorQueryPoint.h"
+#include "services/vectorSearch/VectorSearch.h"
 #include "util/HashMap.h"
+#include "util/HashSet.h"
 
 // ____________________________________________________________________________
 VectorSearchJoin::VectorSearchJoin(
@@ -24,20 +27,35 @@ VectorSearchJoin::VectorSearchJoin(
     std::shared_ptr<QueryExecutionTree> child)
     : Operation{qec}, config_{std::move(config)}, child_{std::move(child)} {
   AD_CONTRACT_CHECK(config_.leftVariable_.has_value(),
-                    "VectorSearchJoin requires a query (`<left>`) variable.");
+                    "VectorSearchJoin requires a `<candidates>` variable.");
+  // The parser guarantees these; direct constructions must obey them too.
+  AD_CONTRACT_CHECK(config_.hasQueryPoint() || !annotatesCandidatesInPlace(),
+                    "`<candidates> ?in` with `<result> ?in` (annotate in "
+                    "place) requires a query point.");
+  AD_CONTRACT_CHECK(
+      config_.hasQueryPoint() || !config_.coarseScoreVariable_.has_value(),
+      "`<bindCoarseScore>` requires a query point.");
   if (!child_) {
-    // INCOMPLETE form: the subtree binding `<left>` comes from the
+    // INCOMPLETE form: the subtree binding `<candidates>` comes from the
     // surrounding query. Expose the variables as possibly-undefined columns
     // so that the join enumeration can find the connection (see
     // `IncompleteJoinOperation`); `addJoinChild` builds the completed
-    // operation.
+    // operation. If nothing binds `<candidates>`, the leaf itself executes
+    // FORM W (see `computeResult`).
+    size_t next = 0;
     variableColumns_[config_.leftVariable_.value()] =
-        makePossiblyUndefinedColumn(ColumnIndex{0});
-    variableColumns_[config_.resultVariable_] =
-        makePossiblyUndefinedColumn(ColumnIndex{1});
+        makePossiblyUndefinedColumn(ColumnIndex{next++});
+    if (!annotatesCandidatesInPlace()) {
+      variableColumns_[config_.resultVariable_] =
+          makePossiblyUndefinedColumn(ColumnIndex{next++});
+    }
     if (config_.scoreVariable_.has_value()) {
       variableColumns_[config_.scoreVariable_.value()] =
-          makePossiblyUndefinedColumn(ColumnIndex{2});
+          makePossiblyUndefinedColumn(ColumnIndex{next++});
+    }
+    if (config_.coarseScoreVariable_.has_value()) {
+      variableColumns_[config_.coarseScoreVariable_.value()] =
+          makePossiblyUndefinedColumn(ColumnIndex{next++});
     }
     return;
   }
@@ -47,35 +65,49 @@ VectorSearchJoin::VectorSearchJoin(
     throw std::runtime_error{
         absl::StrCat("The vector-search `<candidates>`/`<left>` variable ",
                      config_.leftVariable_.value().name(),
-                     " is not bound by the nested query pattern.")};
+                     " is not bound by the join child.")};
   }
   leftCol_ = it->second.columnIndex_;
 
-  // The `?result`/`?score` columns are appended to the child's columns; if the
-  // nested pattern also binds one of them, silently overwriting the mapping
-  // would relabel a child column and return wrong results -- reject instead.
+  // The `?result`/`?score`/`?coarseScore` columns are appended to the child's
+  // columns (except in the annotate form, where `?result` IS the candidates
+  // column); if the child also binds one of them, silently overwriting the
+  // mapping would relabel a child column and return wrong results -- reject.
   auto checkNotBoundByChild = [&childCols](const Variable& var,
                                            std::string_view parameter) {
     if (childCols.contains(var)) {
       throw std::runtime_error{absl::StrCat(
           "The vector-search `<", parameter, ">` variable ", var.name(),
-          " must not be bound by the nested query pattern. (Restricting the "
-          "search space of the `<left>` form is not supported yet.)")};
+          " must not be bound by the subtree that binds `<candidates>`.")};
     }
   };
-  checkNotBoundByChild(config_.resultVariable_, "result");
+  if (!annotatesCandidatesInPlace()) {
+    checkNotBoundByChild(config_.resultVariable_, "result");
+  }
   if (config_.scoreVariable_.has_value()) {
     checkNotBoundByChild(config_.scoreVariable_.value(), "bindScore");
   }
+  if (config_.coarseScoreVariable_.has_value()) {
+    checkNotBoundByChild(config_.coarseScoreVariable_.value(),
+                         "bindCoarseScore");
+  }
 
-  // Output columns: all child columns, then `?result`, then optional `?score`.
+  // Output columns: all child columns, then `?result` (unless it annotates
+  // the candidates column in place), then the optional `?score` and
+  // `?coarseScore`.
   variableColumns_ = childCols;
-  size_t childWidth = child_->getResultWidth();
-  variableColumns_[config_.resultVariable_] =
-      makeAlwaysDefinedColumn(ColumnIndex{childWidth});
+  size_t next = child_->getResultWidth();
+  if (!annotatesCandidatesInPlace()) {
+    variableColumns_[config_.resultVariable_] =
+        makeAlwaysDefinedColumn(ColumnIndex{next++});
+  }
   if (config_.scoreVariable_.has_value()) {
     variableColumns_[config_.scoreVariable_.value()] =
-        makeAlwaysDefinedColumn(ColumnIndex{childWidth + 1});
+        makeAlwaysDefinedColumn(ColumnIndex{next++});
+  }
+  if (config_.coarseScoreVariable_.has_value()) {
+    variableColumns_[config_.coarseScoreVariable_.value()] =
+        makeAlwaysDefinedColumn(ColumnIndex{next++});
   }
 }
 
@@ -112,9 +144,12 @@ std::string VectorSearchJoin::getDescriptor() const {
 
 // ____________________________________________________________________________
 size_t VectorSearchJoin::getResultWidth() const {
-  size_t ownColumns = config_.scoreVariable_.has_value() ? 2 : 1;
+  size_t ownColumns =
+      static_cast<size_t>(!annotatesCandidatesInPlace()) +
+      static_cast<size_t>(config_.scoreVariable_.has_value()) +
+      static_cast<size_t>(config_.coarseScoreVariable_.has_value());
   if (!child_) {
-    // Incomplete: `<left>`, `<result>`[, `<bindScore>`].
+    // Incomplete: `<candidates>`, plus the own columns.
     return 1 + ownColumns;
   }
   return child_->getResultWidth() + ownColumns;
@@ -125,24 +160,39 @@ float VectorSearchJoin::getMultiplicity(size_t col) {
   if (!child_) {
     return 1.0f;
   }
-  // Passthrough columns inherit the child's multiplicity (scaled by the k-fold
-  // expansion); the synthetic result/score columns are treated as ~unique.
+  // Passthrough columns inherit the child's multiplicity -- scaled by the
+  // k-fold expansion of FORM E; FORM P keeps at most the child's rows. The
+  // synthetic result/score columns are treated as ~unique.
   size_t childWidth = child_->getResultWidth();
   if (col < childWidth) {
-    return child_->getMultiplicity(col) * static_cast<float>(config_.k_);
+    return config_.hasQueryPoint()
+               ? child_->getMultiplicity(col)
+               : child_->getMultiplicity(col) * static_cast<float>(config_.k_);
   }
   return 1.0f;
 }
 
 // ____________________________________________________________________________
 uint64_t VectorSearchJoin::getSizeEstimateBeforeLimit() {
-  return child_ ? child_->getSizeEstimate() * config_.k_ : config_.k_;
+  if (!child_) {
+    // FORM W (never completed): a whole-index top-k.
+    return config_.k_;
+  }
+  if (config_.hasQueryPoint()) {
+    // FORM P never leaves the bound set: at most the child's rows, and at
+    // most ~k of its distinct candidates unless all are kept.
+    return config_.keepAllCandidates_
+               ? child_->getSizeEstimate()
+               : std::min<uint64_t>(child_->getSizeEstimate(), config_.k_);
+  }
+  // FORM E: k result rows per child row.
+  return child_->getSizeEstimate() * config_.k_;
 }
 
 // ____________________________________________________________________________
 size_t VectorSearchJoin::getCostEstimate() {
-  // The child's own cost plus one index probe per child row. A probe is ~log(N)
-  // with HNSW, but a full scan of the N vectors without it.
+  // FORM E: the child's own cost plus one index probe per child row. A probe
+  // is ~log(N) with HNSW, but a full scan of the N vectors without it.
   auto vidx = qlever::vector::getVectorIndex(getExecutionContext()->getIndex(),
                                              config_.indexName_);
   size_t probeCost = config_.k_;
@@ -159,6 +209,11 @@ size_t VectorSearchJoin::getCostEstimate() {
   if (!child_) {
     return probeCost;
   }
+  if (config_.hasQueryPoint()) {
+    // FORM P: ONE exact scan restricted to the child's candidate set (plus
+    // the gather over the child's rows), not a probe per row.
+    return child_->getCostEstimate() + child_->getSizeEstimate();
+  }
   return child_->getCostEstimate() + child_->getSizeEstimate() * probeCost;
 }
 
@@ -171,18 +226,26 @@ VariableToColumnMap VectorSearchJoin::computeVariableToColumnMap() const {
 std::string VectorSearchJoin::getCacheKeyImpl() const {
   std::string key = absl::StrCat(
       "VECTOR_SEARCH_JOIN index=", config_.indexName_, " k=", config_.k_,
+      " keepAll=", config_.keepAllCandidates_,
       " algo=", static_cast<int>(config_.algorithm_), " leftCol=", leftCol_,
-      " score=", config_.scoreVariable_.has_value());
+      " annotate=", annotatesCandidatesInPlace(),
+      " score=", config_.scoreVariable_.has_value(),
+      " coarseScore=", config_.coarseScoreVariable_.has_value());
+  if (config_.rerankK_.has_value()) {
+    absl::StrAppend(&key, " rerankK=", config_.rerankK_.value());
+  }
   if (config_.maxDistance_.has_value()) {
     absl::StrAppend(
         &key, " maxDist=",
         absl::Hex(absl::bit_cast<uint32_t>(config_.maxDistance_.value())));
   }
+  qlever::vector::appendQueryPointToCacheKey(&key, config_);
   if (child_) {
     absl::StrAppend(&key, " {", child_->getCacheKey(), "}");
   } else {
-    // Incomplete operations are never executed or cached; the marker only
-    // keeps the key well-defined during planning.
+    // A leaf that the planner never completed either executes FORM W (query
+    // point present) or throws; the marker keeps its key distinct from a
+    // completed operation's.
     absl::StrAppend(&key, " INCOMPLETE");
   }
   return key;
@@ -197,20 +260,34 @@ std::unique_ptr<Operation> VectorSearchJoin::cloneImpl() const {
 // ____________________________________________________________________________
 Result VectorSearchJoin::computeResult([[maybe_unused]] bool requestLaziness) {
   if (!child_) {
-    // A `VectorSearchJoin` is only planned for a config WITHOUT a query point
-    // (a `<candidates>` config WITH one is lowered to a whole-index
-    // `VectorSearch` bound to the candidates variable, see
-    // `VectorSearchQuery::toVectorSearchConfiguration`). So an unbound
-    // `<candidates>` variable here is genuinely malformed: there are no query
-    // entities and nothing else to search for.
-    throw std::runtime_error{absl::StrCat(
-        "The vector-search `<candidates>`/`<left>` variable ",
-        config_.leftVariable_.value().name(),
-        " is not bound anywhere: bind it in the surrounding query (it is "
-        "then joined with the vector search), or add an explicit query point "
-        "(`<queryVector>`, `<query>`, `<queryText>`, or `<imageUrl>`/"
-        "`<imageBase64>`) to search the whole index -- the matches are then "
-        "bound to the `<candidates>` variable itself (omit `<result>`).")};
+    // The planner found NO subtree binding `<candidates>` -- the variable is
+    // unbound by the surrounding query.
+    if (!config_.hasQueryPoint()) {
+      // FORM E without candidates is genuinely malformed: there are no query
+      // entities and nothing else to search for.
+      throw std::runtime_error{absl::StrCat(
+          "The vector-search `<candidates>`/`<left>` variable ",
+          config_.leftVariable_.value().name(),
+          " is not bound anywhere: bind it in the surrounding query (each "
+          "candidate is then searched by its own stored vector), or add an "
+          "explicit query point (`<queryVector>`, `<query>`, `<queryText>`, "
+          "or `<imageUrl>`/`<imageBase64>`) to search the whole index.")};
+    }
+    if (!annotatesCandidatesInPlace()) {
+      throw std::runtime_error{absl::StrCat(
+          "The vector-search `<candidates>` variable ",
+          config_.leftVariable_.value().name(),
+          " is not bound anywhere: with a query point and unbound "
+          "`<candidates>` the search runs over the WHOLE index and binds its "
+          "matches to that variable itself, so `<result>` must name the SAME "
+          "variable (or omit `<candidates>` altogether), but it is ",
+          config_.resultVariable_.name(), ".")};
+    }
+    // FORM W: identical to omitting `<candidates>` -- the whole-index top-k,
+    // bound to the (shared) `<candidates>`/`<result>` variable.
+    return {qlever::vector::computeWholeIndexSearch(
+                config_, getExecutionContext(), cancellationHandle_),
+            resultSortedOn(), LocalVocab{}};
   }
   const Index& index = getExecutionContext()->getIndex();
   std::shared_ptr<const qlever::vector::VectorIndex> vidx =
@@ -220,6 +297,21 @@ Result VectorSearchJoin::computeResult([[maybe_unused]] bool requestLaziness) {
         "There is no loaded vector index named '", config_.indexName_,
         "'. Was the index built with `--service-index`?")};
   }
+
+  std::shared_ptr<const Result> childRes = child_->getResult();
+  const IdTable& childTable = childRes->idTable();
+  IdTable result{getResultWidth(), getExecutionContext()->getAllocator()};
+
+  if (config_.hasQueryPoint()) {
+    // FORM P (PRE-FILTER): score the bound candidates against the fixed
+    // query point; the search never leaves the bound set.
+    computePreFilterRows(*vidx, childTable, &result);
+    return {std::move(result), resultSortedOn(),
+            childRes->getCopyOfLocalVocab()};
+  }
+
+  // FORM E (ENTITY-TO-ENTITY): for each bound candidate, the k nearest of
+  // its OWN stored vector.
   using Algo = qlever::vector::VectorSearchConfiguration::Algorithm;
   if (config_.algorithm_ == Algo::Hnsw && !vidx->hasHnsw()) {
     throw std::runtime_error{
@@ -229,18 +321,15 @@ Result VectorSearchJoin::computeResult([[maybe_unused]] bool requestLaziness) {
   bool useHnsw = vidx->hasHnsw() && config_.algorithm_ != Algo::Exact;
   bool withScore = config_.scoreVariable_.has_value();
   auto checkInterrupt = [this]() { checkCancellation(); };
-
-  std::shared_ptr<const Result> childRes = child_->getResult();
-  const IdTable& childTable = childRes->idTable();
   const size_t childWidth = childTable.numColumns();
 
   // Children are often sorted (or at least clustered) by the join column, so
   // memoize the search results per distinct query entity -- without this, a
-  // child with many duplicate `<left>` values re-runs identical searches.
+  // child with many duplicate `<candidates>` values re-runs identical
+  // searches.
   ad_utility::HashMap<uint64_t, std::vector<qlever::vector::ScoredEntity>>
       hitsByEntity;
 
-  IdTable result{getResultWidth(), getExecutionContext()->getAllocator()};
   for (size_t row = 0; row < childTable.numRows(); ++row) {
     checkCancellation();
     Id leftId = childTable(row, leftCol_);
@@ -269,4 +358,125 @@ Result VectorSearchJoin::computeResult([[maybe_unused]] bool requestLaziness) {
     }
   }
   return {std::move(result), resultSortedOn(), childRes->getCopyOfLocalVocab()};
+}
+
+// ____________________________________________________________________________
+void VectorSearchJoin::computePreFilterRows(
+    const qlever::vector::VectorIndex& vidx, const IdTable& childTable,
+    IdTable* result) {
+  // FORM P: every bound candidate is scored by the exact distance of its
+  // STORED vector to the FIXED query point (brute force over exactly the
+  // candidate set; on a two-layer index a coarse scan over the set prunes to
+  // the top-`rerankK` and the fine layer reranks). `?in == ?out` annotates
+  // the child's rows in place; a distinct `?out` appends the top-k of the
+  // bound set as a fresh column. Rows whose candidate is not kept -- no
+  // stored vector, cut by `k`, or beyond `maxDistance` -- are dropped.
+  qlever::vector::QueryPoint queryPoint = qlever::vector::resolveQueryPoint(
+      config_, vidx, getExecutionContext()->getIndex().getImpl(),
+      cancellationHandle_);
+  if (std::holds_alternative<std::monostate>(queryPoint)) {
+    // Unknown or vectorless constant query entity -> no distances -> empty.
+    return;
+  }
+  std::optional<Id> queryEntity;
+  std::vector<float> query;
+  if (std::holds_alternative<Id>(queryPoint)) {
+    queryEntity = std::get<Id>(queryPoint);
+  } else {
+    query = std::move(std::get<std::vector<float>>(queryPoint));
+  }
+  auto checkInterrupt = [this]() { checkCancellation(); };
+
+  // The DISTINCT bound candidates (the restricted searches below skip
+  // candidates without a stored vector themselves).
+  std::vector<Id> candidates;
+  {
+    ad_utility::HashSet<Id> seen;
+    for (size_t row = 0; row < childTable.numRows(); ++row) {
+      Id candidate = childTable(row, leftCol_);
+      if (seen.insert(candidate).second) {
+        candidates.push_back(candidate);
+      }
+    }
+  }
+  const size_t effectiveK =
+      config_.keepAllCandidates_ ? candidates.size() : config_.k_;
+
+  const bool withCoarseScore = config_.coarseScoreVariable_.has_value();
+  ad_utility::HashMap<Id, float> coarseDistances;
+  std::vector<qlever::vector::ScoredEntity> scored;
+  if (vidx.hasRerankLayer()) {
+    // Coarse pass over exactly the bound set, then the fine rerank pass over
+    // the coarse survivors (never below `effectiveK`, so the annotate form
+    // without `<k>` keeps every candidate). `maxDistance` filters on the
+    // FINE distance only.
+    const size_t rerankK = std::max(
+        config_.rerankK_.value_or(std::max<size_t>(10 * effectiveK, 100)),
+        effectiveK);
+    auto coarse = queryEntity.has_value()
+                      ? vidx.searchExactCoarseByEntity(
+                            queryEntity.value(), rerankK, candidates,
+                            std::nullopt, checkInterrupt)
+                      : vidx.searchExactCoarse(query, rerankK, candidates,
+                                               std::nullopt, checkInterrupt);
+    std::vector<Id> pruned;
+    pruned.reserve(coarse.size());
+    for (const auto& hit : coarse) {
+      pruned.push_back(hit.entity_);
+      if (withCoarseScore) {
+        coarseDistances[hit.entity_] = hit.distance_;
+      }
+    }
+    scored =
+        queryEntity.has_value()
+            ? vidx.searchExactByEntity(queryEntity.value(), effectiveK, pruned,
+                                       config_.maxDistance_, checkInterrupt)
+            : vidx.searchExact(query, effectiveK, pruned, config_.maxDistance_,
+                               checkInterrupt);
+  } else {
+    scored = queryEntity.has_value()
+                 ? vidx.searchExactByEntity(queryEntity.value(), effectiveK,
+                                            candidates, config_.maxDistance_,
+                                            checkInterrupt)
+                 : vidx.searchExact(query, effectiveK, candidates,
+                                    config_.maxDistance_, checkInterrupt);
+  }
+
+  // The fine distance of every KEPT candidate.
+  ad_utility::HashMap<Id, float> fineDistances;
+  for (const auto& hit : scored) {
+    fineDistances[hit.entity_] = hit.distance_;
+  }
+
+  // Emit the child's rows whose candidate was kept, appending the fresh
+  // `?result` column (unless annotating in place) and the score column(s).
+  const bool annotate = annotatesCandidatesInPlace();
+  const bool withScore = config_.scoreVariable_.has_value();
+  const size_t childWidth = childTable.numColumns();
+  for (size_t row = 0; row < childTable.numRows(); ++row) {
+    checkCancellation();
+    Id candidate = childTable(row, leftCol_);
+    auto it = fineDistances.find(candidate);
+    if (it == fineDistances.end()) {
+      continue;
+    }
+    result->emplace_back();
+    size_t outRow = result->numRows() - 1;
+    for (size_t c = 0; c < childWidth; ++c) {
+      (*result)(outRow, c) = childTable(row, c);
+    }
+    size_t next = childWidth;
+    if (!annotate) {
+      (*result)(outRow, next++) = candidate;
+    }
+    if (withScore) {
+      (*result)(outRow, next++) = Id::makeFromDouble(it->second);
+    }
+    if (withCoarseScore) {
+      // On a single-layer index the two layers coincide.
+      auto coarseIt = coarseDistances.find(candidate);
+      (*result)(outRow, next++) = Id::makeFromDouble(
+          coarseIt != coarseDistances.end() ? coarseIt->second : it->second);
+    }
+  }
 }

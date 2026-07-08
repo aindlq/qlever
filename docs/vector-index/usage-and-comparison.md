@@ -280,26 +280,38 @@ On a single-layer index the SERVICE behaves as before (single-precision
 top-k; `vec:rerankK` is ignored, `vec:bindCoarseScore` equals
 `vec:bindScore`).
 
-**Candidates (`vec:candidates`, alias `vec:left`).** The SERVICE's input-set
-parameter is named `vec:candidates` (the original name `vec:left` keeps
-working). The semantics:
+**The three SERVICE forms.** `vec:result ?out` is **required in every form**;
+the input-set parameter is `vec:candidates ?in` (the original name `vec:left`
+keeps working). `vec:index` accepts either a string literal (`"emb"`) or the
+index IRI (`vidx:emb`).
 
-- `vec:candidates ?in` **without** a query point (the join form): `?in` must
-  be **bound** by the surrounding query → for each `?in`, search by its
-  stored vector, the matches go to `vec:result`; if `?in` is bound nowhere,
-  this is a clear execution-time error (there is nothing to search for);
-- `vec:candidates` **omitted** → search the whole index from the explicit
-  query point (the produce form above);
-- `vec:candidates ?in` **with** a query point (the candidates-fallback form):
-  a whole-index search whose matches are bound to `?in` **itself** (omit
-  `vec:result`; `vec:bindScore`/`vec:bindCoarseScore` work as in the produce
-  form). With `?in` unbound elsewhere this IS the top-k result — identical to
-  the produce form with `vec:result ?in`. If `?in` is *also* bound by the
-  surrounding query, the two sets are **joined** (the whole-index top-k
-  intersected with the outer bindings) — the search is *not* restricted to
-  the outer set; restricting ("among" semantics) is a possible future form;
-- `?in == ?out` (`vec:result` the same variable) → intended to annotate the
-  candidates in place; currently rejected (TODO), use a distinct `?out`.
+- **FORM W — whole-index**: a query point, `vec:candidates` **omitted** — or
+  present with `?in` **unbound** by the surrounding query, which then must
+  name the *same* variable as `vec:result` (`?in == ?out`; a distinct `?out`
+  is a clear error). The top-`k` nearest to the query point over the WHOLE
+  index, bound to `?out` (the produce form above, incl. the two-layer
+  coarse-scan-then-rerank).
+- **FORM P — pre-filter**: a query point *and* `vec:candidates ?in` **bound**
+  by the surrounding query. Every bound candidate is scored by the exact
+  distance of its **stored** vector to the query point; the search is
+  **restricted** to the bound set — it never pulls in non-candidates
+  (brute-force over exactly that set; on a two-layer index the coarse i8
+  scan of the set prunes to the top-`rerankK`, the fine layer reranks:
+  `vec:bindScore` = fine, `vec:bindCoarseScore` = coarse).
+  - `?in == ?out` → **annotate in place**: every bound row gets `?d`
+    (`vec:bindScore`). With `vec:k`, only the top-`k` of the bound set is
+    kept (still bound to that one variable); without it, ALL bound
+    candidates are scored.
+  - `?in != ?out` → `?out` binds the top-`k` nearest of the bound set (a
+    fresh column next to the carried-through `?in` rows), `?d` their
+    distance.
+- **FORM E — entity-to-entity**: `vec:candidates ?in` bound, **no** query
+  point: for each `?in`, the `k` nearest by its OWN stored vector →
+  a **distinct** `?out` (`?in == ?out` is an error here; a candidate's
+  neighbours are other entities). If `?in` is bound nowhere, this is a clear
+  execution-time error (there is nothing to search for).
+  `vec:bindCoarseScore` is not available (no fixed query point to rerank
+  against).
 
 **Coexist / compare.** `vec:distance` (fine, exact) and the SERVICE (coarse
 scan → fine rerank) work on the *same* two-layer index, so one query can put

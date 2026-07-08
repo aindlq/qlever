@@ -41,11 +41,21 @@ struct VectorSearchConfiguration {
   // The query point. Exactly one of these specifies it:
   std::optional<std::vector<float>> queryVector_;  // an explicit vector,
   std::optional<std::string> queryEntityIri_;      // a constant entity IRI,
-  std::optional<std::string> queryText_;           // free text to embed,
-  std::optional<ImageQuery> queryImage_;           // an image to embed, or
-  std::optional<Variable> leftVariable_;           // the "for each ?x" binary
-                                                   // form: a variable bound by
-  // the surrounding query.
+  std::optional<std::string> queryText_;           // free text to embed, or
+  std::optional<ImageQuery> queryImage_;           // an image to embed.
+
+  // True iff one of the query-point fields above is set (FORM W / FORM P;
+  // FORM E -- entity-to-entity -- has no query point).
+  bool hasQueryPoint() const {
+    return queryVector_.has_value() || queryEntityIri_.has_value() ||
+           queryText_.has_value() || queryImage_.has_value();
+  }
+
+  // The `vec:candidates` (alias `vec:left`) variable, bound by the
+  // SURROUNDING query. With a query point it restricts the search to the
+  // bound set (FORM P, pre-filter); without one it is the entity-to-entity
+  // input (FORM E). See `VectorSearchQuery::toVectorSearchConfiguration`.
+  std::optional<Variable> leftVariable_;
 
   // The variable bound to each result entity.
   Variable resultVariable_{"?_qlever_internal_vec_result"};
@@ -62,6 +72,11 @@ struct VectorSearchConfiguration {
 
   // Number of nearest neighbours to return.
   size_t k_ = 10;
+
+  // FORM P annotate only (`vec:candidates` and `vec:result` the SAME variable,
+  // query point present, `vec:k` omitted): score ALL bound candidates instead
+  // of keeping a top-`k_` cut (`k_` is ignored on the bound path then).
+  bool keepAllCandidates_ = false;
 
   // Two-layer indices only: how many candidates the coarse scan pass keeps
   // for the fine rerank pass (`vec:rerankK`). Unset = `max(10 * k, 100)`.

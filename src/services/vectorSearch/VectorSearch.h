@@ -9,10 +9,31 @@
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORSEARCH_H
 
 #include <memory>
+#include <string>
 
 #include "engine/Operation.h"
 #include "engine/QueryExecutionTree.h"
 #include "services/vectorSearch/VectorSearchConfig.h"
+
+namespace qlever::vector {
+
+// Append the query-point fields of `config` to a cache key, each value
+// length-prefixed / bit-exact so distinct query points never share a key.
+// Shared by `VectorSearch` and `VectorSearchJoin`.
+void appendQueryPointToCacheKey(std::string* key,
+                                const VectorSearchConfiguration& config);
+
+// The WHOLE-INDEX top-k search of `config` (FORM W): resolve the query point
+// against the index `config.indexName_` and return the k nearest entities as
+// a `(?result[, ?score][, ?coarseScore])` table in that column order
+// (coarse-scan-then-rerank on a two-layer index). Shared by the `VectorSearch`
+// operation and by a never-completed `VectorSearchJoin` leaf (FORM W spelled
+// as `vec:candidates ?out` with `?out` unbound by the surrounding query).
+IdTable computeWholeIndexSearch(
+    const VectorSearchConfiguration& config, QueryExecutionContext* qec,
+    const ad_utility::SharedCancellationHandle& handle);
+
+}  // namespace qlever::vector
 
 // A WHOLE-INDEX vector similarity search for a single query point (an explicit
 // vector, the vector of a constant entity, or an embedded text/image),

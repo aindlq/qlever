@@ -69,16 +69,16 @@ struct VectorSearchQuery : MagicServiceQuery {
       queryImage_;  // image -> embedded at query time
   // The candidates variable, parsed from `vec:candidates` (canonical) or
   // `vec:left` (the original name, kept as a working alias). Semantics (see
-  // `toVectorSearchConfiguration`):
-  //  * WITHOUT a query point (the join form): the query entities, bound by
-  //    the surrounding query -> for each, the k nearest of its stored vector.
-  //  * WITH a query point (the candidates-fallback form): the config is
-  //    lowered to a whole-index produce search whose matches are bound to
-  //    this variable itself (`vec:result` must be omitted); if the variable
-  //    is unbound elsewhere that IS the result, if it is also bound by the
-  //    surrounding query the two sets are joined like any produce output.
-  // TODO: `?in == ?out` (`vec:candidates` and `vec:result` the same variable,
-  // annotate the candidates in place) is still rejected.
+  // `toVectorSearchConfiguration` for the full three-form description):
+  //  * WITH a query point and the variable BOUND by the surrounding query
+  //    (FORM P, pre-filter): the search is RESTRICTED to the bound set; each
+  //    candidate is scored by the distance of its stored vector to the query
+  //    point. `?in == ?out` annotates the candidates in place.
+  //  * WITH a query point and the variable UNBOUND (FORM W spelled with
+  //    `vec:candidates`): a whole-index search; requires `?in == ?out`.
+  //  * WITHOUT a query point (FORM E, entity-to-entity): for each bound
+  //    candidate, the k nearest of its OWN stored vector -> a DISTINCT
+  //    `vec:result`.
   std::optional<Variable> leftVar_;
   std::optional<Variable> resultVar_;
   std::optional<Variable> scoreVar_;

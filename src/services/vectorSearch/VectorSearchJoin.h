@@ -15,17 +15,30 @@
 #include "engine/QueryExecutionTree.h"
 #include "services/vectorSearch/VectorSearchConfig.h"
 
-// The "for each ?x, find the k most similar entities" form of vector search.
-// For each row of the child subtree the operation looks up the query entity's
-// vector and emits the k nearest entities of the index, carrying the child's
-// columns through and adding `?result` (and optionally `?score`).
-//
-// The query entities can come from either side of the SERVICE clause:
-//  * a nested `{ ... }` pattern inside the SERVICE that binds `<left>`
-//    (the operation is then constructed complete), or
-//  * the SURROUNDING query (mirroring `SpatialJoin`): the operation is planned
-//    as an INCOMPLETE leaf implementing `IncompleteJoinOperation`, and the
-//    join enumeration completes it with the subtree that binds `<left>`.
+namespace qlever::vector {
+class VectorIndex;
+}  // namespace qlever::vector
+
+// The `vec:candidates` (alias `vec:left`) forms of vector search. The
+// operation is planned as an INCOMPLETE leaf implementing
+// `IncompleteJoinOperation` (mirroring `SpatialJoin`); the join enumeration
+// completes it with the subtree of the SURROUNDING query that binds
+// `<candidates>`. Which form runs is decided by the config's query point and
+// by whether the planner found such a subtree:
+//  * FORM P (PRE-FILTER; query point + completed child): every bound
+//    candidate is scored by the exact distance of its STORED vector to the
+//    fixed query point -- the search is RESTRICTED to the bound set
+//    (coarse-scan-then-rerank on a two-layer index). `?in == ?out` annotates
+//    the child's rows in place (all scored candidates, or the top-`k` of the
+//    bound set if `vec:k` was given); a distinct `?out` appends the top-k of
+//    the bound set as a fresh column.
+//  * FORM E (ENTITY-TO-ENTITY; no query point + completed child): for each
+//    bound candidate, the k nearest entities of its OWN stored vector are
+//    emitted into the DISTINCT `?result` column (plus optionally `?score`),
+//    carrying the child's columns through.
+//  * FORM W (WHOLE-INDEX; query point, NEVER completed -- `<candidates>` is
+//    unbound): identical to omitting `<candidates>`; requires
+//    `?in == ?out` and delegates to `computeWholeIndexSearch`.
 class VectorSearchJoin : public Operation, public IncompleteJoinOperation {
  private:
   qlever::vector::VectorSearchConfiguration config_;
@@ -67,9 +80,19 @@ class VectorSearchJoin : public Operation, public IncompleteJoinOperation {
       const Variable& var) const override;
 
  private:
+  // True iff `<result>` names the same variable as `<candidates>` (the FORM P
+  // annotate-in-place spelling; also how FORM W is spelled with candidates).
+  bool annotatesCandidatesInPlace() const {
+    return config_.leftVariable_ == config_.resultVariable_;
+  }
+
   uint64_t getSizeEstimateBeforeLimit() override;
   std::string getCacheKeyImpl() const override;
   Result computeResult(bool requestLaziness) override;
+  // FORM P: score the child's bound candidates (and ONLY those) against the
+  // fixed query point, appending the result rows to `result`.
+  void computePreFilterRows(const qlever::vector::VectorIndex& vidx,
+                            const IdTable& childTable, IdTable* result);
   VariableToColumnMap computeVariableToColumnMap() const override;
   std::unique_ptr<Operation> cloneImpl() const override;
 };

@@ -76,17 +76,17 @@ void registerVectorSearchService() {
               "`LIMIT`."};
         }
         if (config.leftVariable_.has_value()) {
-          // "for each ?x bound by the SURROUNDING query, find the k nearest":
-          // an incomplete join leaf; the planner's join enumeration adds the
-          // subtree that binds `<left>` (see `IncompleteJoinOperation`).
+          // `<candidates>`: an incomplete join leaf; the planner's join
+          // enumeration completes it with the subtree of the surrounding
+          // query that binds the variable (see `IncompleteJoinOperation`).
+          // Completed WITH a query point -> FORM P (pre-filter: score exactly
+          // the bound set against the query point); completed WITHOUT one ->
+          // FORM E (entity-to-entity); never completed (the variable is
+          // unbound) -> FORM W over the whole index, requiring `<candidates>`
+          // == `<result>` (see `VectorSearchJoin::computeResult`).
           ctx.addLeafOperation(std::make_shared<VectorSearchJoin>(qec, config));
         } else {
-          // Whole-index query point -> top-k table. This also covers
-          // `<candidates>` TOGETHER with a query point: that form is lowered
-          // to a produce config whose result variable IS the candidates
-          // variable (see `toVectorSearchConfiguration`), so an unbound
-          // candidates variable receives the whole-index top-k, and a bound
-          // one is joined by the planner like any produce output.
+          // FORM W: whole-index query point -> top-k table.
           ctx.addLeafOperation(std::make_shared<VectorSearch>(qec, config));
         }
       });

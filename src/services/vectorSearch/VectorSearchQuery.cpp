@@ -14,6 +14,7 @@
 #include <cmath>
 
 #include "parser/SparqlTriple.h"
+#include "services/vectorSearch/VectorIndexExtension.h"
 
 namespace parsedQuery {
 
@@ -61,7 +62,31 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
   };
 
   if (pred == "index") {
-    indexName_ = requireLiteral();
+    // `<index>` accepts either a plain string literal ("images") or the
+    // index's metadata IRI (`<.../vectorSearch/index/images>`) -- the same
+    // IRI the `vec:distance`/`vec:embed` functions and `vec:hasMember` take.
+    if (object.isLiteral()) {
+      indexName_ =
+          std::string{asStringViewUnsafe(object.getLiteral().getContent())};
+    } else if (object.isIri()) {
+      std::optional<std::string> name =
+          qlever::vector::indexNameFromMetadataIri(
+              object.getIri().toStringRepresentation());
+      if (!name.has_value()) {
+        throw VectorSearchException{absl::StrCat(
+            "The parameter `<index>` expects a string literal (e.g. "
+            "\"images\") or a vector-index IRI "
+            "`<https://qlever.cs.uni-freiburg.de/vectorSearch/index/NAME>`, "
+            "but got the IRI ",
+            object.getIri().toStringRepresentation(), ".")};
+      }
+      indexName_ = std::move(name).value();
+    } else {
+      throw VectorSearchException{
+          "The parameter `<index>` expects a string literal (e.g. \"images\") "
+          "or a vector-index IRI "
+          "`<https://qlever.cs.uni-freiburg.de/vectorSearch/index/NAME>`."};
+    }
   } else if (pred == "query") {
     if (!object.isIri()) {
       throw VectorSearchException{
@@ -179,44 +204,47 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   throwIf(queryVector_.has_value() && queryVector_->empty(),
           "The `<queryVector>` parameter must contain at least one number.");
 
+  // `<result>` is REQUIRED in every form.
+  throwIf(!resultVar_.has_value(),
+          "Vector search requires the `<result>` (alias `<right>`) parameter "
+          "(the variable bound to each result entity).");
+
   // The three surface forms:
-  //  * PRODUCE form (query point, no `<candidates>`): whole-index top-k, the
-  //    matches are bound to `<result>`;
-  //  * JOIN form (`<candidates>` without a query point): for each candidate
-  //    entity bound by the surrounding query, the k nearest of its STORED
-  //    vector, bound to `<result>`;
-  //  * CANDIDATES-FALLBACK form (query point AND `<candidates>`): a
-  //    whole-index top-k whose matches are bound to the `<candidates>`
-  //    variable itself (`<result>` must be omitted). If the variable is also
-  //    bound by the surrounding query, the two sets are JOINED like any other
-  //    produce-form result variable (the search is NOT restricted to the
-  //    outer set; that would be a future "among" form).
-  const bool joinForm = leftVar_.has_value() && numQueryPoints == 0;
-  const bool candidatesFallbackForm =
-      leftVar_.has_value() && numQueryPoints == 1;
+  //  * FORM W (WHOLE-INDEX): a query point, `<candidates>` omitted -- or
+  //    present but UNBOUND by the surrounding query, which then must name
+  //    the SAME variable as `<result>` (`?in == ?out`): the top-k nearest
+  //    to the query point over the WHOLE index, bound to `<result>`.
+  //  * FORM P (PRE-FILTER): a query point AND `<candidates> ?in` BOUND by
+  //    the surrounding query: every bound candidate is scored by the
+  //    distance of its STORED vector to the query point; the search is
+  //    RESTRICTED to the bound set (it never pulls in non-candidates).
+  //    `?in == ?out` ANNOTATES the candidates in place -- all of them, or
+  //    only the top-`<k>` of the bound set if `<k>` is given; a distinct
+  //    `?out` binds the top-k of the bound set (fresh binding).
+  //  * FORM E (ENTITY-TO-ENTITY): `<candidates> ?in` bound, NO query point:
+  //    for each bound candidate, the k nearest of its OWN stored vector,
+  //    bound to a DISTINCT `<result>`.
+  // Bound-ness of `<candidates>` is a planner/runtime property, so the
+  // parse-time split is only "query point or not" (FORM E vs FORM W/P); the
+  // `VectorSearchJoin` operation resolves W-vs-P when the planner does or
+  // does not complete it with a subtree binding `?in`.
+  const bool entityToEntityForm = leftVar_.has_value() && numQueryPoints == 0;
+  const bool annotateForm =
+      leftVar_.has_value() && numQueryPoints == 1 && leftVar_ == resultVar_;
 
-  if (candidatesFallbackForm) {
-    throwIf(resultVar_.has_value(),
-            "A vector search with both a query point and `<candidates>` "
-            "(alias `<left>`) binds the matches to the `<candidates>` "
-            "variable itself, so the `<result>` parameter must be omitted. "
-            "(Alternatively, omit `<candidates>` and bind the matches with "
-            "`<result>`.)");
-  } else {
-    throwIf(!resultVar_.has_value(),
-            "Vector search requires the `<result>` (alias `<right>`) "
-            "parameter (the variable bound to each result entity).");
-  }
-
-  if (joinForm) {
-    // Binary "for each ?x" form: the query entities are bound by the
-    // SURROUNDING query (the planner joins the vector search with the subtree
-    // that binds the variable). TODO: `<candidates> ?in` with `?in == ?out`
-    // should eventually ANNOTATE the candidates in place instead of being an
-    // error (see `VectorSearchQuery::leftVar_`).
+  if (entityToEntityForm) {
+    // A candidate's neighbours are OTHER entities; `?in == ?out` (annotating
+    // in place) is only meaningful with a fixed query point (FORM P).
     throwIf(leftVar_ == resultVar_,
             "The `<candidates>`/`<left>` and `<result>` variables of a vector "
-            "search must be different.");
+            "search without a query point (the entity-to-entity form) must be "
+            "different. (`?in == ?out` requires a query point.)");
+    // The coarse->rerank pass needs a fixed query point; FORM E binds one
+    // exact (fine) score per row.
+    throwIf(coarseScoreVar_.has_value(),
+            "The `<bindCoarseScore>` parameter requires a query point; it is "
+            "not supported in the entity-to-entity `<candidates>` form "
+            "(no query point).");
   }
   throwIf(scoreVar_.has_value() && scoreVar_ == resultVar_,
           "The `<bindScore>` and `<result>` variables of a vector search must "
@@ -236,13 +264,6 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
               coarseScoreVar_ == scoreVar_,
           "The `<bindCoarseScore>` and `<bindScore>` variables of a vector "
           "search must be different.");
-  // The coarse->rerank pass exists only on the whole-index produce paths
-  // (including the candidates-fallback form, which is lowered to one below);
-  // the join form binds one exact (fine) score per row.
-  throwIf(coarseScoreVar_.has_value() && joinForm,
-          "The `<bindCoarseScore>` parameter is only supported for the "
-          "whole-index search forms, not together with "
-          "`<candidates>`/`<left>`.");
 
   qlever::vector::VectorSearchConfiguration config;
   config.indexName_ = indexName_.value();
@@ -250,20 +271,13 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   config.queryEntityIri_ = queryEntityIri_;
   config.queryText_ = queryText_;
   config.queryImage_ = queryImage_;
-  if (candidatesFallbackForm) {
-    // Lower to the PRODUCE form: the whole-index matches ARE bound to the
-    // `<candidates>` variable. The planner then plans a plain `VectorSearch`
-    // leaf; if the variable is also bound by the surrounding query, the
-    // planner joins the two sets like for any other produce-form output.
-    config.leftVariable_ = std::nullopt;
-    config.resultVariable_ = leftVar_.value();
-  } else {
-    config.leftVariable_ = leftVar_;
-    config.resultVariable_ = resultVar_.value();
-  }
+  config.leftVariable_ = leftVar_;
+  config.resultVariable_ = resultVar_.value();
   config.scoreVariable_ = scoreVar_;
   config.coarseScoreVariable_ = coarseScoreVar_;
   config.k_ = k_.value_or(10);
+  // FORM P annotate without an explicit `<k>` scores ALL bound candidates.
+  config.keepAllCandidates_ = annotateForm && !k_.has_value();
   config.rerankK_ = rerankK_;
   config.maxDistance_ = maxDistance_;
   config.algorithm_ = algo_;

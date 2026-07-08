@@ -642,15 +642,15 @@ TEST(VectorRerank, candidatesAliasMatchesLeft) {
 }
 
 // _____________________________________________________________________________
-// The candidates-fallback form (an explicit query point + `vec:candidates
-// ?nn` with `?nn` unbound by the surrounding query) runs the same
-// coarse-scan-then-rerank produce path as `vec:result ?nn` on a two-layer
-// index -- bit-equal entities, fine scores, AND coarse scores
-// (`vec:bindCoarseScore` is supported here, unlike in the pure join form).
-TEST(VectorRerank, unboundCandidatesFallbackRunsProducePath) {
+// FORM W spelled with `vec:candidates` (an explicit query point +
+// `vec:candidates ?nn ; vec:result ?nn` with `?nn` unbound by the surrounding
+// query) runs the same coarse-scan-then-rerank whole-index path as the plain
+// `vec:result ?nn` form on a two-layer index -- bit-equal entities, fine
+// scores, AND coarse scores.
+TEST(VectorRerank, unboundCandidatesRunsWholeIndexRerankPath) {
   auto* qec = qecWithRerankIndexes();
   auto run = [&](std::string_view bindClause) {
-    // Both forms share one cache key by design; force fresh computations.
+    // Force fresh computations for each form.
     qec->getQueryTreeCache().clearAll();
     QueryExecutionTree qet = planQuery(
         qec, std::string{PREFIX} +
@@ -671,7 +671,7 @@ TEST(VectorRerank, unboundCandidatesFallbackRunsProducePath) {
     }
     return rows;
   };
-  auto viaCandidates = run("vec:candidates ?nn");
+  auto viaCandidates = run("vec:candidates ?nn ; vec:result ?nn");
   auto viaResult = run("vec:result ?nn");
   EXPECT_EQ(viaCandidates, viaResult);
   // Sanity: the fine (reranked) top-3 for [0,1,0,0] is r3 < r2 < r1.
@@ -680,6 +680,77 @@ TEST(VectorRerank, unboundCandidatesFallbackRunsProducePath) {
   EXPECT_EQ(std::get<0>(viaCandidates[0]), getId("<r3>").getBits());
   EXPECT_EQ(std::get<0>(viaCandidates[1]), getId("<r2>").getBits());
   EXPECT_EQ(std::get<0>(viaCandidates[2]), getId("<r1>").getBits());
+}
+
+// _____________________________________________________________________________
+// TWO-LAYER FORM P (pre-filter): the bound candidates are scored with the
+// coarse-scan-then-rerank pipeline restricted to the bound set.
+// `vec:bindScore` is the FINE distance (bit-equal to `vec:distance` over the
+// same rows), `vec:bindCoarseScore` the coarse scan distance -- on the
+// designed probe `<r5>` the two differ by the i8 quantization error.
+TEST(VectorRerank, formPAnnotateRerankOnBoundSet) {
+  auto* qec = qecWithRerankIndexes();
+  QueryExecutionTree qet = planQuery(
+      qec,
+      std::string{PREFIX} +
+          "SELECT * WHERE { ?e <is-a> <RItem> . "
+          "SERVICE vec: { _:c vec:index \"embrr\" ; "
+          "vec:queryVector \"0,1,0,0\" ; vec:candidates ?e ; vec:result ?e ; "
+          "vec:bindScore ?d ; vec:bindCoarseScore ?dc . } "
+          "BIND(vec:distance(vidx:embrr, ?e, \"0,1,0,0\") AS ?dref) }");
+  auto result = qet.getResult();
+  size_t eCol = qet.getVariableColumn(Variable{"?e"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  size_t dcCol = qet.getVariableColumn(Variable{"?dc"});
+  size_t drefCol = qet.getVariableColumn(Variable{"?dref"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+  // No `vec:k`: EVERY bound candidate (all six items) is annotated.
+  ASSERT_EQ(table.numRows(), 6u);
+  bool sawR5 = false;
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    // The fine score is bit-equal to the exact `vec:distance` (both read the
+    // fine rerank layer).
+    ASSERT_EQ(table(r, dCol).getDatatype(), Datatype::Double);
+    EXPECT_EQ(table(r, dCol), table(r, drefCol)) << "row " << r;
+    double fine = table(r, dCol).getDouble();
+    double coarse = table(r, dcCol).getDouble();
+    if (table(r, eCol) == getId("<r5>")) {
+      sawR5 = true;
+      // Fine: ~1 - 0.003 (bf16 keeps the small component); coarse: exactly 1
+      // (i8 dropped it) -- the quantization error survives the FORM P path.
+      EXPECT_NEAR(fine, 0.997, 1e-3);
+      EXPECT_NEAR(coarse, 1.0, 1e-6);
+      EXPECT_GT(std::abs(fine - coarse), 1e-3);
+    } else {
+      EXPECT_NEAR(fine, coarse, 0.02) << "row " << r;
+    }
+  }
+  EXPECT_TRUE(sawR5);
+}
+
+// _____________________________________________________________________________
+// TWO-LAYER FORM P is restricted to the bound set: with only the seed `<r2>`
+// bound, the result is `<r2>` alone -- although the whole-index top-1 for the
+// query point would be `<r3>`.
+TEST(VectorRerank, formPTwoLayerRestrictsToBoundSet) {
+  auto* qec = qecWithRerankIndexes();
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT * WHERE { ?x <is-a> <SeedItem> . "
+               "SERVICE vec: { _:c vec:index \"embrr\" ; "
+               "vec:queryVector \"0,1,0,0\" ; vec:candidates ?x ; "
+               "vec:result ?nn ; vec:bindScore ?d ; vec:bindCoarseScore ?dc ; "
+               "vec:k 3 . } }");
+  auto result = qet.getResult();
+  size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
+  size_t dcCol = qet.getVariableColumn(Variable{"?dc"});
+  const IdTable& table = result->idTable();
+  auto getId = makeGetId(qec->getIndex());
+  ASSERT_EQ(table.numRows(), 1u);
+  EXPECT_EQ(table(0, nnCol), getId("<r2>"));
+  // The coarse score column is present and a real distance.
+  ASSERT_EQ(table(0, dcCol).getDatatype(), Datatype::Double);
 }
 
 // _____________________________________________________________________________
@@ -706,13 +777,15 @@ TEST(VectorRerank, parseErrors) {
                            "vec:queryVector \"0,1,0,0\" ; "
                            "vec:bindCoarseScore ?x .")),
       HasSubstr("must be different"));
-  // `<bindCoarseScore>` is a whole-index (produce path) feature.
+  // `<bindCoarseScore>` needs a query point (it is not available in the
+  // entity-to-entity FORM E, which has none).
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"embrr\" ; vec:candidates ?c ; "
                            "vec:result ?x ; vec:bindCoarseScore ?dc .")),
-      HasSubstr("only supported"));
-  // `<candidates>` and `<result>` must differ (the in-place annotate form is
-  // not supported yet).
+      HasSubstr("requires a query point"));
+  // `<candidates>` and `<result>` must differ WITHOUT a query point (FORM E:
+  // a candidate's neighbours are distinct entities; the in-place annotate
+  // form requires a query point).
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"embrr\" ; vec:candidates ?x ; "
                            "vec:result ?x .")),
