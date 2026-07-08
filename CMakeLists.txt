@@ -349,6 +349,16 @@ else ()
     endif ()
 endif ()
 
+### C-library allocator hooks (route ICU allocations to jemalloc on Windows) ###
+# On Windows/MinGW jemalloc's je_-prefixed C API leaves plain malloc/free - and
+# thus C libraries such as ICU - on the UCRT heap. QLEVER_JEMALLOC_LIBRARY_HOOKS
+# installs jemalloc-backed allocators for those libraries (see
+# src/util/JemallocLibraryHooks). No-op on non-Windows; toggle for benchmarking.
+option(QLEVER_JEMALLOC_LIBRARY_HOOKS "Route ICU (and other C-library) allocations to jemalloc on Windows" ON)
+# The definition is applied narrowly to the `util` target (which owns
+# JemallocLibraryHooks.cpp) rather than globally, so toggling it only recompiles
+# that library.
+
 ### io_uring (optional, for asynchronous batch vocabulary I/O)
 option(USE_IO_URING "Enable io_uring support for batch vocabulary I/O (requires liburing)" ON)
 if (USE_IO_URING)

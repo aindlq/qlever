@@ -7,9 +7,11 @@
 
 #include "index/Vocabulary.h"
 #include "index/VocabularyMerger.h"
+#include "util/JemallocLibraryHooks.h"
 
 // ____________________________________________________________________________________________________
 int main(int argc, char** argv) {
+  ad_utility::installLibraryAllocatorHooks();
   if (argc != 3) {
     std::cerr
         << "Usage: " << argv[0]
