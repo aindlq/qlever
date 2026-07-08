@@ -192,7 +192,8 @@ class VectorIndex {
       ql::span<const float> query, size_t k,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
-      const CheckInterruptCallback& checkInterrupt = {}) const;
+      const CheckInterruptCallback& checkInterrupt = {},
+      size_t* numScored = nullptr) const;
 
   // The same exact brute-force search on the COARSE scan matrix (identical to
   // `searchExact` on a single-layer index). This is the SERVICE's coarse
@@ -202,7 +203,8 @@ class VectorIndex {
       ql::span<const float> query, size_t k,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
-      const CheckInterruptCallback& checkInterrupt = {}) const;
+      const CheckInterruptCallback& checkInterrupt = {},
+      size_t* numScored = nullptr) const;
 
   // Approximate top-`k` via the HNSW graph over the whole index. Requires
   // `hasHnsw()`. Results are ascending by distance. `k` is clamped to the
@@ -223,12 +225,14 @@ class VectorIndex {
       Id entity, size_t k,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
-      const CheckInterruptCallback& checkInterrupt = {}) const;
+      const CheckInterruptCallback& checkInterrupt = {},
+      size_t* numScored = nullptr) const;
   std::vector<ScoredEntity> searchExactCoarseByEntity(
       Id entity, size_t k,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
-      const CheckInterruptCallback& checkInterrupt = {}) const;
+      const CheckInterruptCallback& checkInterrupt = {},
+      size_t* numScored = nullptr) const;
   std::vector<ScoredEntity> searchHnswByEntity(
       Id entity, size_t k, std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;

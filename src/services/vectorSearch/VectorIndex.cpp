@@ -933,12 +933,22 @@ std::vector<ScoredEntity> searchExactBytes(
     ImplT& impl, LayerT& layer, const char* queryBytes, size_t k,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt) {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored = nullptr) {
+  // `numScored` (optional out-param) reports how many vectors actually had a
+  // distance computed -- the WHOLE live set for a whole-index search, or just
+  // the candidates that are members for a restricted one. It is NOT the raw
+  // candidate count: a candidate without a stored vector is skipped, not scored.
+  auto reportScored = [numScored](size_t n) {
+    if (numScored != nullptr) {
+      *numScored = n;
+    }
+  };
   // Clamp `k` (user-supplied, unbounded) to the live vector count AND a hard
   // maximum: it bounds the `TopK` heap and would otherwise be a remote OOM
   // lever.
   k = std::min({k, impl.numLive(), MAX_SEARCH_RESULTS});
   if (k == 0) {
+    reportScored(0);
     return {};
   }
   TopK top{k};
@@ -983,6 +993,7 @@ std::vector<ScoredEntity> searchExactBytes(
           return std::pair<size_t, uint64_t>{row, id};
         },
         checkInterrupt);
+    reportScored(impl.numLive());
     return top.sorted();
   }
 
@@ -1039,6 +1050,8 @@ std::vector<ScoredEntity> searchExactBytes(
         },
         checkInterrupt);
   }
+  // The members among the candidates -- the rows that actually got a distance.
+  reportScored(matched.size());
   return top.sorted();
 }
 
@@ -1047,7 +1060,7 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
     ql::span<const float> query, size_t k,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -1060,7 +1073,7 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
   std::vector<char> buffer;
   const char* queryBytes = layer.encodeQuery(query, buffer);
   return searchExactBytes(impl, layer, queryBytes, k, candidates, maxDistance,
-                          checkInterrupt);
+                          checkInterrupt, numScored);
 }
 
 // ____________________________________________________________________________
@@ -1068,7 +1081,7 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarse(
     ql::span<const float> query, size_t k,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -1080,14 +1093,14 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarse(
   std::vector<char> buffer;
   const char* queryBytes = impl.scan_.encodeQuery(query, buffer);
   return searchExactBytes(impl, impl.scan_, queryBytes, k, candidates,
-                          maxDistance, checkInterrupt);
+                          maxDistance, checkInterrupt, numScored);
 }
 
 // ____________________________________________________________________________
 std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -1097,14 +1110,14 @@ std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
     return {};
   }
   return searchExactBytes(impl, layer, layer.rowPtr(row.value()), k, candidates,
-                          maxDistance, checkInterrupt);
+                          maxDistance, checkInterrupt, numScored);
 }
 
 // ____________________________________________________________________________
 std::vector<ScoredEntity> VectorIndex::searchExactCoarseByEntity(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -1113,7 +1126,7 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarseByEntity(
     return {};
   }
   return searchExactBytes(impl, impl.scan_, impl.scan_.rowPtr(row.value()), k,
-                          candidates, maxDistance, checkInterrupt);
+                          candidates, maxDistance, checkInterrupt, numScored);
 }
 
 // ____________________________________________________________________________

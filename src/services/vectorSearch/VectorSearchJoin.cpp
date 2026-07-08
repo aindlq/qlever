@@ -415,15 +415,19 @@ void VectorSearchJoin::computePreFilterRows(
         config_.rerankK_.value_or(std::max<size_t>(10 * effectiveK, 100)),
         effectiveK);
     ad_utility::Timer coarseTimer{ad_utility::Timer::Started};
+    size_t coarseScored = 0;
     auto coarse = queryEntity.has_value()
                       ? vidx.searchExactCoarseByEntity(
                             queryEntity.value(), rerankK, candidates,
-                            std::nullopt, checkInterrupt)
+                            std::nullopt, checkInterrupt, &coarseScored)
                       : vidx.searchExactCoarse(query, rerankK, candidates,
-                                               std::nullopt, checkInterrupt);
+                                               std::nullopt, checkInterrupt,
+                                               &coarseScored);
+    // `coarseScored` = candidates that HAVE a vector (were actually scored),
+    // not the raw candidate count -- the merge-join skips the vectorless ones.
     qlever::vector::logVectorSearchPhase(
-        config_.indexName_, "brute-force scan (coarse layer, candidate set)",
-        coarseTimer.value().count() / 1000.0, candidates.size());
+        config_.indexName_, "brute-force scan (coarse layer, index members)",
+        coarseTimer.value().count() / 1000.0, coarseScored);
     std::vector<Id> pruned;
     pruned.reserve(coarse.size());
     for (const auto& hit : coarse) {
@@ -445,15 +449,18 @@ void VectorSearchJoin::computePreFilterRows(
                                          pruned.size());
   } else {
     ad_utility::Timer scanTimer{ad_utility::Timer::Started};
+    size_t numScored = 0;
     scored = queryEntity.has_value()
                  ? vidx.searchExactByEntity(queryEntity.value(), effectiveK,
                                             candidates, config_.maxDistance_,
-                                            checkInterrupt)
+                                            checkInterrupt, &numScored)
                  : vidx.searchExact(query, effectiveK, candidates,
-                                    config_.maxDistance_, checkInterrupt);
+                                    config_.maxDistance_, checkInterrupt,
+                                    &numScored);
+    // Members actually scored, not the raw candidate count (see above).
     qlever::vector::logVectorSearchPhase(
-        config_.indexName_, "brute-force scan (candidate set)",
-        scanTimer.value().count() / 1000.0, candidates.size());
+        config_.indexName_, "brute-force scan (index members)",
+        scanTimer.value().count() / 1000.0, numScored);
   }
 
   // The fine distance of every KEPT candidate.

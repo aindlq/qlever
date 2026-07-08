@@ -375,6 +375,17 @@ TEST(VectorIndex, exactSearchOverCandidateSubset) {
   for (size_t i = 0; i < res.size(); ++i) {
     EXPECT_EQ(res[i].entity_.getBits(), expected[i]);
   }
+  // `numScored` reports the DISTINCT members actually scored, NOT the raw
+  // candidate count: duplicate candidate ids are collapsed by the merge-join,
+  // so they neither inflate the count nor produce duplicate results.
+  std::vector<Id> withDups = subset;
+  withDups.insert(withDups.end(), subset.begin(), subset.end());
+  size_t numScored = 999999;
+  auto dupRes =
+      idx.searchExact(b.data.vecs[3], NUM_VECTORS,
+                      ql::span<const Id>{withDups}, std::nullopt, {}, &numScored);
+  EXPECT_EQ(numScored, subset.size());
+  EXPECT_EQ(dupRes.size(), std::min<size_t>(subset.size(), NUM_VECTORS));
   cleanup(b);
 }
 
