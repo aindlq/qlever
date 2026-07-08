@@ -315,6 +315,22 @@ TEST(VectorSearchService, vecDistanceSourcesAreSymmetric) {
 }
 
 // _____________________________________________________________________________
+// Regression: `vec:imageUrl <IRI>` must forward the BARE url (`http://...`) to
+// the embedding endpoint, NOT the `<http://...>` string representation -- the
+// endpoint rejects the angle brackets. The op cache key carries the parsed url.
+TEST(VectorSearchService, imageUrlIriForwardsBareUrl) {
+  auto* qec = qecWithVectorIndex();
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
+               "vec:imageUrl <http://example.com/x.jpg> ; vec:result ?nn ; "
+               "vec:k 2 . } }");
+  std::string key = qet.getCacheKey();
+  EXPECT_THAT(key, HasSubstr("http://example.com/x.jpg"));
+  EXPECT_THAT(key, ::testing::Not(HasSubstr("<http://example.com/x.jpg>")));
+}
+
+// _____________________________________________________________________________
 // An entity without a vector evaluates to UNDEF (and is dropped by ORDER BY /
 // comparisons), rather than erroring.
 TEST(VectorSearchService, vecDistanceMissingVectorIsUndef) {

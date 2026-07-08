@@ -100,8 +100,14 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
     queryText_ = requireLiteral();
   } else if (pred == "imageUrl") {
     using ImageKind = qlever::vector::VectorSearchConfiguration::ImageKind;
-    std::string url = object.isIri() ? object.getIri().toStringRepresentation()
-                                     : requireLiteral();
+    // Use the bare IRI content (`https://...`), NOT `toStringRepresentation()`
+    // (`<https://...>`): the raw URL is forwarded to the embedding endpoint,
+    // which rejects the angle brackets. Matches how `vec:embed` reads its
+    // image IRI (`getContent()`).
+    std::string url =
+        object.isIri()
+            ? std::string{asStringViewUnsafe(object.getIri().getContent())}
+            : requireLiteral();
     queryImage_ = {ImageKind::Url, std::move(url)};
   } else if (pred == "imageBase64") {
     using ImageKind = qlever::vector::VectorSearchConfiguration::ImageKind;
