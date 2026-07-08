@@ -81,7 +81,12 @@ void registerVectorSearchService() {
           // subtree that binds `<left>` (see `IncompleteJoinOperation`).
           ctx.addLeafOperation(std::make_shared<VectorSearchJoin>(qec, config));
         } else {
-          // Whole-index query point -> top-k table.
+          // Whole-index query point -> top-k table. This also covers
+          // `<candidates>` TOGETHER with a query point: that form is lowered
+          // to a produce config whose result variable IS the candidates
+          // variable (see `toVectorSearchConfiguration`), so an unbound
+          // candidates variable receives the whole-index top-k, and a bound
+          // one is joined by the planner like any produce output.
           ctx.addLeafOperation(std::make_shared<VectorSearch>(qec, config));
         }
       });

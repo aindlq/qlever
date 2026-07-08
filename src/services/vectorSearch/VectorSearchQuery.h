@@ -67,15 +67,18 @@ struct VectorSearchQuery : MagicServiceQuery {
   std::optional<std::string> queryText_;  // free text -> embedded at query time
   std::optional<qlever::vector::VectorSearchConfiguration::ImageQuery>
       queryImage_;  // image -> embedded at query time
-  // The candidate/query entities, bound by the surrounding query (the join
-  // form). Parsed from `vec:candidates` (canonical) or `vec:left` (the
-  // original name, kept as a working alias). Intended semantics: bound by the
-  // surrounding query -> search that subset per row; unbound or omitted ->
-  // the whole index (the produce form below). TODO: `vec:candidates ?in`
-  // that is PRESENT but UNBOUND anywhere in the query currently errors at
-  // execution time instead of falling back to the whole index, and
-  // `?in == ?out` (annotate the candidates in place) is currently rejected;
-  // both need planner support.
+  // The candidates variable, parsed from `vec:candidates` (canonical) or
+  // `vec:left` (the original name, kept as a working alias). Semantics (see
+  // `toVectorSearchConfiguration`):
+  //  * WITHOUT a query point (the join form): the query entities, bound by
+  //    the surrounding query -> for each, the k nearest of its stored vector.
+  //  * WITH a query point (the candidates-fallback form): the config is
+  //    lowered to a whole-index produce search whose matches are bound to
+  //    this variable itself (`vec:result` must be omitted); if the variable
+  //    is unbound elsewhere that IS the result, if it is also bound by the
+  //    surrounding query the two sets are joined like any produce output.
+  // TODO: `?in == ?out` (`vec:candidates` and `vec:result` the same variable,
+  // annotate the candidates in place) is still rejected.
   std::optional<Variable> leftVar_;
   std::optional<Variable> resultVar_;
   std::optional<Variable> scoreVar_;

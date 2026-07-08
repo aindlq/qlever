@@ -24,6 +24,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -638,6 +639,47 @@ TEST(VectorRerank, candidatesAliasMatchesLeft) {
   ASSERT_EQ(viaCandidates.size(), 2u);
   EXPECT_EQ(viaCandidates[0].first, getId("<r2>"));
   EXPECT_EQ(viaCandidates[1].first, getId("<r1>"));
+}
+
+// _____________________________________________________________________________
+// The candidates-fallback form (an explicit query point + `vec:candidates
+// ?nn` with `?nn` unbound by the surrounding query) runs the same
+// coarse-scan-then-rerank produce path as `vec:result ?nn` on a two-layer
+// index -- bit-equal entities, fine scores, AND coarse scores
+// (`vec:bindCoarseScore` is supported here, unlike in the pure join form).
+TEST(VectorRerank, unboundCandidatesFallbackRunsProducePath) {
+  auto* qec = qecWithRerankIndexes();
+  auto run = [&](std::string_view bindClause) {
+    // Both forms share one cache key by design; force fresh computations.
+    qec->getQueryTreeCache().clearAll();
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} +
+                 "SELECT * WHERE { SERVICE vec: { _:c vec:index \"embrr\" ; "
+                 "vec:queryVector \"0,1,0,0\" ; " +
+                 std::string{bindClause} +
+                 " ; vec:bindScore ?d ; vec:bindCoarseScore ?dc ; "
+                 "vec:k 3 ; vec:rerankK 6 . } }");
+    auto result = qet.getResult();
+    size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    size_t dcCol = qet.getVariableColumn(Variable{"?dc"});
+    std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> rows;
+    for (size_t r = 0; r < result->idTable().numRows(); ++r) {
+      rows.emplace_back(result->idTable()(r, nnCol).getBits(),
+                        result->idTable()(r, dCol).getBits(),
+                        result->idTable()(r, dcCol).getBits());
+    }
+    return rows;
+  };
+  auto viaCandidates = run("vec:candidates ?nn");
+  auto viaResult = run("vec:result ?nn");
+  EXPECT_EQ(viaCandidates, viaResult);
+  // Sanity: the fine (reranked) top-3 for [0,1,0,0] is r3 < r2 < r1.
+  auto getId = makeGetId(qec->getIndex());
+  ASSERT_EQ(viaCandidates.size(), 3u);
+  EXPECT_EQ(std::get<0>(viaCandidates[0]), getId("<r3>").getBits());
+  EXPECT_EQ(std::get<0>(viaCandidates[1]), getId("<r2>").getBits());
+  EXPECT_EQ(std::get<0>(viaCandidates[2]), getId("<r1>").getBits());
 }
 
 // _____________________________________________________________________________

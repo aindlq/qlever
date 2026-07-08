@@ -162,16 +162,16 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   };
   throwIf(!indexName_.has_value(),
           "Vector search requires the `<index>` parameter.");
-  throwIf(!resultVar_.has_value(),
-          "Vector search requires the `<result>` (alias `<right>`) parameter "
-          "(the variable bound to each result entity).");
 
-  int numQuerySpecs = static_cast<int>(queryVector_.has_value()) +
-                      static_cast<int>(queryEntityIri_.has_value()) +
-                      static_cast<int>(queryText_.has_value()) +
-                      static_cast<int>(queryImage_.has_value()) +
-                      static_cast<int>(leftVar_.has_value());
-  throwIf(numQuerySpecs != 1,
+  int numQueryPoints = static_cast<int>(queryVector_.has_value()) +
+                       static_cast<int>(queryEntityIri_.has_value()) +
+                       static_cast<int>(queryText_.has_value()) +
+                       static_cast<int>(queryImage_.has_value());
+  throwIf(numQueryPoints > 1,
+          "Vector search requires exactly one of `<queryVector>`, `<query>` (a "
+          "constant entity IRI), `<queryText>`, or "
+          "`<imageUrl>`/`<imageBase64>` as the query point.");
+  throwIf(numQueryPoints == 0 && !leftVar_.has_value(),
           "Vector search requires exactly one of `<queryVector>`, `<query>` (a "
           "constant entity IRI), `<queryText>`, `<imageUrl>`/`<imageBase64>`, "
           "or `<candidates>` (alias `<left>`; a variable bound by the "
@@ -179,7 +179,36 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   throwIf(queryVector_.has_value() && queryVector_->empty(),
           "The `<queryVector>` parameter must contain at least one number.");
 
-  if (leftVar_.has_value()) {
+  // The three surface forms:
+  //  * PRODUCE form (query point, no `<candidates>`): whole-index top-k, the
+  //    matches are bound to `<result>`;
+  //  * JOIN form (`<candidates>` without a query point): for each candidate
+  //    entity bound by the surrounding query, the k nearest of its STORED
+  //    vector, bound to `<result>`;
+  //  * CANDIDATES-FALLBACK form (query point AND `<candidates>`): a
+  //    whole-index top-k whose matches are bound to the `<candidates>`
+  //    variable itself (`<result>` must be omitted). If the variable is also
+  //    bound by the surrounding query, the two sets are JOINED like any other
+  //    produce-form result variable (the search is NOT restricted to the
+  //    outer set; that would be a future "among" form).
+  const bool joinForm = leftVar_.has_value() && numQueryPoints == 0;
+  const bool candidatesFallbackForm =
+      leftVar_.has_value() && numQueryPoints == 1;
+
+  if (candidatesFallbackForm) {
+    throwIf(resultVar_.has_value(),
+            "A vector search with both a query point and `<candidates>` "
+            "(alias `<left>`) binds the matches to the `<candidates>` "
+            "variable itself, so the `<result>` parameter must be omitted. "
+            "(Alternatively, omit `<candidates>` and bind the matches with "
+            "`<result>`.)");
+  } else {
+    throwIf(!resultVar_.has_value(),
+            "Vector search requires the `<result>` (alias `<right>`) "
+            "parameter (the variable bound to each result entity).");
+  }
+
+  if (joinForm) {
     // Binary "for each ?x" form: the query entities are bound by the
     // SURROUNDING query (the planner joins the vector search with the subtree
     // that binds the variable). TODO: `<candidates> ?in` with `?in == ?out`
@@ -207,9 +236,10 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
               coarseScoreVar_ == scoreVar_,
           "The `<bindCoarseScore>` and `<bindScore>` variables of a vector "
           "search must be different.");
-  // The coarse->rerank pass exists only on the whole-index produce path; the
-  // join form binds one exact (fine) score per row.
-  throwIf(coarseScoreVar_.has_value() && leftVar_.has_value(),
+  // The coarse->rerank pass exists only on the whole-index produce paths
+  // (including the candidates-fallback form, which is lowered to one below);
+  // the join form binds one exact (fine) score per row.
+  throwIf(coarseScoreVar_.has_value() && joinForm,
           "The `<bindCoarseScore>` parameter is only supported for the "
           "whole-index search forms, not together with "
           "`<candidates>`/`<left>`.");
@@ -220,8 +250,17 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   config.queryEntityIri_ = queryEntityIri_;
   config.queryText_ = queryText_;
   config.queryImage_ = queryImage_;
-  config.leftVariable_ = leftVar_;
-  config.resultVariable_ = resultVar_.value();
+  if (candidatesFallbackForm) {
+    // Lower to the PRODUCE form: the whole-index matches ARE bound to the
+    // `<candidates>` variable. The planner then plans a plain `VectorSearch`
+    // leaf; if the variable is also bound by the surrounding query, the
+    // planner joins the two sets like for any other produce-form output.
+    config.leftVariable_ = std::nullopt;
+    config.resultVariable_ = leftVar_.value();
+  } else {
+    config.leftVariable_ = leftVar_;
+    config.resultVariable_ = resultVar_.value();
+  }
   config.scoreVariable_ = scoreVar_;
   config.coarseScoreVariable_ = coarseScoreVar_;
   config.k_ = k_.value_or(10);

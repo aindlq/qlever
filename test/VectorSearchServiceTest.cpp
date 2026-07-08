@@ -651,8 +651,10 @@ TEST(VectorSearchService, outerBoundLeftOptionalMinusRejected) {
 }
 
 // _____________________________________________________________________________
-// Without any binding of `<left>` the operation stays incomplete and fails at
-// execution time with an actionable message (not a crash or silent result).
+// Without any binding of `<left>` AND without a query point the operation
+// stays incomplete and fails at execution time with an actionable message
+// (there is nothing to search for; the message points to the whole-index
+// fallback of adding a query point).
 TEST(VectorSearchService, unjoinedOuterLeftThrows) {
   auto* qec = qecWithVectorIndex();
   AD_EXPECT_THROW_WITH_MESSAGE(
@@ -662,6 +664,116 @@ TEST(VectorSearchService, unjoinedOuterLeftThrows) {
                    "vec:left ?x ; vec:result ?nn ; vec:k 2 . } }",
                Variable{"?nn"}),
       HasSubstr("is not bound anywhere"));
+}
+
+// _____________________________________________________________________________
+// `vec:candidates ?nn` together with an explicit query point and `?nn` UNBOUND
+// by the surrounding query searches the WHOLE index and binds the top-k
+// matches to `?nn` itself -- bit-equal to the produce form that omits
+// `vec:candidates` and uses `vec:result ?nn` instead.
+TEST(VectorSearchService, unboundCandidatesWithQueryPointSearchesWholeIndex) {
+  auto* qec = qecWithVectorIndex();
+  auto run = [&](std::string_view body) {
+    // Force a fresh computation for each form (the two forms deliberately
+    // share one cache key, which would make the comparison trivial).
+    qec->getQueryTreeCache().clearAll();
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} + "SELECT * WHERE { SERVICE vec: { _:c " +
+                 std::string{body} + " } }");
+    auto result = qet.getResult();
+    size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    std::vector<std::pair<uint64_t, uint64_t>> rows;
+    for (size_t r = 0; r < result->idTable().numRows(); ++r) {
+      rows.emplace_back(result->idTable()(r, nnCol).getBits(),
+                        result->idTable()(r, dCol).getBits());
+    }
+    return rows;
+  };
+  auto viaCandidates =
+      run("vec:index \"clip\" ; vec:query <e0> ; vec:candidates ?nn ; "
+          "vec:bindScore ?d ; vec:k 2 .");
+  auto viaResult =
+      run("vec:index \"clip\" ; vec:query <e0> ; vec:result ?nn ; "
+          "vec:bindScore ?d ; vec:k 2 .");
+  // Bit-equal entities AND scores.
+  EXPECT_EQ(viaCandidates, viaResult);
+  // Sanity: the whole-index `searchExact` top-2 for <e0> is <e0>, then <e1>.
+  auto getId = makeGetId(qec->getIndex());
+  ASSERT_EQ(viaCandidates.size(), 2u);
+  EXPECT_EQ(viaCandidates[0].first, getId("<e0>").getBits());
+  EXPECT_EQ(viaCandidates[1].first, getId("<e1>").getBits());
+}
+
+// _____________________________________________________________________________
+// Planning-level shape of the `<candidates>` forms: unbound `<candidates>`
+// with a query point plans a whole-index `VectorSearch` (produce) leaf; a
+// `<candidates>` variable bound by the surrounding query (the join form,
+// without a query point) plans a `VectorSearchJoin` completed with the outer
+// subtree.
+TEST(VectorSearchService, candidatesBoundnessSelectsOperation) {
+  auto* qec = qecWithVectorIndex();
+  {
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} +
+                 "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
+                 "vec:query <e0> ; vec:candidates ?nn ; vec:k 2 . } }");
+    Operation* op = qet.getRootOperation().get();
+    EXPECT_NE(dynamic_cast<VectorSearch*>(op), nullptr);
+    EXPECT_EQ(dynamic_cast<VectorSearchJoin*>(op), nullptr);
+  }
+  {
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} +
+                 "SELECT * WHERE { ?x <is-a> <Painting> . "
+                 "SERVICE vec: { _:c vec:index \"clip\" ; "
+                 "vec:candidates ?x ; vec:result ?nn ; vec:k 2 . } }");
+    Operation* op = qet.getRootOperation().get();
+    EXPECT_NE(dynamic_cast<VectorSearchJoin*>(op), nullptr);
+    EXPECT_EQ(dynamic_cast<VectorSearch*>(op), nullptr);
+  }
+}
+
+// _____________________________________________________________________________
+// A `<candidates>` variable given WITH a query point that is ALSO bound by the
+// surrounding query behaves like a bound `<result>` variable of the produce
+// form: the whole-index top-k is JOINED with the outer bindings. (The search
+// is not restricted to the outer set; that would be a future "among" form.)
+TEST(VectorSearchService, boundCandidatesWithQueryPointJoinsLikeResult) {
+  auto* qec = qecWithVectorIndex();
+  auto [result, col] =
+      runQuery(qec,
+               std::string{PREFIX} +
+                   "SELECT * WHERE { ?nn <is-a> <Statue> . "
+                   "SERVICE vec: { _:c vec:index \"clip\" ; vec:query <e0> ; "
+                   "vec:candidates ?nn ; vec:k 5 . } }",
+               Variable{"?nn"});
+  auto getId = makeGetId(qec->getIndex());
+  const IdTable& table = result->idTable();
+  // Whole-index top-5 for <e0> = all four vectored entities; intersected with
+  // the statues {<e0>, <e1>, <e3>} (<e2> is a painting, <e4> has no vector).
+  std::set<uint64_t> got;
+  for (size_t r = 0; r < table.numRows(); ++r) {
+    got.insert(table(r, col).getBits());
+  }
+  EXPECT_EQ(
+      got, (std::set<uint64_t>{getId("<e0>").getBits(), getId("<e1>").getBits(),
+                               getId("<e3>").getBits()}));
+}
+
+// _____________________________________________________________________________
+// In the candidates-fallback form (query point + `<candidates>`) the matches
+// are bound to the `<candidates>` variable itself, so `<result>` must be
+// omitted.
+TEST(VectorSearchService, candidatesWithQueryPointAndResultRejected) {
+  auto* qec = qecWithVectorIndex();
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                std::string{PREFIX} +
+                    "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
+                    "vec:query <e0> ; vec:candidates ?nn ; vec:result ?out ; "
+                    "vec:k 2 . } }"),
+      HasSubstr("must be omitted"));
 }
 
 // _____________________________________________________________________________

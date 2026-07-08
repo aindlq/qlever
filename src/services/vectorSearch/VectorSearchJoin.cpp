@@ -197,18 +197,20 @@ std::unique_ptr<Operation> VectorSearchJoin::cloneImpl() const {
 // ____________________________________________________________________________
 Result VectorSearchJoin::computeResult([[maybe_unused]] bool requestLaziness) {
   if (!child_) {
-    // TODO: the INTENDED semantics of a present-but-unbound `<candidates>`
-    // variable is "search the whole index" (identical to omitting the
-    // parameter); wiring that fallback needs the planner to detect that no
-    // subtree binds the variable and swap this leaf for a `VectorSearch`.
-    // Until then it is a clear error.
+    // A `VectorSearchJoin` is only planned for a config WITHOUT a query point
+    // (a `<candidates>` config WITH one is lowered to a whole-index
+    // `VectorSearch` bound to the candidates variable, see
+    // `VectorSearchQuery::toVectorSearchConfiguration`). So an unbound
+    // `<candidates>` variable here is genuinely malformed: there are no query
+    // entities and nothing else to search for.
     throw std::runtime_error{absl::StrCat(
         "The vector-search `<candidates>`/`<left>` variable ",
         config_.leftVariable_.value().name(),
         " is not bound anywhere: bind it in the surrounding query (it is "
-        "then joined with the vector search) or in a nested `{ ... }` "
-        "pattern inside the SERVICE clause, or omit the parameter to search "
-        "the whole index.")};
+        "then joined with the vector search), or add an explicit query point "
+        "(`<queryVector>`, `<query>`, `<queryText>`, or `<imageUrl>`/"
+        "`<imageBase64>`) to search the whole index -- the matches are then "
+        "bound to the `<candidates>` variable itself (omit `<result>`).")};
   }
   const Index& index = getExecutionContext()->getIndex();
   std::shared_ptr<const qlever::vector::VectorIndex> vidx =

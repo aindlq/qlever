@@ -282,15 +282,22 @@ top-k; `vec:rerankK` is ignored, `vec:bindCoarseScore` equals
 
 **Candidates (`vec:candidates`, alias `vec:left`).** The SERVICE's input-set
 parameter is named `vec:candidates` (the original name `vec:left` keeps
-working). The intended semantics:
+working). The semantics:
 
-- `vec:candidates ?in` with `?in` **bound** by the surrounding query → for
-  each `?in`, search by its stored vector (the join form; implemented);
+- `vec:candidates ?in` **without** a query point (the join form): `?in` must
+  be **bound** by the surrounding query → for each `?in`, search by its
+  stored vector, the matches go to `vec:result`; if `?in` is bound nowhere,
+  this is a clear execution-time error (there is nothing to search for);
 - `vec:candidates` **omitted** → search the whole index from the explicit
-  query point (the produce form above; implemented);
-- `vec:candidates ?in` present but **unbound** anywhere → intended to fall
-  back to the whole index; currently a clear execution-time error (TODO:
-  needs planner support), so omit the parameter instead;
+  query point (the produce form above);
+- `vec:candidates ?in` **with** a query point (the candidates-fallback form):
+  a whole-index search whose matches are bound to `?in` **itself** (omit
+  `vec:result`; `vec:bindScore`/`vec:bindCoarseScore` work as in the produce
+  form). With `?in` unbound elsewhere this IS the top-k result — identical to
+  the produce form with `vec:result ?in`. If `?in` is *also* bound by the
+  surrounding query, the two sets are **joined** (the whole-index top-k
+  intersected with the outer bindings) — the search is *not* restricted to
+  the outer set; restricting ("among" semantics) is a possible future form;
 - `?in == ?out` (`vec:result` the same variable) → intended to annotate the
   candidates in place; currently rejected (TODO), use a distinct `?out`.
 
