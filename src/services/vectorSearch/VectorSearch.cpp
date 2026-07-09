@@ -151,9 +151,12 @@ CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
     cut.maxKeep_ = DEFAULT_CSLS_KNEE_MAX_KEEP;
   } else {
     cut.mode_ = CslsCut::Mode::Softmax;
+    // T precedence: per-query override -> runtime-config serving default ->
+    // the BUILD-time corpus calibration (`.meta`) -> the constant fallback.
+    const float calibratedOrConst = vidx.calibratedSoftmaxTemperature().value_or(
+        DEFAULT_CSLS_SOFTMAX_TEMPERATURE);
     cut.temperature_ = config.softmaxTemperature_.value_or(
-        vidx.softmaxTemperatureDefault().value_or(
-            DEFAULT_CSLS_SOFTMAX_TEMPERATURE));
+        vidx.softmaxTemperatureDefault().value_or(calibratedOrConst));
     // Default softmaxN: a few times the neighbourhood scale r(q) uses (the
     // effective `cslsNeighbors` -- the query override, else the build value).
     const size_t neighbors =

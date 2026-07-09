@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -236,6 +237,25 @@ class CslsNeighborhood {
     return static_cast<float>(sum / static_cast<double>(heap_.size()));
   }
 
+  // Population standard deviation of the kept neighbours' cosine similarities --
+  // the local spread of a point's nearest neighbours. Used at BUILD time to
+  // calibrate the softmax autoCut temperature: a tightly-clustered space (small
+  // spread) wants a small, sharp T; a diffuse one a larger T. Fewer than two
+  // neighbours -> 0 (no spread to measure).
+  float stdevCosSim() const {
+    if (heap_.size() < 2) {
+      return 0.f;
+    }
+    const double mean = static_cast<double>(meanCosSim());
+    double sumSq = 0;
+    for (float d : heap_) {
+      const double c = (1.0 - static_cast<double>(d)) - mean;
+      sumSq += c * c;
+    }
+    return static_cast<float>(
+        std::sqrt(sumSq / static_cast<double>(heap_.size())));
+  }
+
  private:
   size_t k_;
   std::vector<float> heap_;  // max-heap of the k smallest distances
@@ -447,6 +467,15 @@ struct VectorIndexMetadata {
   // (candidate gathers stay correct, they merely lose the sequential-read
   // speedup). Never affects results.
   std::string collationLocale_;
+  // Softmax-autoCut temperature T calibrated from the corpus at build time: the
+  // median, across rows, of each point's nearest-neighbour cosine spread
+  // (`CslsNeighborhood::stdevCosSim`), clamped to a sane range. A saturated
+  // space (cosines packed near 1) yields a small, sharp T automatically. Set
+  // only for a csls index whose r(d) was COMPUTED (not ingested via `cslsR`);
+  // absent => the query path falls back to the constant default. A SERVING
+  // default only: the runtime config and the per-query `vec:softmaxTemperature`
+  // both override it (see `resolveCslsCut`).
+  std::optional<float> calibratedSoftmaxT_;
 };
 
 // Path helpers. Centralised so the builder and the reader agree.
@@ -512,6 +541,12 @@ inline void to_json(nlohmann::json& j, const VectorIndexMetadata& m) {
   if (m.config_.csls_) {
     j["cslsNeighbors"] = m.config_.cslsNeighbors_;
   }
+  // Build-time softmax T calibration: only written when it was computed (a csls
+  // index with a self-kNN r(d)), so it stays absent -- and back-compatible --
+  // otherwise.
+  if (m.calibratedSoftmaxT_.has_value()) {
+    j["calibratedSoftmaxT"] = m.calibratedSoftmaxT_.value();
+  }
   // NOTE: `embeddingUrl`/`embeddingModel`/`preload` are deliberately NOT
   // persisted -- they are serving concerns set at server start from the
   // `QLEVER_VECTOR_SEARCH_ENDPOINTS` environment variable (see
@@ -552,6 +587,13 @@ inline void from_json(const nlohmann::json& j, VectorIndexMetadata& m) {
   // Absent before the collation guard existed ("" => the load hook skips the
   // collation check for this index).
   m.collationLocale_ = j.value("collationLocale", std::string{});
+  // Absent (older builds, ingested-r(d), or non-csls) => no calibrated default;
+  // the query path then uses the constant softmax temperature.
+  if (j.contains("calibratedSoftmaxT")) {
+    m.calibratedSoftmaxT_ = j.at("calibratedSoftmaxT").get<float>();
+  } else {
+    m.calibratedSoftmaxT_ = std::nullopt;
+  }
 }
 
 }  // namespace qlever::vector

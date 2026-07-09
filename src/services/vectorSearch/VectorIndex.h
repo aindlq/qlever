@@ -267,6 +267,11 @@ class VectorIndex {
   void setSoftmaxNDefault(std::optional<size_t> n);
   std::optional<float> breadthDefault() const;
   void setBreadthDefault(std::optional<float> breadth);
+  // The softmax temperature calibrated from the corpus at BUILD time (read from
+  // the `.meta`; see `VectorIndexMetadata::calibratedSoftmaxT_`). Ranks below a
+  // runtime-config default and a per-query override, above the constant
+  // fallback (see `resolveCslsCut`). Absent for older/ingested/non-csls builds.
+  std::optional<float> calibratedSoftmaxTemperature() const;
 
   // True iff this index stores a (live) vector for `entity`.
   bool hasVector(Id entity) const;

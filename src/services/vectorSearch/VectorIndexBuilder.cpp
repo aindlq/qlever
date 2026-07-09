@@ -703,6 +703,12 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   //     `cslsR` GPU path), else EXACT brute force on the fine layer below
   //     `cslsBruteForceMax_`, else a DEDICATED recall-tuned fine-layer HNSW
   //     (built, self-searched, and discarded -- never persisted).
+  //
+  // The self-kNN also feeds the build-time SOFTMAX-T calibration: the median
+  // per-row neighbour-cosine spread becomes the serving default temperature
+  // (stored in the `.meta`), so a saturated space gets a sharp T out of the
+  // box. Computed only on the self-kNN path (ingested r(d) carries no spread).
+  std::optional<float> calibratedSoftmaxT;
   if (config_.csls_) {
     // r(d) is computed DIRECTLY into the memory-mapped `.csls` sidecar, never
     // into a heap buffer: on full-scale builds (>4 GiB fine store, >2M rows,
@@ -729,6 +735,21 @@ VectorIndexMetadata VectorIndexBuilder::build() {
     } else {
       const CslsFineLayer fine = openFineLayer();
       const size_t k = config_.cslsNeighbors_;
+      // Softmax-T calibration: accumulate each row's neighbour-cosine spread
+      // into per-thread STACK histograms over [0, kDispMax] (no large heap
+      // array to be corrupted; a small, fixed footprint like `summarizeCslsRd`)
+      // -- one per worker so the r(d) loops stay lock-free. Merged into a
+      // median below, exactly where r(d) itself is summarised.
+      constexpr size_t kDispBuckets = 512;  // ~0.001 stdev resolution
+      constexpr float kDispMax = 0.5f;      // max stdev of cosines in [0,1]
+      std::vector<std::array<uint64_t, kDispBuckets>> dispHist(
+          std::max<size_t>(1, numThreads));
+      auto recordDispersion = [&](size_t t, float stdev) {
+        const float c = stdev < 0.f ? 0.f : (stdev > kDispMax ? kDispMax : stdev);
+        ++dispHist[t][std::min(
+            kDispBuckets - 1,
+            static_cast<size_t>(c / kDispMax * kDispBuckets))];
+      };
       // Optional diagnostic (env `CSLS_DEBUG_LOG`): capture the dedicated
       // graph's candidates for a spread of sample rows, then dump a full
       // diagnostic file next to the index. Inert unless the env var is set.
@@ -749,7 +770,7 @@ VectorIndexMetadata VectorIndexBuilder::build() {
                     << n << " vectors, " << k << " neighbours) ..."
                     << std::endl;
         parallelOverRows(n, numThreads,
-                         [&](size_t, size_t first, size_t last, auto& stop) {
+                         [&](size_t t, size_t first, size_t last, auto& stop) {
                            for (size_t row = first; row < last; ++row) {
                              if (stop.load(std::memory_order_relaxed)) return;
                              CslsNeighborhood top{k};
@@ -760,6 +781,7 @@ VectorIndexMetadata VectorIndexBuilder::build() {
                                top.offer(fine.distance(row, j));
                              }
                              cslsR[row] = top.meanCosSim();
+                             recordDispersion(t, top.stdevCosSim());
                            }
                          });
       } else {
@@ -850,6 +872,7 @@ VectorIndexMetadata VectorIndexBuilder::build() {
                   top.offer(fine.distance(row, cand[i]));
                 }
                 cslsR[row] = top.meanCosSim();
+                recordDispersion(t, top.stdevCosSim());
                 if (isCslsDebugRow(row)) {
                   std::string dbg = "graph row " + std::to_string(row) +
                                     " count=" + std::to_string(count) +
@@ -878,6 +901,39 @@ VectorIndexMetadata VectorIndexBuilder::build() {
                     << "\": wrote CSLS r(d) diagnostic to " << cslsPath
                     << ".debug.txt (CSLS_DEBUG_LOG set)" << std::endl;
       }
+      // Softmax-T calibration: merge the per-thread spread histograms, take the
+      // median bucket, and clamp it to [kSoftmaxTMin, kSoftmaxTMax]. This is the
+      // serving-default temperature persisted in the `.meta`.
+      constexpr float kSoftmaxTMin = 0.01f;
+      constexpr float kSoftmaxTMax = 0.5f;
+      std::array<uint64_t, kDispBuckets> merged{};
+      uint64_t total = 0;
+      for (const auto& h : dispHist) {
+        for (size_t b = 0; b < kDispBuckets; ++b) {
+          merged[b] += h[b];
+          total += h[b];
+        }
+      }
+      if (total > 0) {
+        const uint64_t target = total / 2;
+        uint64_t cum = 0;
+        size_t medBucket = 0;
+        for (; medBucket + 1 < kDispBuckets; ++medBucket) {
+          cum += merged[medBucket];
+          if (cum > target) {
+            break;
+          }
+        }
+        const float medianStdev = (static_cast<float>(medBucket) + 0.5f) /
+                                  static_cast<float>(kDispBuckets) * kDispMax;
+        calibratedSoftmaxT =
+            std::clamp(medianStdev, kSoftmaxTMin, kSoftmaxTMax);
+        AD_LOG_INFO << std::setprecision(9) << "Vector index \""
+                    << config_.name_ << "\": calibrated softmax T = "
+                    << calibratedSoftmaxT.value()
+                    << " (median neighbour-cosine stdev " << medianStdev
+                    << " over " << total << " rows)" << std::endl;
+      }
     }
     AD_CORRECTNESS_CHECK(cslsR.size() == n);
     logCslsDistribution(config_.name_,
@@ -896,6 +952,7 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   meta.vocabSize_ = vocabSize_;
   meta.rowStrideBytes_ = stride;
   meta.collationLocale_ = collationLocale_;
+  meta.calibratedSoftmaxT_ = calibratedSoftmaxT;
   {
     outputsCleanup.track(tmp(metaPath));
     std::ofstream metaOut{tmp(metaPath)};

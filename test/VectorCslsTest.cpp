@@ -1370,7 +1370,8 @@ namespace {
 // hand-designable knee/softmax fixtures. Row i gets entity id `1000 + i`.
 std::string buildAngleFixtureIndex(const std::string& name,
                                    const std::vector<float>& angleDegrees,
-                                   size_t cslsNeighbors = 3, bool csls = true) {
+                                   size_t cslsNeighbors = 3, bool csls = true,
+                                   bool ingestRd = true) {
   std::string basename = uniqueTmpBasename();
   VectorIndexConfig cfg;
   cfg.name_ = name;
@@ -1381,9 +1382,11 @@ std::string buildAngleFixtureIndex(const std::string& name,
   cfg.cslsNeighbors_ = cslsNeighbors;
   VectorIndexBuilder builder{basename, cfg};
   // Ingest a neutral r(d)=0 for the csls fixtures (the cut tests isolate the
-  // cut logic from r(d) variation); a plain index takes no r(d) at all.
+  // cut logic from r(d) variation); a plain index takes no r(d) at all. Pass
+  // `ingestRd=false` to instead COMPUTE r(d) via the self-kNN (the path that
+  // also calibrates the softmax T).
   const std::optional<float> rd =
-      csls ? std::optional<float>{0.f} : std::nullopt;
+      (csls && ingestRd) ? std::optional<float>{0.f} : std::nullopt;
   for (size_t i = 0; i < angleDegrees.size(); ++i) {
     const float a = angleDegrees[i] * std::numbers::pi_v<float> / 180.f;
     builder.add(mkId(1000 + i), "<http://ex/" + std::to_string(i) + ">",
@@ -1550,6 +1553,67 @@ TEST(VectorCsls, autoCutSoftmaxRunsOnPlainCosineIndex) {
               1e-4);
   EXPECT_TRUE(std::isnan(hits[0].csls_));
   cleanupTmp(basename, "acsoftplain");
+}
+
+// _____________________________________________________________________________
+// BUILD-TIME softmax-T calibration: the self-kNN that computes r(d) also
+// records each point's neighbour-cosine spread; the median (clamped) becomes
+// the softmax serving-default T, persisted in the `.meta` and re-loaded. A
+// tight angular cluster (near-identical neighbours) calibrates a small/floored
+// T; a spread corpus a larger one. `resolveCslsCut` uses it below any query or
+// runtime override.
+TEST(VectorCsls, softmaxTemperatureCalibratedFromCorpusSpread) {
+  std::vector<float> tightAngles;
+  for (float a = 40.f; a < 50.f; a += 0.5f) {
+    tightAngles.push_back(a);
+  }
+  const std::vector<float> spreadAngles{0.f, 20.f, 40.f, 60.f, 80.f};
+  // csls with COMPUTED r(d) (ingestRd=false) -> the calibration path runs.
+  std::string tightBase =
+      buildAngleFixtureIndex("caltight", tightAngles, /*cslsNeighbors=*/3,
+                             /*csls=*/true, /*ingestRd=*/false);
+  std::string spreadBase =
+      buildAngleFixtureIndex("calspread", spreadAngles, /*cslsNeighbors=*/3,
+                             /*csls=*/true, /*ingestRd=*/false);
+  VectorIndex tight, spread;
+  tight.open(tightBase, "caltight");
+  spread.open(spreadBase, "calspread");
+
+  ASSERT_TRUE(tight.calibratedSoftmaxTemperature().has_value());
+  ASSERT_TRUE(spread.calibratedSoftmaxTemperature().has_value());
+  const float tT = tight.calibratedSoftmaxTemperature().value();
+  const float sT = spread.calibratedSoftmaxTemperature().value();
+  // Clamped into the sane range, and the tighter corpus gives the sharper T.
+  EXPECT_GE(tT, 0.01f);
+  EXPECT_LE(sT, 0.5f);
+  EXPECT_LT(tT, sT);
+
+  // `resolveCslsCut` uses the calibrated T as the softmax default...
+  using AutoCutMode = VectorSearchConfiguration::AutoCutMode;
+  VectorSearchConfiguration config;
+  config.indexName_ = "calspread";
+  config.queryVector_ = kAngleQuery;
+  config.autoCut_ = AutoCutMode::Softmax;
+  EXPECT_FLOAT_EQ(resolveCslsCut(config, spread).temperature_, sT);
+  // ...but a per-query override still wins.
+  config.softmaxTemperature_ = 0.25f;
+  EXPECT_FLOAT_EQ(resolveCslsCut(config, spread).temperature_, 0.25f);
+
+  cleanupTmp(tightBase, "caltight");
+  cleanupTmp(spreadBase, "calspread");
+}
+
+// _____________________________________________________________________________
+// INGESTED r(d) (the `cslsR` GPU path) skips the self-kNN, so there is no
+// neighbour spread to measure: no calibrated T is persisted, and the query
+// path falls back to the constant softmax default.
+TEST(VectorCsls, ingestedRdLeavesSoftmaxTUncalibrated) {
+  const std::vector<float> angles{0.f, 20.f, 40.f, 60.f, 80.f};
+  std::string base = buildAngleFixtureIndex("calingest", angles);  // ingestRd
+  VectorIndex idx;
+  idx.open(base, "calingest");
+  EXPECT_FALSE(idx.calibratedSoftmaxTemperature().has_value());
+  cleanupTmp(base, "calingest");
 }
 
 // _____________________________________________________________________________

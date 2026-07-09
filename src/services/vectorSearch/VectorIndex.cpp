@@ -437,6 +437,11 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
                   << s.min_ << "/" << s.p50_ << "/" << s.p95_ << "/" << s.max_
                   << std::endl;
     }
+    if (impl.meta_.calibratedSoftmaxT_.has_value()) {
+      AD_LOG_INFO << std::setprecision(9) << "Vector index \"" << name
+                  << "\": softmax autoCut T default (build-calibrated) = "
+                  << impl.meta_.calibratedSoftmaxT_.value() << std::endl;
+    }
   }
 
   // 4. The optional HNSW graph, memory-mapped read-only via usearch `view`.
@@ -685,6 +690,9 @@ void VectorIndex::setBreadthDefault(std::optional<float> breadth) {
     breadth = std::clamp(breadth.value(), 0.f, 1.f);
   }
   impl_->breadthDefault_ = breadth;
+}
+std::optional<float> VectorIndex::calibratedSoftmaxTemperature() const {
+  return impl_->meta_.calibratedSoftmaxT_;
 }
 
 // ____________________________________________________________________________
