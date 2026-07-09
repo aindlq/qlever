@@ -9,6 +9,7 @@
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEXFORMAT_H
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -239,6 +240,53 @@ class CslsNeighborhood {
   size_t k_;
   std::vector<float> heap_;  // max-heap of the k smallest distances
 };
+
+// Distribution summary of a csls r(d) array via a fixed-size STACK histogram --
+// NO large heap copy (unlike copy+sort), so it is immune to any transient
+// heap corruption in the builder process. That corruption is precisely what
+// made the build-time `logCslsDistribution` spuriously report 1/1/1 (it sorted
+// an 8.5 MB heap copy that got stomped) even though the persisted, file-backed
+// sidecar -- and hence the runtime -- was correct all along. r(d) is a cosine
+// mean in [0,1]; min/max are exact, percentiles are to ~1/kBuckets resolution.
+struct CslsRdSummary {
+  float min_ = 0.f, p50_ = 0.f, p95_ = 0.f, max_ = 0.f;
+  double mean_ = 0.0;
+};
+inline CslsRdSummary summarizeCslsRd(ql::span<const float> r) {
+  CslsRdSummary s;
+  if (r.empty()) {
+    return s;
+  }
+  constexpr size_t kBuckets = 4096;
+  std::array<uint64_t, kBuckets> hist{};  // 32 KiB on the STACK, no heap alloc
+  float mn = r[0], mx = r[0];
+  double sum = 0.0;
+  for (float v : r) {
+    mn = std::min(mn, v);
+    mx = std::max(mx, v);
+    sum += static_cast<double>(v);
+    const float c = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+    ++hist[std::min(kBuckets - 1, static_cast<size_t>(c * kBuckets))];
+  }
+  auto percentile = [&](double frac) {
+    const auto target =
+        static_cast<uint64_t>(frac * static_cast<double>(r.size()));
+    uint64_t cum = 0;
+    for (size_t b = 0; b < kBuckets; ++b) {
+      cum += hist[b];
+      if (cum > target) {
+        return static_cast<float>(b) / static_cast<float>(kBuckets);
+      }
+    }
+    return 1.f;
+  };
+  s.min_ = mn;
+  s.max_ = mx;
+  s.mean_ = sum / static_cast<double>(r.size());
+  s.p50_ = percentile(0.5);
+  s.p95_ = percentile(0.95);
+  return s;
+}
 
 // String conversions (used both for the SPARQL surface and the JSON metadata).
 inline std::string toString(VectorMetric m) {

@@ -430,14 +430,12 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
     // same min/p50/p95/max shape so it can be compared directly, at full float
     // precision (setprecision(9)) so a near-1 value cannot masquerade as 1.
     if (impl.cslsR_.size() > 0) {
-      std::vector<float> sidecar(impl.cslsR_.begin(), impl.cslsR_.end());
-      std::sort(sidecar.begin(), sidecar.end());
-      const size_t nn = sidecar.size();
+      const CslsRdSummary s = summarizeCslsRd(
+          ql::span<const float>(impl.cslsR_.data(), impl.cslsR_.size()));
       AD_LOG_INFO << std::setprecision(9) << "Vector index \"" << name
                   << "\": loaded csls r(d) sidecar: min/p50/p95/max = "
-                  << sidecar.front() << "/" << sidecar[nn / 2] << "/"
-                  << sidecar[std::min(nn - 1, (nn * 95) / 100)] << "/"
-                  << sidecar.back() << std::endl;
+                  << s.min_ << "/" << s.p50_ << "/" << s.p95_ << "/" << s.max_
+                  << std::endl;
     }
   }
 
@@ -2089,7 +2087,10 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
   // Non-const so the sweep can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
-  AD_CONTRACT_CHECK(impl.meta_.config_.csls_,
+  // The softmax cut is csls-independent (top-N cosine standouts, no r(d)/r(q)),
+  // so it may run on a plain cosine index; every other cut needs the sidecar.
+  AD_CONTRACT_CHECK(impl.meta_.config_.csls_ ||
+                        cut.mode_ == CslsCut::Mode::Softmax,
                     "searchCsls called on an index without csls data.");
   // Guaranteed by the build (`csls` is rejected for non-cosine metrics).
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
@@ -2126,7 +2127,9 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
   // Non-const so the sweep can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
-  AD_CONTRACT_CHECK(impl.meta_.config_.csls_,
+  // See `searchCsls`: softmax is csls-independent, the rest need the sidecar.
+  AD_CONTRACT_CHECK(impl.meta_.config_.csls_ ||
+                        cut.mode_ == CslsCut::Mode::Softmax,
                     "searchCslsByEntity called on an index without csls data.");
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
   AD_CONTRACT_CHECK(cut.mode_ != CslsCut::Mode::Softmax || cut.softmaxN_ >= 1,

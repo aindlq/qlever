@@ -1238,6 +1238,35 @@ TEST(VectorCsls, thresholdOnNonCslsIndexErrors) {
 }
 
 // _____________________________________________________________________________
+// The SOFTMAX autoCut is csls-independent (top-N cosine standouts, no r(d)), so
+// -- unlike `vec:cslsThreshold` and `vec:autoCut "csls"` -- it is ACCEPTED on a
+// plain (non-csls) cosine index ("embplain"): the query executes to a real
+// table with no `.csls` sidecar. The CSLS-knee on the same index still errors.
+TEST(VectorCsls, softmaxAutoCutAcceptedOnNonCslsIndex) {
+  auto* qec = qecWithCslsIndexes();
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT * WHERE { SERVICE vec: { _:c vec:index "
+                           "\"embplain\" ; vec:queryVector \"0,1,0,0\" ; "
+                           "vec:result ?nn ; vec:autoCut \"softmax\" . } }");
+    // Must NOT throw the csls-availability error -- it runs to a real table.
+    auto result = qet.getResult();
+    EXPECT_LE(result->idTable().numRows(), 5u);
+  }
+  {
+    // The CSLS-knee DOES read r(d), so it is still rejected on the same index.
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT * WHERE { SERVICE vec: { _:c vec:index "
+                           "\"embplain\" ; vec:queryVector \"0,1,0,0\" ; "
+                           "vec:result ?nn ; vec:autoCut \"csls\" . } }");
+    AD_EXPECT_THROW_WITH_MESSAGE(qet.getResult(),
+                                 HasSubstr("was not built with csls:true"));
+  }
+}
+
+// _____________________________________________________________________________
 // Build-spec validation through the registered build hook: csls requires the
 // cosine metric, and the csls sub-keys require `csls: true`.
 TEST(VectorCsls, buildSpecValidation) {
@@ -1341,20 +1370,24 @@ namespace {
 // hand-designable knee/softmax fixtures. Row i gets entity id `1000 + i`.
 std::string buildAngleFixtureIndex(const std::string& name,
                                    const std::vector<float>& angleDegrees,
-                                   size_t cslsNeighbors = 3) {
+                                   size_t cslsNeighbors = 3, bool csls = true) {
   std::string basename = uniqueTmpBasename();
   VectorIndexConfig cfg;
   cfg.name_ = name;
   cfg.dimensions_ = 4;
   cfg.metric_ = VectorMetric::Cosine;
   cfg.buildHnsw_ = false;
-  cfg.csls_ = true;
+  cfg.csls_ = csls;
   cfg.cslsNeighbors_ = cslsNeighbors;
   VectorIndexBuilder builder{basename, cfg};
+  // Ingest a neutral r(d)=0 for the csls fixtures (the cut tests isolate the
+  // cut logic from r(d) variation); a plain index takes no r(d) at all.
+  const std::optional<float> rd =
+      csls ? std::optional<float>{0.f} : std::nullopt;
   for (size_t i = 0; i < angleDegrees.size(); ++i) {
     const float a = angleDegrees[i] * std::numbers::pi_v<float> / 180.f;
     builder.add(mkId(1000 + i), "<http://ex/" + std::to_string(i) + ">",
-                std::vector<float>{std::cos(a), std::sin(a), 0.f, 0.f}, 0.f);
+                std::vector<float>{std::cos(a), std::sin(a), 0.f, 0.f}, rd);
   }
   builder.build();
   return basename;
@@ -1491,6 +1524,32 @@ TEST(VectorCsls, autoCutSoftmaxKeepsNothingOnUniform) {
   EXPECT_EQ(numScored, 40u);
   EXPECT_TRUE(hits.empty());
   cleanupTmp(basename, "acuni");
+}
+
+// _____________________________________________________________________________
+// The SOFTMAX cut is CSLS-INDEPENDENT: it thresholds the softmax of the top-N
+// COSINE similarities and never reads r(d)/r(q). So it must run on a PLAIN
+// cosine index that was NOT built with `csls:true` (no `.csls` sidecar), and
+// return the very same standout as the csls-built fixture above.
+TEST(VectorCsls, autoCutSoftmaxRunsOnPlainCosineIndex) {
+  std::vector<float> angles{5.f};
+  for (float a = 60.f; a < 80.f; a += 0.5f) {
+    angles.push_back(a);
+  }
+  std::string basename = buildAngleFixtureIndex("acsoftplain", angles,
+                                                /*cslsNeighbors=*/3,
+                                                /*csls=*/false);
+  VectorIndex idx;
+  idx.open(basename, "acsoftplain");
+  ASSERT_FALSE(idx.hasCsls());
+
+  auto hits = idx.searchCsls(kAngleQuery, softmaxCut(15), 3);
+  ASSERT_EQ(hits.size(), 1u);
+  EXPECT_EQ(hits[0].entity_, mkId(1000));
+  EXPECT_NEAR(hits[0].distance_, 1.0 - std::cos(5 * std::numbers::pi / 180.0),
+              1e-4);
+  EXPECT_TRUE(std::isnan(hits[0].csls_));
+  cleanupTmp(basename, "acsoftplain");
 }
 
 // _____________________________________________________________________________

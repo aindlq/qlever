@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <iomanip>
 #include <atomic>
 #include <cmath>
 #include <filesystem>
@@ -134,14 +135,14 @@ void logCslsDistribution(const std::string& indexName,
   if (r.empty()) {
     return;
   }
-  std::vector<float> sorted(r.begin(), r.end());
-  ql::ranges::sort(sorted);
-  const size_t n = sorted.size();
-  const float min = sorted.front();
-  const float p50 = sorted[n / 2];
-  const float p95 = sorted[std::min(n - 1, (n * 95) / 100)];
-  const float max = sorted.back();
-  AD_LOG_INFO << "Vector index \"" << indexName
+  // Stack-histogram summary (no large heap copy that could be corrupted
+  // mid-build; see `summarizeCslsRd`). The old copy+sort here is exactly what
+  // spuriously printed 1/1/1 while the persisted, file-backed sidecar -- and
+  // hence the runtime -- was correct. The authoritative distribution is
+  // re-logged at LOAD (`VectorIndex::open`) from a fresh process.
+  const CslsRdSummary s = summarizeCslsRd(r);
+  const float min = s.min_, p50 = s.p50_, p95 = s.p95_, max = s.max_;
+  AD_LOG_INFO << std::setprecision(9) << "Vector index \"" << indexName
               << "\": csls r(d): min/p50/p95/max = " << min << "/" << p50 << "/"
               << p95 << "/" << max << std::endl;
   if (p50 >= 0.95f) {

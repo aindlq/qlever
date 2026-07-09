@@ -97,6 +97,23 @@ void appendCslsCutToCacheKey(std::string* key,
 // ____________________________________________________________________________
 void validateCslsIsAvailable(const VectorSearchConfiguration& config,
                              const VectorIndex& vidx) {
+  using AutoCutMode = VectorSearchConfiguration::AutoCutMode;
+  // The SOFTMAX autoCut is CSLS-INDEPENDENT: it thresholds the softmax of the
+  // top-`softmaxN` COSINE similarities and never consults r(d) or r(q). So it
+  // needs only a cosine-metric index, NOT one built with `csls:true` (which is
+  // what materialises the r(d) sidecar the other cuts read).
+  if (config.autoCut_.has_value() &&
+      config.autoCut_.value() == AutoCutMode::Softmax) {
+    if (vidx.metric() != VectorMetric::Cosine) {
+      throw std::runtime_error{absl::StrCat(
+          "`vec:autoCut \"softmax\"` needs a cosine-metric vector index (it "
+          "thresholds the softmax of cosine similarities), but vector index '",
+          config.indexName_, "' uses a non-cosine metric.")};
+    }
+    return;
+  }
+  // The fixed `cslsThreshold` and the CSLS-knee both use r(d), so they require
+  // the csls sidecar.
   if (!vidx.hasCsls()) {
     throw std::runtime_error{absl::StrCat(
         "`vec:",
