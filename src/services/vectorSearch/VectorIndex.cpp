@@ -20,13 +20,17 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
+#include <string>
+#include <string_view>
 #include <thread>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
+#include "backports/StartsWithAndEndsWith.h"
 #include "backports/algorithm.h"
 #include "services/vectorSearch/UsearchGraph.h"
 #include "services/vectorSearch/VectorMemory.h"
@@ -842,6 +846,70 @@ void VectorIndex::gatherSortedDistances(ql::span<const Id> ascendingEntities,
   }
 }
 
+// Declared in `VectorIndex.h`. `/proc/cpuinfo` lists one block per LOGICAL
+// cpu, blocks separated by blank lines; hyperthread siblings share their
+// `(physical id, core id)` pair, so the number of unique pairs is the
+// physical-core count.
+unsigned physicalCoreCount() {
+  static const unsigned count = [] {
+    ad_utility::HashSet<uint64_t> cores;
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    if (cpuinfo.is_open()) {
+      // The integer after the ':' if `line` starts with `key`, else `nullopt`.
+      auto valueForKey = [](const std::string& line,
+                            std::string_view key) -> std::optional<int64_t> {
+        if (!ql::starts_with(line, key)) {
+          return std::nullopt;
+        }
+        size_t colon = line.find(':', key.size());
+        if (colon == std::string::npos) {
+          return std::nullopt;
+        }
+        return std::strtoll(line.c_str() + colon + 1, nullptr, 10);
+      };
+      int64_t physicalId = 0;  // stays 0 on kernels that omit the field
+      std::optional<int64_t> coreId;
+      auto flushBlock = [&]() {
+        if (coreId.has_value()) {
+          cores.insert((static_cast<uint64_t>(physicalId) << 32) |
+                       static_cast<uint32_t>(coreId.value()));
+        }
+        physicalId = 0;
+        coreId = std::nullopt;
+      };
+      std::string line;
+      while (std::getline(cpuinfo, line)) {
+        if (line.empty()) {
+          flushBlock();
+        } else if (auto v = valueForKey(line, "physical id")) {
+          physicalId = v.value();
+        } else if (auto v = valueForKey(line, "core id")) {
+          coreId = v;
+        }
+      }
+      flushBlock();
+    }
+    if (!cores.empty()) {
+      return static_cast<unsigned>(cores.size());
+    }
+    // No `/proc/cpuinfo`, or it has no core-topology fields (some
+    // containers/ARM): fall back to the logical cpu count, which may include
+    // hyperthreads -- acceptable.
+    return std::max(1u, std::thread::hardware_concurrency());
+  }();
+  return count;
+}
+
+// Declared in `VectorIndex.h`.
+int vectorSearchThreadCap() {
+  int physical = static_cast<int>(physicalCoreCount());
+#ifdef _OPENMP
+  return std::max(1, std::min(omp_get_max_threads(), physical));
+#else
+  return std::max(1, physical);
+#endif
+}
+
 namespace {
 #ifdef _OPENMP
 // Parallelize the exact top-k distance sweep once it crosses this many
@@ -850,10 +918,6 @@ namespace {
 // cost more than it saves. Mirrors the `vec:distance` expression's thresholds.
 constexpr size_t VEC_SEARCH_PARALLEL_THRESHOLD = 2048;
 constexpr size_t VEC_SEARCH_PARALLEL_CHUNK = 1024;
-int vectorSearchThreadCap() {
-  unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-  return std::max(1, std::min(omp_get_max_threads(), static_cast<int>(hw)));
-}
 #endif
 
 // A bounded max-heap that keeps the `k` smallest (best) distances seen.
@@ -897,12 +961,14 @@ class TopK {
 };
 
 // Score `n` items into `top` (a `k`-bounded heap): `rowAndId(i)` returns the
-// `(row, id)` of item `i`, or `nullopt` to skip it (e.g. a tombstone). The
-// distance computation -- the mmap-heavy SIMD work -- runs in parallel once
-// `n` crosses `VEC_SEARCH_PARALLEL_THRESHOLD`, via per-thread heaps merged at
-// the end, so the big brute-force scan uses every core while the small rerank
-// pass stays serial. For distinct distances the parallel result is identical
-// to the serial one (the same `k` smallest distances).
+// `(row, id)` of item `i`, or `nullopt` to skip it. This is the GATHER scan
+// for candidate-restricted searches, whose rows are scattered (the whole-index
+// sweep has its own pointer-walk below). The distance computation -- the
+// mmap-heavy SIMD work -- runs in parallel once `n` crosses
+// `VEC_SEARCH_PARALLEL_THRESHOLD`, via per-thread heaps merged at the end,
+// so a big candidate scan uses every core while the small rerank pass stays
+// serial. For distinct distances the parallel result is identical to the
+// serial one (the same `k` smallest distances).
 template <typename LayerT, typename Fn>
 void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
                   const char* queryBytes, std::optional<float> maxDistance,
@@ -925,7 +991,13 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
 #pragma omp parallel num_threads(numThreads)
     {
       TopK& localTop = locals[static_cast<size_t>(omp_get_thread_num())];
-#pragma omp for schedule(dynamic, VEC_SEARCH_PARALLEL_CHUNK) nowait
+      // schedule(static): each thread owns ONE contiguous ~n/numThreads block
+      // and streams it start-to-end -- best prefetch locality for this
+      // bandwidth-bound sweep, and no dynamic-scheduling overhead. The
+      // iteration->thread assignment does not affect the result (the
+      // per-thread heaps are merged below). `VEC_SEARCH_PARALLEL_CHUNK`
+      // remains the interrupt-poll stride inside each block.
+#pragma omp for schedule(static) nowait
       for (size_t i = 0; i < n; ++i) {
         // An exception must never unwind out of the OpenMP region: poll the
         // (throwing) interrupt once per chunk, latch a flag on cancellation,
@@ -961,6 +1033,93 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
       checkInterrupt();
     }
     scoreOne(top, i);
+  }
+}
+
+// The dedicated WHOLE-INDEX top-k sweep (the filtered search keeps the
+// generic `scanIntoTopK` above, whose gather callback it genuinely needs).
+// Visiting ALL rows 0..numVectors in physical order lets every worker carry a
+// RUNNING row pointer (one `p += stride_` add per row) instead of the generic
+// path's `base() + row * stride_` multiply, and read the keys column directly
+// instead of a per-row callback. `numThreads > 1` runs MANUAL static
+// partitioning: each worker owns one contiguous, evenly-split row range
+// processed start-to-end, so each core streams its own region of the store --
+// the prefetch-friendliest order for this memory-bandwidth-bound scan. Rows
+// go into per-thread heaps merged at the end, so the thread assignment is
+// irrelevant to the result: the same distances are offered as in the serial
+// walk, and the top-k is bit-identical (for distinct distances).
+template <typename ImplT, typename LayerT>
+void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
+                            const char* queryBytes,
+                            std::optional<float> maxDistance,
+                            const CheckInterruptCallback& checkInterrupt,
+                            [[maybe_unused]] int numThreads) {
+  const size_t n = impl.meta_.numVectors_;
+#ifdef _OPENMP
+  if (numThreads > 1) {
+    std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
+    std::atomic<bool> cancelled{false};
+#pragma omp parallel num_threads(numThreads)
+    {
+      const size_t tid = static_cast<size_t>(omp_get_thread_num());
+      // Partition by the ACTUAL team size (OpenMP may grant fewer threads
+      // than requested); `tid < team <= numThreads` indexes `locals` safely.
+      const size_t team = static_cast<size_t>(omp_get_num_threads());
+      TopK& localTop = locals[tid];
+      const size_t first = n * tid / team;
+      const size_t last = n * (tid + 1) / team;
+      const char* p = layer.base() + first * layer.stride_;
+      for (size_t row = first; row < last; ++row, p += layer.stride_) {
+        // An exception must never unwind out of the OpenMP region: poll the
+        // (throwing) interrupt once per chunk, latch a flag on cancellation
+        // (also noticing another worker's latch), and re-raise once AFTER the
+        // region.
+        if ((row - first) % VEC_SEARCH_PARALLEL_CHUNK == 0) {
+          if (cancelled.load(std::memory_order_relaxed)) {
+            break;
+          }
+          if (checkInterrupt) {
+            try {
+              checkInterrupt();
+            } catch (...) {
+              cancelled.store(true, std::memory_order_relaxed);
+              break;
+            }
+          }
+        }
+        uint64_t id = impl.keys_[row];
+        if (id != TOMBSTONE_KEY) {
+          float dist = layer.distanceBetweenBytes(queryBytes, p);
+          if (!maxDistance.has_value() || dist <= maxDistance.value()) {
+            localTop.offer(dist, id);
+          }
+        }
+      }
+    }
+    if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+      checkInterrupt();  // re-raise the cancellation outside the parallel
+                         // region
+    }
+    for (TopK& local : locals) {
+      top.merge(local);
+    }
+    return;
+  }
+#endif
+  const char* p = layer.base();
+  size_t sinceCheck = 0;
+  for (size_t row = 0; row < n; ++row, p += layer.stride_) {
+    if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+      sinceCheck = 0;
+      checkInterrupt();
+    }
+    uint64_t id = impl.keys_[row];
+    if (id != TOMBSTONE_KEY) {
+      float dist = layer.distanceBetweenBytes(queryBytes, p);
+      if (!maxDistance.has_value() || dist <= maxDistance.value()) {
+        top.offer(dist, id);
+      }
+    }
   }
 }
 }  // namespace
@@ -1026,22 +1185,26 @@ std::vector<ScoredEntity> searchExactBytes(
   if (!candidates.has_value()) {
     // Whole-index brute force: rows are visited in order, so it is sequential.
     // The distance sweep runs in parallel (per-thread heaps) above the
-    // threshold.
+    // threshold, on the dedicated pointer-walk scan.
+    int numThreads = 1;
+#ifdef _OPENMP
+    if (impl.meta_.numVectors_ >= VEC_SEARCH_PARALLEL_THRESHOLD) {
+      numThreads = vectorSearchThreadCap();
+    }
+#endif
+    AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
+                << "\": whole-index scan (" << impl.numLive() << " vectors, "
+                << numThreads << " threads)" << std::endl;
     SeqScanHint hint{layer, !layer.alignedBuf_};
-    scanIntoTopK(
-        top, k, impl.meta_.numVectors_, layer, queryBytes, maxDistance,
-        [&](size_t row) -> std::optional<std::pair<size_t, uint64_t>> {
-          uint64_t id = impl.keys_[row];
-          if (id == TOMBSTONE_KEY) {
-            return std::nullopt;
-          }
-          return std::pair<size_t, uint64_t>{row, id};
-        },
-        checkInterrupt);
+    scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
+                           checkInterrupt, numThreads);
     reportScored(impl.numLive());
     return top.sorted();
   }
 
+  AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
+              << "\": filtered scan (" << candidates->size() << " candidates)"
+              << std::endl;
   // Restricted search: merge-join the candidate id set against the id-sorted
   // `.rowmap`. This replaces both the old per-candidate `lower_bound` gather
   // (sparse sets) and the whole-index membership scan (dense sets) with a

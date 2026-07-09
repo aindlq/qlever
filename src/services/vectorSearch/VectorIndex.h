@@ -391,6 +391,29 @@ class VectorIndex {
   std::unique_ptr<Impl> impl_;
 };
 
+// The number of PHYSICAL cores on the machine. Hyperthread siblings share
+// their core's execution ports and add no memory bandwidth, so for the
+// memory-bandwidth-bound SIMD scans the right worker count is the physical
+// core count, not the logical (hyperthread) one. Parsed from `/proc/cpuinfo`
+// (unique `(physical id, core id)` pairs); falls back to
+// `std::thread::hardware_concurrency()` (which may count hyperthreads) where
+// that file is unavailable or lacks those fields (some containers/ARM).
+// Memoized -- the topology never changes at runtime. NOTE: inside a
+// cpu-limited container this still reflects the HOST's physical cores;
+// `OMP_NUM_THREADS` remains the override for cgroup limits.
+unsigned physicalCoreCount();
+
+// Worker cap for the parallel brute-force distance scans (the top-k sweep and
+// the `vec:distance` per-row loop). QLever answers many queries concurrently
+// on a thread pool already sized to the hardware, so letting a single scan
+// grab every logical CPU would oversubscribe when several queries run at
+// once. Cap at the PHYSICAL core count (see `physicalCoreCount()`; the scans
+// are memory-bandwidth bound, so there is nothing to gain past it) AND
+// OpenMP's configured maximum, so `OMP_NUM_THREADS` can still lower it (e.g.
+// for cgroup cpu limits). Search-side only -- the index-build thread counts
+// are chosen separately.
+int vectorSearchThreadCap();
+
 }  // namespace qlever::vector
 
 #endif  // QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEX_H

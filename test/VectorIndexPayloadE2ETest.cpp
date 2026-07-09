@@ -1295,6 +1295,51 @@ TEST(VectorIndexPayloadE2E, parallelPerRowScanMatchesSerialReference) {
 }
 
 // _____________________________________________________________________________
+// The dedicated whole-index PARALLEL scan (`scanWholeIndexIntoTopK` -- the
+// manually static-partitioned pointer-walk) on > VEC_SEARCH_PARALLEL_THRESHOLD
+// (2048) rows must return the same top-k as a serial reference. Guards the
+// hand-rolled batch boundaries (`n*tid/team`) and the per-thread-heap merge:
+// a partitioning off-by-one would drop or double-count rows near a boundary.
+// Compares the SORTED top-k DISTANCES (robust to how ties across entities are
+// ordered between the two paths).
+TEST(VectorIndexPayloadE2E, wholeIndexParallelScanMatchesSerialTopK) {
+  auto* qec = qecWithLargeIndex();
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "embbig");
+  ASSERT_TRUE(vidx);
+  // > 2048 live vectors -> `searchExact` takes the parallel whole-index path.
+  ASSERT_EQ(vidx->numLiveVectors(), BIG_NUM_VECTORS);
+
+  constexpr size_t K = 100;
+  std::vector<qlever::vector::ScoredEntity> parallel =
+      vidx->searchExact(BIG_QUERY, K);
+  ASSERT_EQ(parallel.size(), K);
+
+  // Serial reference: distance to EVERY member via the same layer/metric
+  // (`DistanceComputer`), sorted ascending, top-K.
+  std::vector<Id> members(vidx->numLiveVectors());
+  vidx->memberEntities(members);
+  auto computer = vidx->makeDistanceComputer(BIG_QUERY);
+  std::vector<float> ref;
+  ref.reserve(members.size());
+  for (Id e : members) {
+    ref.push_back(computer(e));
+  }
+  std::sort(ref.begin(), ref.end());
+  for (size_t i = 0; i < K; ++i) {
+    ASSERT_EQ(parallel[i].distance_, ref[i]) << "top-k rank " << i;
+  }
+
+  // Determinism: a second parallel run is bit-identical (entity AND distance).
+  std::vector<qlever::vector::ScoredEntity> parallel2 =
+      vidx->searchExact(BIG_QUERY, K);
+  ASSERT_EQ(parallel2.size(), K);
+  for (size_t i = 0; i < K; ++i) {
+    EXPECT_EQ(parallel2[i].entity_, parallel[i].entity_) << "rank " << i;
+    EXPECT_EQ(parallel2[i].distance_, parallel[i].distance_) << "rank " << i;
+  }
+}
+
+// _____________________________________________________________________________
 // The opt-in HNSW fast path, GUARD PASSES: a whole-index scan (all six members
 // enumerated -> input rows == numLiveVectors, the boundary case of the
 // input-covers-the-index `>=` guard) with a constant query and k'=3 takes the

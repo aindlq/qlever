@@ -18,14 +18,9 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #include "backports/StartsWithAndEndsWith.h"
 #include "engine/sparqlExpressions/LiteralExpression.h"
@@ -58,20 +53,12 @@ constexpr size_t VEC_DISTANCE_PARALLEL_THRESHOLD = 2048;
 // scheduling overhead negligible; it is also the cancellation-poll granularity.
 constexpr size_t VEC_DISTANCE_PARALLEL_CHUNK = 1024;
 
-#ifdef _OPENMP
-// Worker cap for the parallel scan. QLever answers many queries concurrently on
-// a thread pool already sized to the hardware, so letting a single
-// `vec:distance` grab every core would oversubscribe when several queries run
-// at once. Cap at the hardware concurrency AND OpenMP's configured maximum (so
-// `OMP_NUM_THREADS` can still lower it). The scan is memory-bandwidth bound, so
-// there is nothing to gain past the physical core count anyway. (No per-query
-// thread-count config is reachable from the expression's `EvaluationContext`;
-// if one is exposed here later, prefer it over the hardware concurrency.)
-int vectorDistanceThreadCap() {
-  unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-  return std::max(1, std::min(omp_get_max_threads(), static_cast<int>(hw)));
-}
-#endif
+// Worker cap for the parallel scan: the shared search-side cap (physical
+// cores AND OpenMP's configured maximum, so `OMP_NUM_THREADS` can still lower
+// it -- see `VectorIndex.h`). (No per-query thread-count config is reachable
+// from the expression's `EvaluationContext`; if one is exposed here later,
+// prefer it over the machine-wide cap.)
+using qlever::vector::vectorSearchThreadCap;
 
 // Parse a comma-separated list of finite floats, e.g. "0.1,-0.2,0.3" (the
 // string form of an explicit query vector, and the output format of
@@ -319,7 +306,7 @@ ExpressionResult VectorDistanceExpression::evaluate(
 #ifdef _OPENMP
     if (resultSize >= VEC_DISTANCE_PARALLEL_THRESHOLD) {
       std::atomic<bool> cancelled{false};
-      const int numThreads = vectorDistanceThreadCap();
+      const int numThreads = vectorSearchThreadCap();
 #pragma omp parallel for schedule(dynamic, VEC_DISTANCE_PARALLEL_CHUNK) \
     num_threads(numThreads) reduction(+ : produced)
       for (size_t i = 0; i < resultSize; ++i) {
@@ -471,7 +458,7 @@ ExpressionResult VectorDistanceExpression::evaluate(
 
     int numThreads = 1;
 #ifdef _OPENMP
-    numThreads = vectorDistanceThreadCap();
+    numThreads = vectorSearchThreadCap();
 #endif
     vidx.gatherSortedDistances(
         column, *computer, onMiss,
