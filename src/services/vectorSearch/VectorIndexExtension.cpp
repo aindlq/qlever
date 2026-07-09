@@ -809,6 +809,36 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                     << it->second.cslsRerankFloor_.value() << " at startup ("
                     << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << ")" << std::endl;
       }
+      // The per-index serving DEFAULTS of the dynamic `vec:autoCut` cuts
+      // (query parameters override them; see `resolveCslsCut`) -- in-memory
+      // only, like everything above.
+      const auto& o = it->second;
+      if (o.cslsFloor_.has_value() || o.softmaxTemperature_.has_value() ||
+          o.softmaxN_.has_value() || o.breadth_.has_value()) {
+        if (o.cslsFloor_.has_value()) {
+          idx.setCslsFloorDefault(o.cslsFloor_);
+        }
+        if (o.softmaxTemperature_.has_value()) {
+          idx.setSoftmaxTemperatureDefault(o.softmaxTemperature_);
+        }
+        if (o.softmaxN_.has_value()) {
+          idx.setSoftmaxNDefault(o.softmaxN_);
+        }
+        if (o.breadth_.has_value()) {
+          idx.setBreadthDefault(o.breadth_);
+        }
+        auto fmt = [](const auto& opt) {
+          return opt.has_value() ? std::to_string(opt.value())
+                                 : std::string{"-"};
+        };
+        AD_LOG_INFO << "Vector index '" << name
+                    << "': autoCut defaults set at startup ("
+                    << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << "): cslsFloor "
+                    << fmt(o.cslsFloor_) << ", softmaxTemperature "
+                    << fmt(o.softmaxTemperature_) << ", softmaxN "
+                    << fmt(o.softmaxN_) << ", breadth " << fmt(o.breadth_)
+                    << std::endl;
+      }
       endpointOverrides.erase(it);
     }
     const VectorIndexConfig& config = idx.metadata().config_;

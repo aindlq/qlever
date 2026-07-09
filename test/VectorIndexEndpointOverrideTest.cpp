@@ -201,6 +201,84 @@ TEST(VectorIndexEndpointOverride, cslsRerankFloorOverrideIsInMemoryOnly) {
 }
 
 // _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, parseAutoCutDefaultOverrides) {
+  // The four per-index defaults of the dynamic `vec:autoCut` cuts parse,
+  // alone or alongside other keys; `cslsFloor` may be negative.
+  auto overrides = parseEmbeddingEndpointOverrides(
+      R"({"images": {"cslsFloor": -0.25, "softmaxTemperature": 0.05,)"
+      R"( "softmaxN": 42, "breadth": 0.75},)"
+      R"( "texts": {"embeddingModel": "m", "breadth": 1}})");
+  ASSERT_EQ(overrides.size(), 2u);
+  EXPECT_FLOAT_EQ(overrides.at("images").cslsFloor_.value(), -0.25f);
+  EXPECT_FLOAT_EQ(overrides.at("images").softmaxTemperature_.value(), 0.05f);
+  EXPECT_EQ(overrides.at("images").softmaxN_, 42u);
+  EXPECT_FLOAT_EQ(overrides.at("images").breadth_.value(), 0.75f);
+  EXPECT_FALSE(overrides.at("images").cslsRerankFloor_.has_value());
+  EXPECT_EQ(overrides.at("texts").embeddingModel_, "m");
+  EXPECT_FLOAT_EQ(overrides.at("texts").breadth_.value(), 1.f);
+  EXPECT_FALSE(overrides.at("texts").cslsFloor_.has_value());
+  // Malformed values poison the ENTIRE entry (even a valid field next to
+  // them must not half-apply), while well-formed entries still parse:
+  // breadth out of [0, 1], non-positive/non-numeric temperature, softmaxN 0,
+  // a string cslsFloor.
+  auto invalid = parseEmbeddingEndpointOverrides(
+      R"({"breadthHigh": {"embeddingModel": "m", "breadth": 1.5},)"
+      R"( "breadthNeg": {"breadth": -0.1},)"
+      R"( "tZero": {"softmaxTemperature": 0},)"
+      R"( "tNeg": {"softmaxTemperature": -0.1},)"
+      R"( "tString": {"softmaxTemperature": "0.1"},)"
+      R"( "nZero": {"softmaxN": 0},)"
+      R"( "nFrac": {"softmaxN": 1.5},)"
+      R"( "floorString": {"cslsFloor": "low"},)"
+      R"( "good": {"softmaxTemperature": 0.2}})");
+  ASSERT_EQ(invalid.size(), 1u);
+  EXPECT_FLOAT_EQ(invalid.at("good").softmaxTemperature_.value(), 0.2f);
+}
+
+// _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, autoCutDefaultsAreInMemoryOnly) {
+  auto b = buildTmpIndex();
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+  // Fresh index: no serving defaults (the constants apply).
+  EXPECT_FALSE(idx.cslsFloorDefault().has_value());
+  EXPECT_FALSE(idx.softmaxTemperatureDefault().has_value());
+  EXPECT_FALSE(idx.softmaxNDefault().has_value());
+  EXPECT_FALSE(idx.breadthDefault().has_value());
+  // Apply the overrides exactly as the load hook does.
+  EndpointsEnvGuard guard{
+      R"({"images": {"cslsFloor": -0.5, "softmaxTemperature": 0.2,)"
+      R"( "softmaxN": 25, "breadth": 0.9}})"};
+  auto overrides = embeddingEndpointOverridesFromEnv();
+  auto it = overrides.find(b.name);
+  ASSERT_NE(it, overrides.end());
+  idx.setCslsFloorDefault(it->second.cslsFloor_);
+  idx.setSoftmaxTemperatureDefault(it->second.softmaxTemperature_);
+  idx.setSoftmaxNDefault(it->second.softmaxN_);
+  idx.setBreadthDefault(it->second.breadth_);
+  EXPECT_FLOAT_EQ(idx.cslsFloorDefault().value(), -0.5f);
+  EXPECT_FLOAT_EQ(idx.softmaxTemperatureDefault().value(), 0.2f);
+  EXPECT_EQ(idx.softmaxNDefault(), 25u);
+  EXPECT_FLOAT_EQ(idx.breadthDefault().value(), 0.9f);
+  // The setters clamp/ignore invalid values defensively.
+  idx.setSoftmaxNDefault(0);
+  EXPECT_EQ(idx.softmaxNDefault(), 1u);
+  idx.setBreadthDefault(2.f);
+  EXPECT_FLOAT_EQ(idx.breadthDefault().value(), 1.f);
+  idx.setSoftmaxTemperatureDefault(-1.f);  // ignored, keeps 0.2
+  EXPECT_FLOAT_EQ(idx.softmaxTemperatureDefault().value(), 0.2f);
+  // `nullopt` resets to "use the constants".
+  idx.setCslsFloorDefault(std::nullopt);
+  EXPECT_FALSE(idx.cslsFloorDefault().has_value());
+  // Never persisted: a fresh open has no defaults again.
+  VectorIndex reopened;
+  reopened.open(b.basename, b.name);
+  EXPECT_FALSE(reopened.softmaxTemperatureDefault().has_value());
+  EXPECT_FALSE(reopened.breadthDefault().has_value());
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
 TEST(VectorIndexEndpointOverride, parseMalformedNeverThrowsAndYieldsNothing) {
   // Whole value malformed or of the wrong shape -> empty map, no exception.
   EXPECT_TRUE(parseEmbeddingEndpointOverrides("").empty());

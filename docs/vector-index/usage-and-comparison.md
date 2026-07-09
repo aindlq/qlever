@@ -371,6 +371,45 @@ stand out more.
   `vec:bindCoarseScore` (there is no coarse pass); requires a query point and
   an index built with `"csls": true` (clear errors otherwise).
 
+### Use case 7c — dynamic cuts (`vec:autoCut`): let the query decide where to stop
+
+Instead of hand-tuning a fixed `vec:cslsThreshold`, `vec:autoCut` picks the
+cut **from the retrieved score distribution itself** (query-time only, same
+csls-built index, same coarse-scan + bounded-fine-rerank machinery; mutually
+exclusive with `vec:cslsThreshold`, requires a query point):
+
+- **`vec:autoCut "csls"` — the CSLS knee.** Keep candidates with
+  `CSLS ≥ vec:cslsFloor` (default 0), sort them by CSLS descending, and cut
+  at the **largest consecutive gap** — but only when that gap is
+  *significant* (> `significanceFactor` × the median gap of the inspected
+  head, factor default 3, head capped at 1000). No significant knee (a
+  smooth, cluster-free distribution) ⇒ fall back to "everything ≥ floor", so
+  the cut is stable instead of arbitrary. `vec:bindScore` stays the cosine
+  distance, `vec:bindCsls` works.
+- **`vec:autoCut "softmax"` — the confidence cut.** Softmax the top-`softmaxN`
+  fine cosines (`vec:softmaxN`, default `5 × cslsNeighbors`) at temperature
+  `vec:softmaxTemperature` (default 0.1) and keep the **standouts**
+  `p ≥ alpha/N` (alpha default 2 — at least twice the uniform share). A
+  near-uniform, "shrugging" distribution keeps **nothing** — built-in
+  no-match rejection. No CSLS value is defined here (`vec:bindCsls` is
+  rejected).
+- **`vec:breadth` — one precise↔broad dial** (number 0..1 or `"precise"` /
+  `"balanced"` / `"broad"`; default 0.5 = the defaults above). One lever per
+  mode, ×2 at each extreme: for the knee it scales the significance factor
+  `3 · 2^(2·breadth−1)` (higher breadth ⇒ knee fires *less* readily ⇒ the
+  keep-everything-≥-floor fallback wins more often ⇒ broader); for the
+  softmax it scales `alpha = 2 · 2^(1−2·breadth)` (higher breadth ⇒ looser
+  standout bar ⇒ broader).
+- **Per-index serving defaults**: `cslsFloor`, `softmaxTemperature`,
+  `softmaxN`, and `breadth` can be preset per index in
+  `QLEVER_VECTOR_SEARCH_ENDPOINTS` (like `cslsRerankFloor`; in-memory only,
+  never persisted); query parameters always win.
+- Same restrictions and cost model as `vec:cslsThreshold` (no
+  `vectorSearch:hnsw` / `vec:rerankK` / `vec:bindCoarseScore`; FORM W and
+  FORM P; an explicit `vec:k` caps the survivors). Both cuts operate on the
+  **reranked** candidate set of the two-layer coarse+rerank, so they stay
+  cheap on large stores — the softmax never widens past one rerank batch.
+
 **Coexist / compare.** `vec:distance` (fine, exact) and the SERVICE (coarse
 scan → fine rerank) work on the *same* two-layer index, so one query can put
 the exact baseline and the accelerated scores side by side:

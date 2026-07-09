@@ -36,9 +36,8 @@ VectorSearchJoin::VectorSearchJoin(
   AD_CONTRACT_CHECK(
       config_.hasQueryPoint() || !config_.coarseScoreVariable_.has_value(),
       "`<bindCoarseScore>` requires a query point.");
-  AD_CONTRACT_CHECK(
-      config_.hasQueryPoint() || !config_.cslsThreshold_.has_value(),
-      "`<cslsThreshold>` requires a query point.");
+  AD_CONTRACT_CHECK(config_.hasQueryPoint() || !config_.hasCslsCut(),
+                    "`<cslsThreshold>`/`<autoCut>` requires a query point.");
   if (!child_) {
     // INCOMPLETE form: the subtree binding `<candidates>` comes from the
     // surrounding query. Expose the variables as possibly-undefined columns
@@ -273,16 +272,7 @@ std::string VectorSearchJoin::getCacheKeyImpl() const {
         &key, " maxDist=",
         absl::Hex(absl::bit_cast<uint32_t>(config_.maxDistance_.value())));
   }
-  if (config_.cslsThreshold_.has_value()) {
-    absl::StrAppend(
-        &key, " cslsThreshold=",
-        absl::Hex(absl::bit_cast<uint32_t>(config_.cslsThreshold_.value())),
-        " csls=", config_.cslsVariable_.has_value(),
-        " cslsKCap=", config_.cslsKCap_.value_or(0));
-    if (config_.cslsNeighbors_.has_value()) {
-      absl::StrAppend(&key, " cslsNeighbors=", config_.cslsNeighbors_.value());
-    }
-  }
+  qlever::vector::appendCslsCutToCacheKey(&key, config_);
   qlever::vector::appendQueryPointToCacheKey(&key, config_);
   if (child_) {
     absl::StrAppend(&key, " {", child_->getCacheKey(), "}");
@@ -448,29 +438,32 @@ void VectorSearchJoin::computePreFilterRows(
 
   const bool withCoarseScore = config_.coarseScoreVariable_.has_value();
   ad_utility::HashMap<Id, float> coarseDistances;
-  // The CSLS value of every kept candidate, iff `vec:cslsThreshold` is set.
+  // The CSLS value of every kept candidate, iff a csls cut binding it is set.
   ad_utility::HashMap<Id, float> cslsValues;
   std::vector<qlever::vector::ScoredEntity> scored;
-  if (config_.cslsThreshold_.has_value()) {
-    // CSLS cut over the BOUND set: every candidate member is scored (a full
-    // fine-layer sweep on a single-layer index; a full COARSE sweep plus a
-    // bounded, auto-widening fine rerank on a two-layer one -- see
-    // `searchCslsBytes`), r(q) from the top-`cslsNeighbors` of that set, then
-    // the tau filter. Survivors keep their (fine) COSINE distance as the
-    // score; `vec:k` (if explicitly given) caps them, otherwise all survivors
-    // are kept (variable cardinality).
+  if (config_.hasCslsCut()) {
+    // CSLS-machinery cut over the BOUND set -- the fixed tau
+    // (`vec:cslsThreshold`) or a dynamic `vec:autoCut` (knee/softmax): every
+    // candidate member is scored (a full fine-layer sweep on a single-layer
+    // index; a full COARSE sweep plus a bounded, auto-widening fine rerank on
+    // a two-layer one -- see `searchCslsBytes`), r(q) from the
+    // top-`cslsNeighbors` of that set, then the resolved cut selects the
+    // survivors. They keep their (fine) COSINE distance as the score; `vec:k`
+    // (if explicitly given) caps them, otherwise all survivors are kept
+    // (variable cardinality).
     qlever::vector::validateCslsIsAvailable(config_, vidx);
-    const float threshold = config_.cslsThreshold_.value();
+    const qlever::vector::CslsCut cut =
+        qlever::vector::resolveCslsCut(config_, vidx);
     const size_t neighbors =
         config_.cslsNeighbors_.value_or(vidx.cslsNeighbors());
     ad_utility::Timer cslsTimer{ad_utility::Timer::Started};
     size_t numScored = 0;
     auto hits =
         queryEntity.has_value()
-            ? vidx.searchCslsByEntity(queryEntity.value(), threshold, neighbors,
+            ? vidx.searchCslsByEntity(queryEntity.value(), cut, neighbors,
                                       candidates, config_.maxDistance_,
                                       checkInterrupt, &numScored)
-            : vidx.searchCsls(query, threshold, neighbors, candidates,
+            : vidx.searchCsls(query, cut, neighbors, candidates,
                               config_.maxDistance_, checkInterrupt, &numScored);
     const double ms = cslsTimer.value().count() / 1000.0;
     qlever::vector::logVectorSearchPhase(

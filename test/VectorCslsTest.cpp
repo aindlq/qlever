@@ -39,6 +39,7 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexBuilder.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
+#include "services/vectorSearch/VectorSearch.h"
 #include "util/json.h"
 
 namespace {
@@ -1301,4 +1302,526 @@ TEST(VectorCsls, parseErrors) {
                       "vec:queryVector \"0,1,0,0\" ; vec:cslsThreshold 0.0 ; "
                       "vec:bindCsls ?x .")),
       HasSubstr("must be different"));
+}
+
+// ===========================================================================
+// The DYNAMIC `vec:autoCut` cuts (knee + softmax) on top of the CSLS
+// machinery.
+
+namespace {
+// Build a SINGLE-LAYER f32 csls index whose rows are unit vectors in the
+// (e0, e1) plane at the given ANGLES (degrees) from e0, with an INGESTED
+// r(d) = 0 for every row: `csls = 2*cos(angle) - r(q)`, so the csls ORDER is
+// exactly the cosine order and every csls gap is 2x the cosine gap --
+// hand-designable knee/softmax fixtures. Row i gets entity id `1000 + i`.
+std::string buildAngleFixtureIndex(const std::string& name,
+                                   const std::vector<float>& angleDegrees,
+                                   size_t cslsNeighbors = 3) {
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = name;
+  cfg.dimensions_ = 4;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.buildHnsw_ = false;
+  cfg.csls_ = true;
+  cfg.cslsNeighbors_ = cslsNeighbors;
+  VectorIndexBuilder builder{basename, cfg};
+  for (size_t i = 0; i < angleDegrees.size(); ++i) {
+    const float a = angleDegrees[i] * std::numbers::pi_v<float> / 180.f;
+    builder.add(mkId(1000 + i), "<http://ex/" + std::to_string(i) + ">",
+                std::vector<float>{std::cos(a), std::sin(a), 0.f, 0.f}, 0.f);
+  }
+  builder.build();
+  return basename;
+}
+
+const std::vector<float> kAngleQuery{1.f, 0.f, 0.f, 0.f};
+
+CslsCut kneeCut(float floor) {
+  CslsCut cut;
+  cut.mode_ = CslsCut::Mode::Knee;
+  cut.threshold_ = floor;
+  return cut;
+}
+
+CslsCut softmaxCut(size_t n) {
+  CslsCut cut;
+  cut.mode_ = CslsCut::Mode::Softmax;
+  cut.softmaxN_ = n;
+  return cut;
+}
+}  // namespace
+
+// _____________________________________________________________________________
+// KNEE on a fixture with a clear cluster + gap: 6 vectors at 10..15 degrees
+// (csls ~0.95..0.99 with the ingested r(d) = 0) and 41 background vectors at
+// 60..80 degrees (csls <= ~0.02). The cluster->background csls gap (~0.93) is
+// far above 3x the median gap (~0.015), so the knee fires at rank 5 and keeps
+// EXACTLY the cluster -- although the generous floor (-2) would keep
+// everything.
+TEST(VectorCsls, autoCutKneeKeepsExactlyTheCluster) {
+  std::vector<float> angles{10.f, 11.f, 12.f, 13.f, 14.f, 15.f};
+  for (float a = 60.f; a <= 80.f; a += 0.5f) {
+    angles.push_back(a);
+  }
+  std::string basename = buildAngleFixtureIndex("acknee", angles);
+  VectorIndex idx;
+  idx.open(basename, "acknee");
+  ASSERT_TRUE(idx.hasCsls());
+
+  size_t numScored = 0;
+  auto hits = idx.searchCsls(kAngleQuery, kneeCut(-2.f), 3, std::nullopt,
+                             std::nullopt, {}, &numScored);
+  EXPECT_EQ(numScored, angles.size());
+  ASSERT_EQ(hits.size(), 6u);
+  for (size_t i = 0; i < 6; ++i) {
+    // Ascending by cosine distance = ascending by angle = fixture order.
+    EXPECT_EQ(hits[i].entity_, mkId(1000 + i)) << i;
+    const double cosA = std::cos(angles[i] * std::numbers::pi / 180.0);
+    EXPECT_NEAR(hits[i].distance_, 1.0 - cosA, 1e-4) << i;
+    // csls = 2*cos - r(q), r(q) = mean of the top-3 cosines (no exact
+    // self-match: the nearest candidate is 10 degrees away).
+    const double rq = (std::cos(10 * std::numbers::pi / 180.0) +
+                       std::cos(11 * std::numbers::pi / 180.0) +
+                       std::cos(12 * std::numbers::pi / 180.0)) /
+                      3.0;
+    EXPECT_NEAR(hits[i].csls_, 2.0 * cosA - rq, 1e-4) << i;
+  }
+  cleanupTmp(basename, "acknee");
+}
+
+// _____________________________________________________________________________
+// KNEE significance fallback on a SMOOTH fixture (50 vectors evenly spread
+// over 20..80 degrees, no cluster): the largest gap is < 3x the median gap,
+// so the knee never fires and the cut degrades to the fixed floor -- with a
+// generous floor EVERYTHING is kept, and with a mid-range floor the result is
+// IDENTICAL to the fixed-threshold cut at that floor (entities, distances,
+// and csls values).
+TEST(VectorCsls, autoCutKneeFallsBackWithoutSignificantKnee) {
+  std::vector<float> angles;
+  for (size_t i = 0; i < 50; ++i) {
+    angles.push_back(20.f + static_cast<float>(i) * 60.f / 49.f);
+  }
+  std::string basename = buildAngleFixtureIndex("acsmooth", angles);
+  VectorIndex idx;
+  idx.open(basename, "acsmooth");
+
+  // Generous floor: the fallback keeps everything >= floor, i.e. all 50.
+  auto all = idx.searchCsls(kAngleQuery, kneeCut(-2.f), 3);
+  EXPECT_EQ(all.size(), 50u);
+
+  // Mid-range floor: identical to the fixed cut at the same value.
+  const float floor = 0.35f;
+  auto knee = idx.searchCsls(kAngleQuery, kneeCut(floor), 3);
+  auto fixed = idx.searchCsls(kAngleQuery, CslsCut{floor}, 3);
+  ASSERT_EQ(knee.size(), fixed.size());
+  ASSERT_LT(knee.size(), 50u);  // the floor itself does cut
+  ASSERT_GT(knee.size(), 2u);
+  for (size_t i = 0; i < knee.size(); ++i) {
+    EXPECT_EQ(knee[i].entity_, fixed[i].entity_) << i;
+    EXPECT_EQ(knee[i].distance_, fixed[i].distance_) << i;
+    EXPECT_EQ(knee[i].csls_, fixed[i].csls_) << i;
+  }
+  cleanupTmp(basename, "acsmooth");
+}
+
+// _____________________________________________________________________________
+// SOFTMAX on a clear-winner fixture: one vector at 5 degrees, 40 background
+// vectors at 60..80 degrees. In the top-15 softmax at T = 0.1 the winner
+// holds essentially all the mass (p ~ 0.98 >> the standout bar 2/15), the
+// best background candidate has p ~ 0.007 -- exactly the winner is kept, with
+// its COSINE distance as the score and NO csls value (NaN).
+TEST(VectorCsls, autoCutSoftmaxKeepsTheStandout) {
+  std::vector<float> angles{5.f};
+  for (float a = 60.f; a < 80.f; a += 0.5f) {
+    angles.push_back(a);
+  }
+  std::string basename = buildAngleFixtureIndex("acsoft", angles);
+  VectorIndex idx;
+  idx.open(basename, "acsoft");
+
+  auto hits = idx.searchCsls(kAngleQuery, softmaxCut(15), 3);
+  ASSERT_EQ(hits.size(), 1u);
+  EXPECT_EQ(hits[0].entity_, mkId(1000));
+  EXPECT_NEAR(hits[0].distance_, 1.0 - std::cos(5 * std::numbers::pi / 180.0),
+              1e-4);
+  EXPECT_TRUE(std::isnan(hits[0].csls_));
+  cleanupTmp(basename, "acsoft");
+}
+
+// _____________________________________________________________________________
+// SOFTMAX no-match rejection on a NEAR-UNIFORM fixture: 40 identical vectors
+// at 60 degrees. Every p_i is exactly 1/15 < the standout bar 2/15, so
+// NOTHING is kept -- the confidence cut "shrugs" instead of returning an
+// arbitrary top-k.
+TEST(VectorCsls, autoCutSoftmaxKeepsNothingOnUniform) {
+  std::vector<float> angles(40, 60.f);
+  std::string basename = buildAngleFixtureIndex("acuni", angles);
+  VectorIndex idx;
+  idx.open(basename, "acuni");
+
+  size_t numScored = 0;
+  auto hits = idx.searchCsls(kAngleQuery, softmaxCut(15), 3, std::nullopt,
+                             std::nullopt, {}, &numScored);
+  EXPECT_EQ(numScored, 40u);
+  EXPECT_TRUE(hits.empty());
+  cleanupTmp(basename, "acuni");
+}
+
+// _____________________________________________________________________________
+// TWO-LAYER (binary + bf16) autoCut: the softmax cut is bounded by ONE rerank
+// batch -- it must find the standout WITHOUT ever widening (no "csls rerank
+// widened" log even though a fixed cut at a generous tau would widen through
+// everything) -- and the knee cut reproduces the huge-rerank-floor reference
+// exactly under a small floor (the widen loop covers every survivor, so the
+// knee input -- and output -- is identical).
+TEST(VectorCsls, autoCutTwoLayerBoundedSoftmaxAndKneeIdentity) {
+  constexpr size_t N_BG = 150;
+  constexpr size_t D = 64;
+  std::mt19937 rng{20260709};
+  std::normal_distribution<float> g{0.f, 1.f};
+  auto randomUnit = [&] {
+    std::vector<float> v(D);
+    float norm = 0;
+    for (auto& x : v) {
+      x = g(rng);
+      norm += x * x;
+    }
+    norm = std::sqrt(norm);
+    for (auto& x : v) x /= norm;
+    return v;
+  };
+  const std::vector<float> query = randomUnit();
+  // The standout: 5 degrees from the query in a fresh random plane.
+  std::vector<float> standout;
+  {
+    std::vector<float> w = randomUnit();
+    float dot = 0;
+    for (size_t j = 0; j < D; ++j) dot += w[j] * query[j];
+    float norm = 0;
+    for (size_t j = 0; j < D; ++j) {
+      w[j] -= dot * query[j];
+      norm += w[j] * w[j];
+    }
+    norm = std::sqrt(norm);
+    const float a = 5.f * std::numbers::pi_v<float> / 180.f;
+    standout.resize(D);
+    for (size_t j = 0; j < D; ++j) {
+      standout[j] = std::cos(a) * query[j] + std::sin(a) * w[j] / norm;
+    }
+  }
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = "ac2layer";
+  cfg.dimensions_ = D;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.buildHnsw_ = false;
+  cfg.csls_ = true;
+  cfg.cslsNeighbors_ = 3;
+  cfg.scalar_ = VectorScalar::Binary;
+  cfg.rerankScalar_ = VectorScalar::Bf16;
+  VectorIndexBuilder builder{basename, cfg};
+  builder.add(mkId(500), "<http://ex/standout>", standout);
+  for (size_t i = 0; i < N_BG; ++i) {
+    builder.add(mkId(1000 + i), "<http://ex/" + std::to_string(i) + ">",
+                randomUnit());
+  }
+  builder.build();
+  VectorIndex idx;
+  idx.open(basename, "ac2layer");
+  ASSERT_TRUE(idx.hasRerankLayer());
+
+  // Softmax under a SMALL rerank floor: one batch of 32 (of 151) suffices --
+  // the standout is coarse-rank ~1 -- and the widen loop must NOT fire.
+  idx.setCslsRerankFloor(32);
+  testing::internal::CaptureStdout();
+  auto soft = idx.searchCsls(query, softmaxCut(15), 3);
+  std::string log = testing::internal::GetCapturedStdout();
+  ASSERT_EQ(soft.size(), 1u);
+  EXPECT_EQ(soft[0].entity_, mkId(500));
+  EXPECT_TRUE(std::isnan(soft[0].csls_));
+  EXPECT_THAT(log, HasSubstr("csls softmax: top-15"));
+  EXPECT_THAT(log, ::testing::Not(HasSubstr("csls rerank widened")));
+
+  // Knee identity: a generous floor (-10) keeps every candidate in play, so
+  // the small-floor run widens through everything and must equal the
+  // huge-floor (single batch reranks all) reference bit for bit.
+  idx.setCslsRerankFloor(1'000'000);
+  auto ref = idx.searchCsls(query, kneeCut(-10.f), 3);
+  idx.setCslsRerankFloor(32);
+  auto bounded = idx.searchCsls(query, kneeCut(-10.f), 3);
+  ASSERT_EQ(ref.size(), bounded.size());
+  ASSERT_GE(ref.size(), 1u);
+  EXPECT_EQ(ref[0].entity_, mkId(500));
+  for (size_t i = 0; i < ref.size(); ++i) {
+    EXPECT_EQ(ref[i].entity_, bounded[i].entity_) << i;
+    EXPECT_EQ(ref[i].distance_, bounded[i].distance_) << i;
+    EXPECT_EQ(ref[i].csls_, bounded[i].csls_) << i;
+  }
+  cleanupTmp(basename, "ac2layer");
+}
+
+// _____________________________________________________________________________
+// `resolveCslsCut`: the query-param -> per-index-default -> constant fallback
+// chain and the documented BREADTH mapping (knee: significanceFactor =
+// 3 * 2^(2b-1), so 1.5 at b=0 and 6 at b=1 -- HIGHER breadth = knee fires
+// LESS readily = broader fallback; softmax: alpha = 2 * 2^(1-2b), so 4 at
+// b=0 and 1 at b=1 -- higher breadth = looser standout bar).
+TEST(VectorCsls, resolveCutBreadthMappingAndDefaults) {
+  std::string basename =
+      buildAngleFixtureIndex("acres", {0.f, 30.f, 60.f, 90.f},
+                             /*cslsNeighbors=*/2);
+  VectorIndex idx;
+  idx.open(basename, "acres");
+
+  VectorSearchConfiguration config;
+  config.indexName_ = "acres";
+  config.queryVector_ = kAngleQuery;
+
+  // Fixed threshold: a passthrough.
+  config.cslsThreshold_ = 0.75f;
+  auto fixed = resolveCslsCut(config, idx);
+  EXPECT_EQ(fixed.mode_, CslsCut::Mode::Threshold);
+  EXPECT_EQ(fixed.threshold_, 0.75f);
+  config.cslsThreshold_ = std::nullopt;
+
+  using AutoCutMode = VectorSearchConfiguration::AutoCutMode;
+  // Knee constants: floor 0, factor 3, maxKeep 1000.
+  config.autoCut_ = AutoCutMode::CslsKnee;
+  auto knee = resolveCslsCut(config, idx);
+  EXPECT_EQ(knee.mode_, CslsCut::Mode::Knee);
+  EXPECT_EQ(knee.threshold_, DEFAULT_CSLS_FLOOR);
+  EXPECT_FLOAT_EQ(knee.significanceFactor_, DEFAULT_CSLS_KNEE_SIGNIFICANCE);
+  EXPECT_EQ(knee.maxKeep_, DEFAULT_CSLS_KNEE_MAX_KEEP);
+  // Breadth 0 halves the factor (precise), breadth 1 doubles it (broad).
+  config.breadth_ = 0.f;
+  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).significanceFactor_, 1.5f);
+  config.breadth_ = 1.f;
+  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).significanceFactor_, 6.f);
+  config.breadth_ = std::nullopt;
+
+  // Softmax constants: T 0.1, N = 5 * cslsNeighbors (2 here), alpha 2.
+  config.autoCut_ = AutoCutMode::Softmax;
+  auto soft = resolveCslsCut(config, idx);
+  EXPECT_EQ(soft.mode_, CslsCut::Mode::Softmax);
+  EXPECT_FLOAT_EQ(soft.temperature_, DEFAULT_CSLS_SOFTMAX_TEMPERATURE);
+  EXPECT_EQ(soft.softmaxN_, 10u);
+  EXPECT_FLOAT_EQ(soft.alpha_, DEFAULT_CSLS_SOFTMAX_ALPHA);
+  // The query-side `cslsNeighbors` override scales the default softmaxN.
+  config.cslsNeighbors_ = 4;
+  EXPECT_EQ(resolveCslsCut(config, idx).softmaxN_, 20u);
+  config.cslsNeighbors_ = std::nullopt;
+  // Breadth 0 doubles alpha (precise), breadth 1 halves it (broad).
+  config.breadth_ = 0.f;
+  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).alpha_, 4.f);
+  config.breadth_ = 1.f;
+  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).alpha_, 1.f);
+  config.breadth_ = std::nullopt;
+
+  // Per-index serving defaults kick in when the query does not override...
+  idx.setSoftmaxTemperatureDefault(0.2f);
+  idx.setSoftmaxNDefault(7);
+  idx.setBreadthDefault(1.f);
+  auto served = resolveCslsCut(config, idx);
+  EXPECT_FLOAT_EQ(served.temperature_, 0.2f);
+  EXPECT_EQ(served.softmaxN_, 7u);
+  EXPECT_FLOAT_EQ(served.alpha_, 1.f);
+  // ... and the query params always win over them.
+  config.softmaxTemperature_ = 0.05f;
+  config.softmaxN_ = 3;
+  config.breadth_ = 0.5f;
+  auto overridden = resolveCslsCut(config, idx);
+  EXPECT_FLOAT_EQ(overridden.temperature_, 0.05f);
+  EXPECT_EQ(overridden.softmaxN_, 3u);
+  EXPECT_FLOAT_EQ(overridden.alpha_, 2.f);
+  config.softmaxTemperature_ = std::nullopt;
+  config.softmaxN_ = std::nullopt;
+  config.breadth_ = std::nullopt;
+
+  // The same for the knee floor.
+  config.autoCut_ = AutoCutMode::CslsKnee;
+  idx.setCslsFloorDefault(-0.5f);
+  EXPECT_EQ(resolveCslsCut(config, idx).threshold_, -0.5f);
+  config.cslsFloor_ = -0.25f;
+  EXPECT_EQ(resolveCslsCut(config, idx).threshold_, -0.25f);
+
+  cleanupTmp(basename, "acres");
+}
+
+// _____________________________________________________________________________
+// The SERVICE surface of the dynamic cuts on the hand-computed fixture
+// (r(q) = 0.7 for q = [0,1,0,0]; csls: d 0.6, c 0.02, b -0.38, e -0.7,
+// a -1.4):
+//  * `vec:autoCut "csls"` (default floor 0): survivors {d, c}; with only one
+//    gap the knee cannot be significant, so the fallback keeps both --
+//    identical to `vec:cslsThreshold 0` -- and `vec:bindCsls` binds the
+//    values.
+//  * `vec:autoCut "softmax"` (default N = 5*2 = 10, capped at the 5
+//    candidates; T 0.1, alpha 2): p(d) ~ 0.87 >= 2/5, p(c) ~ 0.12 < 2/5 --
+//    exactly {d} is kept, with the cosine distance bound.
+TEST(VectorCsls, autoCutServiceForms) {
+  auto* qec = qecWithCslsIndexes();
+  auto getId = makeGetId(qec->getIndex());
+  {
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} +
+                 "SELECT * WHERE { SERVICE vec: { _:c vec:index \"embc\" ; "
+                 "vec:queryVector \"0,1,0,0\" ; vec:result ?nn ; "
+                 "vec:bindScore ?d ; vec:bindCsls ?csls ; "
+                 "vec:autoCut \"csls\" . } }");
+    auto result = qet.getResult();
+    size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
+    size_t cslsCol = qet.getVariableColumn(Variable{"?csls"});
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 2u);
+    EXPECT_EQ(table(0, nnCol), getId("<d>"));
+    EXPECT_EQ(table(1, nnCol), getId("<c>"));
+    EXPECT_NEAR(table(0, cslsCol).getDouble(), 0.6, 1e-5);
+    EXPECT_NEAR(table(1, cslsCol).getDouble(), 0.02, 1e-5);
+  }
+  {
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} +
+                 "SELECT * WHERE { SERVICE vec: { _:c vec:index \"embc\" ; "
+                 "vec:queryVector \"0,1,0,0\" ; vec:result ?nn ; "
+                 "vec:bindScore ?d ; vec:autoCut \"softmax\" . } }");
+    auto result = qet.getResult();
+    size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
+    size_t dCol = qet.getVariableColumn(Variable{"?d"});
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 1u);
+    EXPECT_EQ(table(0, nnCol), getId("<d>"));
+    EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-6);
+  }
+  // FORM P: the softmax cut over the BOUND subset {b, c} (N = 2, bar = 1.0):
+  // even the better candidate c has p < 1, so nothing survives -- the
+  // no-match rejection also works on a pre-filtered set.
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT * WHERE { ?x <is-a> <SubItem> . "
+                           "SERVICE vec: { _:c vec:index \"embc\" ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:candidates ?x ; "
+                           "vec:result ?x ; vec:autoCut \"softmax\" . } }");
+    auto result = qet.getResult();
+    EXPECT_EQ(result->idTable().numRows(), 0u);
+  }
+  // The runtime csls-availability check names `vec:autoCut`.
+  {
+    QueryExecutionTree qet =
+        planQuery(qec, std::string{PREFIX} +
+                           "SELECT * WHERE { SERVICE vec: { _:c vec:index "
+                           "\"embplain\" ; vec:queryVector \"0,1,0,0\" ; "
+                           "vec:result ?nn ; vec:autoCut \"csls\" . } }");
+    AD_EXPECT_THROW_WITH_MESSAGE(qet.getResult(),
+                                 HasSubstr("was not built with csls:true"));
+  }
+}
+
+// _____________________________________________________________________________
+// Parse-time validation of the `vec:autoCut` parameter family.
+TEST(VectorCsls, autoCutParseErrors) {
+  auto* qec = qecWithCslsIndexes();
+  auto query = [](std::string_view body) {
+    return std::string{PREFIX} + "SELECT * WHERE { SERVICE vec: { " +
+           std::string{body} + " } }";
+  };
+  // cslsThreshold and autoCut are mutually exclusive.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:cslsThreshold 0.0 ; "
+                      "vec:autoCut \"csls\" .")),
+      HasSubstr("mutually exclusive"));
+  // Only "csls" and "softmax" are valid autoCut values.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; "
+                           "vec:autoCut \"knee\" .")),
+      HasSubstr("\"csls\""));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:autoCut 1 .")),
+      HasSubstr("string literal"));
+  // autoCut requires a query point (FORM E has none).
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:candidates ?c ; "
+                           "vec:result ?x ; vec:autoCut \"csls\" .")),
+      HasSubstr("requires a query point"));
+  // Each knob is only valid with its mode.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; "
+                           "vec:autoCut \"softmax\" ; vec:cslsFloor 0.1 .")),
+      HasSubstr("requires `<autoCut> \"csls\"`"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
+                      "vec:softmaxTemperature 0.2 .")),
+      HasSubstr("requires `<autoCut> \"softmax\"`"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:softmaxN 5 .")),
+      HasSubstr("requires `<autoCut> \"softmax\"`"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:breadth 0.7 .")),
+      HasSubstr("requires `<autoCut>`"));
+  // bindCsls: fine with the knee (see `autoCutServiceForms`), rejected with
+  // the softmax mode (which defines no CSLS value).
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"softmax\" ; "
+                      "vec:bindCsls ?c .")),
+      HasSubstr("requires `<cslsThreshold>` or"));
+  // Value validation of the knobs.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"softmax\" ; "
+                      "vec:softmaxTemperature 0.0 .")),
+      HasSubstr("positive finite"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"softmax\" ; "
+                      "vec:softmaxN 0 .")),
+      HasSubstr("positive integer"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
+                      "vec:breadth 1.5 .")),
+      HasSubstr("between 0"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
+                      "vec:breadth \"wide\" .")),
+      HasSubstr("\"precise\""));
+  // The existing csls-cut incompatibilities apply to autoCut too.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
+                      "vec:rerankK 100 .")),
+      HasSubstr("rerankK"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
+                      "vec:algorithm vec:hnsw .")),
+      HasSubstr("hnsw"));
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec,
+                query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
+                      "vec:bindCoarseScore ?dc .")),
+      HasSubstr("bindCoarseScore"));
+  // The breadth presets parse (a smoke check that the query is accepted).
+  planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                       "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
+                       "vec:breadth \"broad\" ."));
 }

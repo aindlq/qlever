@@ -103,7 +103,7 @@ array (e.g. one for image embeddings, one for text).
 | `hnsw`    | `true` builds the ANN graph; `false` = exact/flat store only   |
 | `scalar`  | *(optional)* storage precision `f32` (default) \| `f16` \| `bf16` \| `i8` \| `binary` (1-bit sign-packed, see below) |
 | `rerank`  | *(optional)* second-layer **rerank precision** `bf16` \| `f16` \| `f32`; unset = single-layer. Builds a TWO-LAYER quantize+rerank store (see below) |
-| `csls`    | *(optional, cosine-only)* `true` precomputes the per-document **CSLS hubness `r(d)`** sidecar, enabling the query-time `vec:cslsThreshold` cut (see below) |
+| `csls`    | *(optional, cosine-only)* `true` precomputes the per-document **CSLS hubness `r(d)`** sidecar, enabling the query-time `vec:cslsThreshold` and `vec:autoCut` cuts (see below) |
 | `cslsNeighbors` | *(optional, default 10)* neighbour count `k` of the CSLS r-terms — both the build-time `r(d)` and the query-time `r(q)` average the top-`k` cosine similarities. Persisted in the `.meta` |
 | `cslsR`   | *(optional)* path to a **precomputed `r(d)`** as a float32 `.npy` of shape `(N,)` (or `(N, 1)`), row-aligned with the `npy` input — the "GPU path"; skips the build-time self-kNN |
 | `embeddingUrl`   | *(optional)* embedding endpoint bound to this index (see below) |
@@ -304,6 +304,20 @@ to the index in the build spec:
 
   `preloadRerank` is ignored on a single-layer index. Like `preload` it is a
   load-time serving setting; the `.meta` is never rewritten.
+
+- The same variable also carries the **CSLS serving knobs** (all in-memory,
+  never persisted): `cslsRerankFloor` (positive integer — the fine-rerank
+  batch size of the two-layer CSLS cut) and the per-index **defaults of the
+  dynamic `vec:autoCut` cuts**, used whenever a query does not override them
+  (see `usage-and-comparison.md`, use case 7c): `cslsFloor` (finite number),
+  `softmaxTemperature` (positive number), `softmaxN` (positive integer), and
+  `breadth` (number in `[0, 1]`). A malformed field poisons its whole entry
+  (nothing half-applies) with a warning.
+
+  ```json
+  {"emb": {"cslsRerankFloor": 20000, "cslsFloor": -0.1,
+           "softmaxTemperature": 0.05, "breadth": 0.7}}
+  ```
 
 ## 4. Serve and query
 

@@ -13,11 +13,10 @@
 
 #include "engine/Operation.h"
 #include "engine/QueryExecutionTree.h"
+#include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorSearchConfig.h"
 
 namespace qlever::vector {
-
-class VectorIndex;
 
 // Append the query-point fields of `config` to a cache key, each value
 // length-prefixed / bit-exact so distinct query points never share a key.
@@ -25,11 +24,35 @@ class VectorIndex;
 void appendQueryPointToCacheKey(std::string* key,
                                 const VectorSearchConfiguration& config);
 
-// Throw a clear user-facing error when `vec:cslsThreshold` targets an index
-// that was not built with `csls: true`. Shared by the FORM W and FORM P
-// paths.
+// Append the CSLS-cut parameters of `config` (the fixed `cslsThreshold` or
+// the dynamic `autoCut` mode with its knobs, plus `bindCsls`/`cslsKCap`/
+// `cslsNeighbors`) to a cache key; a no-op without a cut. Floats are appended
+// bit-exact so nearby values never share a key. Shared by `VectorSearch` and
+// `VectorSearchJoin`.
+void appendCslsCutToCacheKey(std::string* key,
+                             const VectorSearchConfiguration& config);
+
+// Throw a clear user-facing error when `vec:cslsThreshold`/`vec:autoCut`
+// targets an index that was not built with `csls: true`. Shared by the FORM W
+// and FORM P paths.
 void validateCslsIsAvailable(const VectorSearchConfiguration& config,
                              const VectorIndex& vidx);
+
+// Resolve the effective `CslsCut` of `config` against `vidx`: each knob falls
+// back query parameter -> per-index serving default (the `cslsFloor`/
+// `softmaxTemperature`/`softmaxN`/`breadth` keys of
+// `QLEVER_VECTOR_SEARCH_ENDPOINTS`) -> constant default (`DEFAULT_CSLS_*`).
+// Precondition: `config.hasCslsCut()` and `vidx.hasCsls()` (call
+// `validateCslsIsAvailable` first). The BREADTH dial (0 = precise, 0.5 = the
+// defaults, 1 = broad) maps ONE lever per mode, exponentially with a factor
+// of 2 at the extremes:
+//  * Knee:    `significanceFactor = 3.0 * 2^(2*breadth - 1)`  (1.5 .. 6.0).
+//    A LARGER factor makes the knee fire less readily, falling back to "keep
+//    everything >= cslsFloor" more often -- i.e. BROADER results.
+//  * Softmax: `alpha = 2.0 * 2^(1 - 2*breadth)`               (4.0 .. 1.0).
+//    A SMALLER alpha is a looser standout bar -- i.e. BROADER results.
+CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
+                       const VectorIndex& vidx);
 
 // The WHOLE-INDEX top-k search of `config` (FORM W): resolve the query point
 // against the index `config.indexName_` and return the k nearest entities as

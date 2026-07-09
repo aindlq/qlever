@@ -44,8 +44,9 @@ struct ScoredEntity {
 // One survivor of a CSLS-filtered search (`searchCsls*`): the entity, its
 // COSINE DISTANCE to the query (what `vec:bindScore` binds and what results
 // sort by -- CSLS is the cut, not the score), and its CSLS value
-// `2 * cos_sim(q, d) - r(q) - r(d)` (>= the caller's threshold; what
-// `vec:bindCsls` binds).
+// `2 * cos_sim(q, d) - r(q) - r(d)` (>= the caller's threshold/floor; what
+// `vec:bindCsls` binds). NaN for the softmax autoCut mode, which does not
+// define a CSLS value (`vec:bindCsls` is rejected with it at parse time).
 struct CslsScoredEntity {
   Id entity_;
   float distance_;
@@ -63,6 +64,57 @@ using CheckInterruptCallback = std::function<void()>;
 // automatically while the cut reaches the coarse boundary). Large enough that
 // the r(q) neighbourhood (typically ~10 fine cosines) is effectively exact.
 inline constexpr size_t DEFAULT_CSLS_RERANK_FLOOR = 10'000;
+
+// Constant fallback defaults of the DYNAMIC `vec:autoCut` cuts (each
+// overridable per query and per index at serving time; see `CslsCut` below
+// and `resolveCslsCut` in `VectorSearch.h`). These are query-time defaults; a
+// later batch may data-calibrate them from the build-time self-kNN.
+//  * knee ("csls"): candidates below the FLOOR never survive; the knee only
+//    counts when its gap exceeds SIGNIFICANCE x the median gap of the
+//    inspected head (else the cut falls back to "everything >= floor"), and
+//    the knee search inspects at most the top MAX_KEEP survivors by CSLS.
+//  * softmax: the top `SOFTMAX_N_FACTOR * cslsNeighbors` fine cosines enter
+//    `softmax(cos / TEMPERATURE)`; survivors need `p_i >= ALPHA / N` (at
+//    least ALPHA x the uniform 1/N).
+//  * BREADTH 0.5 is the neutral dial position (the defaults above).
+inline constexpr float DEFAULT_CSLS_FLOOR = 0.0f;
+inline constexpr float DEFAULT_CSLS_KNEE_SIGNIFICANCE = 3.0f;
+inline constexpr size_t DEFAULT_CSLS_KNEE_MAX_KEEP = 1'000;
+inline constexpr float DEFAULT_CSLS_SOFTMAX_TEMPERATURE = 0.1f;
+inline constexpr size_t DEFAULT_CSLS_SOFTMAX_N_FACTOR = 5;
+inline constexpr float DEFAULT_CSLS_SOFTMAX_ALPHA = 2.0f;
+inline constexpr float DEFAULT_CSLS_AUTOCUT_BREADTH = 0.5f;
+
+// The fully-resolved cut a `searchCsls*` call applies to the reranked
+// candidate set. The classic fixed cut is `Mode::Threshold` (a bare float
+// converts implicitly, so `searchCsls(query, 0.5f, ...)` keeps meaning "fixed
+// tau 0.5"); the dynamic cuts are resolved from the query parameters, the
+// per-index serving defaults, and the constants above by `resolveCslsCut`
+// (`VectorSearch.h`). Fields not belonging to the active mode are ignored.
+struct CslsCut {
+  enum class Mode { Threshold, Knee, Softmax };
+  // Implicit on purpose: a bare float IS the fixed-threshold cut.
+  CslsCut(float threshold = 0.0f) : threshold_{threshold} {}
+
+  Mode mode_ = Mode::Threshold;
+  // Threshold: the tau of `csls >= tau`. Knee: the FLOOR -- candidates below
+  // it never survive, and the two-layer rerank widening stops at it exactly
+  // like a fixed tau. Unused by Softmax.
+  float threshold_;
+  // Knee: the knee is taken only if its gap > `significanceFactor_` x the
+  // median gap of the inspected head (else: keep everything >= the floor),
+  // and the knee search inspects at most the top-`maxKeep_` survivors by
+  // CSLS descending (tail noise never moves the knee).
+  float significanceFactor_ = DEFAULT_CSLS_KNEE_SIGNIFICANCE;
+  size_t maxKeep_ = DEFAULT_CSLS_KNEE_MAX_KEEP;
+  // Softmax: `p_i = softmax(cos_i / temperature_)` over the top-`softmaxN_`
+  // fine cosines (capped at the reranked count); keep `p_i >= alpha_ / N`
+  // with N the EFFECTIVE (capped) count. `softmaxN_` must be >= 1 when
+  // `mode_ == Softmax` (the resolver guarantees it).
+  size_t softmaxN_ = 0;
+  float temperature_ = DEFAULT_CSLS_SOFTMAX_TEMPERATURE;
+  float alpha_ = DEFAULT_CSLS_SOFTMAX_ALPHA;
+};
 
 // Read-only, memory-mapped accessor for a single on-disk vector index (see
 // `VectorIndexFormat.h` for the file layout). It owns the mmaped flat float
@@ -198,6 +250,24 @@ class VectorIndex {
   size_t cslsRerankFloor() const;
   void setCslsRerankFloor(size_t floor);
 
+  // Per-index serving DEFAULTS of the dynamic `vec:autoCut` cuts, consulted
+  // by `resolveCslsCut` when the query does not override them; `nullopt`
+  // falls through to the `DEFAULT_CSLS_*` constants. Like `cslsRerankFloor`
+  // these are pure IN-MEMORY serving settings: never persisted, reapplied by
+  // the load hook from the `cslsFloor`/`softmaxTemperature`/`softmaxN`/
+  // `breadth` keys of `QLEVER_VECTOR_SEARCH_ENDPOINTS`. The setters clamp
+  // defensively (the env parser already validates): the floor must be finite
+  // (else ignored), the temperature positive and finite (else ignored),
+  // `softmaxN` >= 1, `breadth` clamped into [0, 1].
+  std::optional<float> cslsFloorDefault() const;
+  void setCslsFloorDefault(std::optional<float> floor);
+  std::optional<float> softmaxTemperatureDefault() const;
+  void setSoftmaxTemperatureDefault(std::optional<float> temperature);
+  std::optional<size_t> softmaxNDefault() const;
+  void setSoftmaxNDefault(std::optional<size_t> n);
+  std::optional<float> breadthDefault() const;
+  void setBreadthDefault(std::optional<float> breadth);
+
   // True iff this index stores a (live) vector for `entity`.
   bool hasVector(Id entity) const;
 
@@ -279,10 +349,10 @@ class VectorIndex {
       Id entity, size_t k, std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
 
-  // CSLS-filtered search (`vec:cslsThreshold`); requires `hasCsls()` and the
-  // cosine metric (both guaranteed at build time; violated preconditions
-  // throw). Every candidate is scored (CSLS is a cut over the whole scoring
-  // set, so there is no HNSW shortcut):
+  // CSLS-filtered search (`vec:cslsThreshold` / `vec:autoCut`); requires
+  // `hasCsls()` and the cosine metric (both guaranteed at build time;
+  // violated preconditions throw). Every candidate is scored (the cut is a
+  // decision over the whole scoring set, so there is no HNSW shortcut):
   //  1. compute the cosine distance from the query to EVERY candidate (all
   //     live vectors, or -- like `searchExact` -- only the `candidates` set).
   //     On a SINGLE-LAYER index this is one full fine sweep; on a TWO-LAYER
@@ -295,17 +365,27 @@ class VectorIndex {
   //     RERANKED candidates -- the only approximation of the coarse+rerank
   //     path), EXCLUDING one exact self-match (distance ~ 0 -- the query
   //     entity itself when it is a candidate);
-  //  3. keep candidate `d` iff
-  //     `CSLS = 2 * cos_sim(q, d) - r(q) - r(d) >= threshold`
-  //     (and `distance <= maxDistance`, if set; r(q) is computed BEFORE the
-  //     maxDistance filter -- it describes the retrieval geometry). The
-  //     cosine here is always the FINE-layer distance.
-  // Returns ALL survivors ascending by cosine DISTANCE (CSLS is the cut, not
-  // the score); the caller applies any top-k cap. `numScored`, if set,
-  // receives the number of candidates that were scored (the live set, or the
-  // members among `candidates`).
+  //  3. apply `cut` to the reranked set:
+  //     * Threshold: keep candidate `d` iff
+  //       `CSLS = 2 * cos_sim(q, d) - r(q) - r(d) >= cut.threshold_`;
+  //     * Knee: the same with `cut.threshold_` as the FLOOR, then cut the
+  //       survivors at a SIGNIFICANT largest CSLS gap (see `CslsCut`); the
+  //       widening bound is the floor, exactly like a fixed tau;
+  //     * Softmax: keep the standouts of `softmax(cos / T)` over the
+  //       top-`softmaxN` fine cosines (r(q)/r(d) unused; `csls_` of the
+  //       returned survivors is NaN). No widening -- the coarse layer ranks
+  //       the very top well (the same approximation r(q) already makes), so
+  //       one batch (>= `softmaxN`) suffices.
+  //     In every mode `distance <= maxDistance` (if set) additionally
+  //     filters the OUTPUT; r(q) is computed BEFORE the maxDistance filter
+  //     -- it describes the retrieval geometry. The cosine is always the
+  //     FINE-layer distance.
+  // Returns ALL survivors ascending by cosine DISTANCE (the cut selects, the
+  // cosine distance stays the score); the caller applies any top-k cap.
+  // `numScored`, if set, receives the number of candidates that were scored
+  // (the live set, or the members among `candidates`).
   std::vector<CslsScoredEntity> searchCsls(
-      ql::span<const float> query, float threshold, size_t neighbors,
+      ql::span<const float> query, const CslsCut& cut, size_t neighbors,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
@@ -317,7 +397,7 @@ class VectorIndex {
   // own row is the excluded self-match. An entity without a (live) vector
   // yields an empty result.
   std::vector<CslsScoredEntity> searchCslsByEntity(
-      Id entity, float threshold, size_t neighbors,
+      Id entity, const CslsCut& cut, size_t neighbors,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},

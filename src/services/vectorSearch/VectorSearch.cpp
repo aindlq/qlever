@@ -56,14 +56,98 @@ void appendQueryPointToCacheKey(std::string* key,
 }
 
 // ____________________________________________________________________________
+void appendCslsCutToCacheKey(std::string* key,
+                             const VectorSearchConfiguration& config) {
+  if (!config.hasCslsCut()) {
+    return;
+  }
+  if (config.cslsThreshold_.has_value()) {
+    absl::StrAppend(
+        key, " cslsThreshold=",
+        absl::Hex(absl::bit_cast<uint32_t>(config.cslsThreshold_.value())));
+  } else {
+    absl::StrAppend(key,
+                    " autoCut=", static_cast<int>(config.autoCut_.value()));
+    if (config.cslsFloor_.has_value()) {
+      absl::StrAppend(
+          key, " cslsFloor=",
+          absl::Hex(absl::bit_cast<uint32_t>(config.cslsFloor_.value())));
+    }
+    if (config.softmaxTemperature_.has_value()) {
+      absl::StrAppend(key, " softmaxT=",
+                      absl::Hex(absl::bit_cast<uint32_t>(
+                          config.softmaxTemperature_.value())));
+    }
+    if (config.softmaxN_.has_value()) {
+      absl::StrAppend(key, " softmaxN=", config.softmaxN_.value());
+    }
+    if (config.breadth_.has_value()) {
+      absl::StrAppend(
+          key, " breadth=",
+          absl::Hex(absl::bit_cast<uint32_t>(config.breadth_.value())));
+    }
+  }
+  absl::StrAppend(key, " csls=", config.cslsVariable_.has_value(),
+                  " cslsKCap=", config.cslsKCap_.value_or(0));
+  if (config.cslsNeighbors_.has_value()) {
+    absl::StrAppend(key, " cslsNeighbors=", config.cslsNeighbors_.value());
+  }
+}
+
+// ____________________________________________________________________________
 void validateCslsIsAvailable(const VectorSearchConfiguration& config,
                              const VectorIndex& vidx) {
   if (!vidx.hasCsls()) {
     throw std::runtime_error{absl::StrCat(
-        "`vec:cslsThreshold` requires an index built with `\"csls\": true`, "
+        "`vec:",
+        config.cslsThreshold_.has_value() ? "cslsThreshold" : "autoCut",
+        "` requires an index built with `\"csls\": true`, "
         "but vector index '",
         config.indexName_, "' was not built with csls:true.")};
   }
+}
+
+// ____________________________________________________________________________
+CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
+                       const VectorIndex& vidx) {
+  AD_CORRECTNESS_CHECK(config.hasCslsCut());
+  CslsCut cut;
+  if (config.cslsThreshold_.has_value()) {
+    // The classic fixed cut: everything else stays at its (unused) default.
+    cut.mode_ = CslsCut::Mode::Threshold;
+    cut.threshold_ = config.cslsThreshold_.value();
+    return cut;
+  }
+  using AutoCutMode = VectorSearchConfiguration::AutoCutMode;
+  // Every knob: query parameter -> per-index serving default -> constant.
+  const float breadth = config.breadth_.value_or(
+      vidx.breadthDefault().value_or(DEFAULT_CSLS_AUTOCUT_BREADTH));
+  if (config.autoCut_.value() == AutoCutMode::CslsKnee) {
+    cut.mode_ = CslsCut::Mode::Knee;
+    cut.threshold_ = config.cslsFloor_.value_or(
+        vidx.cslsFloorDefault().value_or(DEFAULT_CSLS_FLOOR));
+    // Higher breadth => LARGER significance factor => the knee fires less
+    // readily => the floor-fallback (keep everything >= floor) wins more
+    // often => BROADER results. Factor 2 at each extreme, 1 at breadth 0.5.
+    cut.significanceFactor_ =
+        DEFAULT_CSLS_KNEE_SIGNIFICANCE * std::exp2(2.f * breadth - 1.f);
+    cut.maxKeep_ = DEFAULT_CSLS_KNEE_MAX_KEEP;
+  } else {
+    cut.mode_ = CslsCut::Mode::Softmax;
+    cut.temperature_ = config.softmaxTemperature_.value_or(
+        vidx.softmaxTemperatureDefault().value_or(
+            DEFAULT_CSLS_SOFTMAX_TEMPERATURE));
+    // Default softmaxN: a few times the neighbourhood scale r(q) uses (the
+    // effective `cslsNeighbors` -- the query override, else the build value).
+    const size_t neighbors =
+        config.cslsNeighbors_.value_or(vidx.cslsNeighbors());
+    cut.softmaxN_ = config.softmaxN_.value_or(vidx.softmaxNDefault().value_or(
+        std::max<size_t>(DEFAULT_CSLS_SOFTMAX_N_FACTOR * neighbors, 1)));
+    // Higher breadth => SMALLER alpha => a looser standout bar => BROADER
+    // results. Factor 2 at each extreme, 1 at breadth 0.5.
+    cut.alpha_ = DEFAULT_CSLS_SOFTMAX_ALPHA * std::exp2(1.f - 2.f * breadth);
+  }
+  return cut;
 }
 
 // ____________________________________________________________________________
@@ -78,7 +162,7 @@ IdTable computeWholeIndexSearch(
         "There is no loaded vector index named '", config.indexName_,
         "'. Was the index built with `--service-index`?")};
   }
-  if (config.cslsThreshold_.has_value()) {
+  if (config.hasCslsCut()) {
     validateCslsIsAvailable(config, *vidx);
   }
 
@@ -114,24 +198,25 @@ IdTable computeWholeIndexSearch(
   }
   auto checkInterrupt = [&handle]() { handle->throwIfCancelled(); };
 
-  if (config.cslsThreshold_.has_value()) {
-    // CSLS cut over the WHOLE index: every live vector is scored (one FULL
-    // scan on the fine layer of a single-layer index; a full COARSE scan plus
-    // a bounded, auto-widening fine rerank on a two-layer one -- see
-    // `searchCslsBytes`), then the query-adaptive `2*cos_sim - r(q) - r(d) >=
-    // tau` filter. `vec:bindScore` stays the (fine) cosine distance;
-    // survivors sort by it.
-    const float threshold = config.cslsThreshold_.value();
+  if (config.hasCslsCut()) {
+    // CSLS-machinery cut over the WHOLE index -- the fixed tau
+    // (`vec:cslsThreshold`) or a dynamic `vec:autoCut` (knee/softmax): every
+    // live vector is scored (one FULL scan on the fine layer of a
+    // single-layer index; a full COARSE scan plus a bounded, auto-widening
+    // fine rerank on a two-layer one -- see `searchCslsBytes`), then the
+    // resolved cut selects the survivors. `vec:bindScore` stays the (fine)
+    // cosine distance; survivors sort by it.
+    const CslsCut cut = resolveCslsCut(config, *vidx);
     const size_t neighbors =
         config.cslsNeighbors_.value_or(vidx->cslsNeighbors());
     ad_utility::Timer cslsTimer{ad_utility::Timer::Started};
     size_t numScored = 0;
     std::vector<CslsScoredEntity> hits =
         queryEntity.has_value()
-            ? vidx->searchCslsByEntity(
-                  queryEntity.value(), threshold, neighbors, std::nullopt,
-                  config.maxDistance_, checkInterrupt, &numScored)
-            : vidx->searchCsls(query, threshold, neighbors, std::nullopt,
+            ? vidx->searchCslsByEntity(queryEntity.value(), cut, neighbors,
+                                       std::nullopt, config.maxDistance_,
+                                       checkInterrupt, &numScored)
+            : vidx->searchCsls(query, cut, neighbors, std::nullopt,
                                config.maxDistance_, checkInterrupt, &numScored);
     const double ms = cslsTimer.value().count() / 1000.0;
     logVectorSearchPhase(config.indexName_,
@@ -361,16 +446,7 @@ std::string VectorSearch::getCacheKeyImpl() const {
         &key, " maxDist=",
         absl::Hex(absl::bit_cast<uint32_t>(config_.maxDistance_.value())));
   }
-  if (config_.cslsThreshold_.has_value()) {
-    absl::StrAppend(
-        &key, " cslsThreshold=",
-        absl::Hex(absl::bit_cast<uint32_t>(config_.cslsThreshold_.value())),
-        " csls=", config_.cslsVariable_.has_value(),
-        " cslsKCap=", config_.cslsKCap_.value_or(0));
-    if (config_.cslsNeighbors_.has_value()) {
-      absl::StrAppend(&key, " cslsNeighbors=", config_.cslsNeighbors_.value());
-    }
-  }
+  qlever::vector::appendCslsCutToCacheKey(&key, config_);
   qlever::vector::appendQueryPointToCacheKey(&key, config_);
   return key;
 }

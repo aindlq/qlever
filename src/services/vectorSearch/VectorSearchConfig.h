@@ -104,11 +104,54 @@ struct VectorSearchConfiguration {
   // Optional override of the index's persisted `cslsNeighbors` for the
   // query-side r(q) (`vec:cslsNeighbors`); unset = the index's build value.
   std::optional<size_t> cslsNeighbors_;
-  // With `cslsThreshold_`: the `vec:k` value iff it was EXPLICITLY given (a
-  // cap on the tau-survivors); unset = return ALL survivors (the variable
-  // cardinality that is the point of the cut). The non-csls paths keep using
-  // `k_` (with its default of 10).
+  // With `cslsThreshold_` or `autoCut_`: the `vec:k` value iff it was
+  // EXPLICITLY given (a cap on the cut's survivors); unset = return ALL
+  // survivors (the variable cardinality that is the point of the cut). The
+  // non-cut paths keep using `k_` (with its default of 10).
   std::optional<size_t> cslsKCap_;
+
+  // DYNAMIC result-selection cut (`vec:autoCut`, mutually exclusive with
+  // `vec:cslsThreshold`; like it, requires an index built with `csls: true`
+  // and a query point, and runs the same coarse-scan + bounded-fine-rerank
+  // machinery). The cut is decided from the RERANKED candidates' scores at
+  // query time instead of a fixed tau:
+  //  * CslsKnee (`vec:autoCut "csls"`): keep candidates with
+  //    `csls >= cslsFloor`, then look for a significant knee (the largest
+  //    consecutive gap) in their CSLS values and cut there; without a
+  //    significant knee keep everything `>= cslsFloor`. `vec:bindCsls` works.
+  //  * Softmax (`vec:autoCut "softmax"`): softmax the top-`softmaxN` fine
+  //    cosines at temperature `softmaxTemperature` and keep the standouts
+  //    (`p_i >= alpha / softmaxN`); a near-uniform distribution keeps NOTHING
+  //    (the no-match rejection). CSLS values are not defined for this mode
+  //    (`vec:bindCsls` is rejected at parse time).
+  // See `qlever::vector::CslsCut` (VectorIndex.h) for the resolved cut and
+  // `resolveCslsCut` (VectorSearch.h) for the parameter resolution
+  // (query param -> per-index serving default -> constant default).
+  enum class AutoCutMode { CslsKnee, Softmax };
+  std::optional<AutoCutMode> autoCut_;
+  // Knee only: the CSLS floor below which candidates never survive
+  // (`vec:cslsFloor`; also the bound of the two-layer rerank widening,
+  // exactly like a fixed tau). Unset = per-index default, then 0.0.
+  std::optional<float> cslsFloor_;
+  // Softmax only: the temperature T of `p_i = softmax(cos_i / T)`
+  // (`vec:softmaxTemperature`). Unset = per-index default, then 0.1.
+  std::optional<float> softmaxTemperature_;
+  // Softmax only: how many of the best (fine-cosine) candidates enter the
+  // softmax (`vec:softmaxN`). Unset = per-index default, then
+  // `5 * cslsNeighbors`.
+  std::optional<size_t> softmaxN_;
+  // Both autoCut modes: the precise (0.0) <-> broad (1.0) dial
+  // (`vec:breadth`; 0.5 = the defaults). Higher breadth keeps more results:
+  // for the knee it RAISES the significance factor (the knee fires less
+  // readily, falling back to "everything >= cslsFloor" more often); for the
+  // softmax it LOWERS alpha (a looser standout bar). See `resolveCslsCut`.
+  std::optional<float> breadth_;
+
+  // True iff a CSLS-machinery cut is requested (the fixed tau or a dynamic
+  // autoCut) -- they share all engine plumbing.
+  bool hasCslsCut() const {
+    return cslsThreshold_.has_value() || autoCut_.has_value();
+  }
 
   // Optional algorithm override: force exact or approximate search. If unset,
   // the index decides (HNSW if available, else exact).

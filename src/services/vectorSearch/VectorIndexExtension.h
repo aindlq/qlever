@@ -9,8 +9,10 @@
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_VECTORINDEXEXTENSION_H
 
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -153,13 +155,18 @@ inline std::optional<std::string> indexNameFromMetadataIri(
 // "preload", and "preloadRerank" (strings; the latter two each
 // "none"|"advise"|"lock"|"aligned") plus "cslsRerankFloor" (a positive
 // integer -- the fine-rerank batch size of the two-layer CSLS cut, see
-// `VectorIndex::cslsRerankFloor()`), e.g.
+// `VectorIndex::cslsRerankFloor()`) and the per-index DEFAULTS of the
+// dynamic `vec:autoCut` cuts (numbers; used when the query does not override
+// them, see `resolveCslsCut`): "cslsFloor" (finite), "softmaxTemperature"
+// (positive finite), "softmaxN" (a positive integer), "breadth" (in [0, 1]).
+// E.g.
 //   QLEVER_VECTOR_SEARCH_ENDPOINTS='{
 //     "images":   {"embeddingUrl": "unix:/siglip2.private",
-//                  "embeddingModel": "siglip"},
+//                  "embeddingModel": "siglip",
+//                  "softmaxTemperature": 0.05, "breadth": 0.7},
 //     "metadata": {"embeddingUrl": "unix:/qwen3.private",
 //                  "preload": "lock", "preloadRerank": "none",
-//                  "cslsRerankFloor": 20000}}'
+//                  "cslsRerankFloor": 20000, "cslsFloor": -0.1}}'
 // Only the fields present are set. The load hook applies them IN MEMORY; the
 // on-disk `.meta` is never touched. The endpoint fields and the rerank floor
 // mutate the already-opened index; "preload" (the SCAN matrix) and
@@ -174,16 +181,32 @@ inline constexpr const char* VECTOR_SEARCH_ENDPOINTS_ENV_VAR =
 
 // One per-index override parsed from the environment variable above; an absent
 // field leaves the corresponding default in place (empty endpoint, `None`
-// residency, `DEFAULT_CSLS_RERANK_FLOOR`). `preload_` (the scan matrix) and
-// `preloadRerank_` (the rerank matrix) are each validated to be one of
-// "none"|"advise"|"lock"|"aligned" and select the per-layer RAM residency at
-// `open` time; `cslsRerankFloor_` is validated to be a positive integer.
+// residency, `DEFAULT_CSLS_RERANK_FLOOR`, the `DEFAULT_CSLS_*` autoCut
+// constants). `preload_` (the scan matrix) and `preloadRerank_` (the rerank
+// matrix) are each validated to be one of "none"|"advise"|"lock"|"aligned"
+// and select the per-layer RAM residency at `open` time; `cslsRerankFloor_`
+// and `softmaxN_` are validated to be positive integers, `cslsFloor_` to be
+// finite, `softmaxTemperature_` to be positive and finite, and `breadth_` to
+// be in [0, 1].
 struct EmbeddingEndpointOverride {
   std::optional<std::string> embeddingUrl_;
   std::optional<std::string> embeddingModel_;
   std::optional<std::string> preload_;
   std::optional<std::string> preloadRerank_;
   std::optional<size_t> cslsRerankFloor_;
+  // Per-index serving DEFAULTS of the dynamic `vec:autoCut` cuts.
+  std::optional<float> cslsFloor_;
+  std::optional<float> softmaxTemperature_;
+  std::optional<size_t> softmaxN_;
+  std::optional<float> breadth_;
+
+  bool empty() const {
+    return !embeddingUrl_.has_value() && !embeddingModel_.has_value() &&
+           !preload_.has_value() && !preloadRerank_.has_value() &&
+           !cslsRerankFloor_.has_value() && !cslsFloor_.has_value() &&
+           !softmaxTemperature_.has_value() && !softmaxN_.has_value() &&
+           !breadth_.has_value();
+  }
 };
 using EmbeddingEndpointOverrides =
     ad_utility::HashMap<std::string, EmbeddingEndpointOverride>;
@@ -221,7 +244,8 @@ inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
                   << " entry for vector index '" << name
                   << "': expected an object with the optional keys "
                      "\"embeddingUrl\", \"embeddingModel\", \"preload\", "
-                     "\"preloadRerank\", and \"cslsRerankFloor\"."
+                     "\"preloadRerank\", \"cslsRerankFloor\", \"cslsFloor\", "
+                     "\"softmaxTemperature\", \"softmaxN\", and \"breadth\"."
                   << std::endl;
       continue;
     }
@@ -256,44 +280,74 @@ inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
         (key == "preload" ? endpointOverride.preload_
                           : endpointOverride.preloadRerank_) =
             std::move(preload);
-      } else if (key == "cslsRerankFloor") {
-        // The fine-rerank batch size of the two-layer CSLS cut; must be a
-        // positive JSON integer (0 would stall the rerank loop).
+      } else if (key == "cslsRerankFloor" || key == "softmaxN") {
+        // The fine-rerank batch size of the two-layer CSLS cut, and the
+        // softmax pool-size default of `vec:autoCut "softmax"`; each must be
+        // a positive JSON integer (0 would stall the rerank loop / make the
+        // softmax empty).
         if (!field.is_number_unsigned() || field.get<uint64_t>() == 0) {
           AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
-                      << " entry for vector index '" << name
-                      << "': \"cslsRerankFloor\" must be a positive integer "
-                         "(got "
-                      << field.dump() << ")." << std::endl;
+                      << " entry for vector index '" << name << "': \"" << key
+                      << "\" must be a positive integer (got " << field.dump()
+                      << ")." << std::endl;
           ok = false;
           break;
         }
-        endpointOverride.cslsRerankFloor_ =
+        (key == "cslsRerankFloor" ? endpointOverride.cslsRerankFloor_
+                                  : endpointOverride.softmaxN_) =
             static_cast<size_t>(field.get<uint64_t>());
+      } else if (key == "cslsFloor" || key == "softmaxTemperature" ||
+                 key == "breadth") {
+        // Per-index defaults of the dynamic `vec:autoCut` cuts: the knee
+        // floor (any finite number), the softmax temperature (positive), and
+        // the breadth dial (in [0, 1]).
+        const double v = field.is_number()
+                             ? field.get<double>()
+                             : std::numeric_limits<double>::quiet_NaN();
+        const float f = static_cast<float>(v);
+        const bool valid = key == "cslsFloor" ? std::isfinite(f)
+                           : key == "softmaxTemperature"
+                               ? std::isfinite(f) && f > 0.f
+                               : f >= 0.f && f <= 1.f;
+        if (!valid) {
+          AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                      << " entry for vector index '" << name << "': \"" << key
+                      << "\" must be "
+                      << (key == "cslsFloor" ? "a finite number"
+                          : key == "softmaxTemperature"
+                              ? "a positive finite number"
+                              : "a number between 0 and 1")
+                      << " (got " << field.dump() << ")." << std::endl;
+          ok = false;
+          break;
+        }
+        (key == "cslsFloor"            ? endpointOverride.cslsFloor_
+         : key == "softmaxTemperature" ? endpointOverride.softmaxTemperature_
+                                       : endpointOverride.breadth_) = f;
       } else {
         AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
                     << " entry for vector index '" << name << "': the key \""
                     << key
                     << "\" is unknown or has the wrong type (known keys: "
                        "\"embeddingUrl\", \"embeddingModel\", \"preload\", "
-                       "\"preloadRerank\" -- strings -- and "
-                       "\"cslsRerankFloor\" -- a positive integer)."
+                       "\"preloadRerank\" -- strings -- "
+                       "\"cslsRerankFloor\" and \"softmaxN\" -- positive "
+                       "integers -- and \"cslsFloor\", "
+                       "\"softmaxTemperature\", \"breadth\" -- numbers)."
                     << std::endl;
         ok = false;
         break;
       }
     }
-    if (!endpointOverride.embeddingUrl_.has_value() &&
-        !endpointOverride.embeddingModel_.has_value() &&
-        !endpointOverride.preload_.has_value() &&
-        !endpointOverride.preloadRerank_.has_value() &&
-        !endpointOverride.cslsRerankFloor_.has_value()) {
+    if (endpointOverride.empty()) {
       if (ok) {
         AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
                     << " entry for vector index '" << name
                     << "': it overrides none of \"embeddingUrl\", "
                        "\"embeddingModel\", \"preload\", \"preloadRerank\", "
-                       "and \"cslsRerankFloor\"."
+                       "\"cslsRerankFloor\", \"cslsFloor\", "
+                       "\"softmaxTemperature\", \"softmaxN\", and "
+                       "\"breadth\"."
                     << std::endl;
       }
       continue;

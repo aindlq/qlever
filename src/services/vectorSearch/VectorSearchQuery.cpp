@@ -166,6 +166,81 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
     cslsThreshold_ = static_cast<float>(value.value());
   } else if (pred == "bindCsls") {
     setVariable("bindCsls", object, cslsVar_);
+  } else if (pred == "autoCut") {
+    using AutoCutMode = qlever::vector::VectorSearchConfiguration::AutoCutMode;
+    std::string mode = requireLiteral();
+    if (mode == "csls") {
+      autoCut_ = AutoCutMode::CslsKnee;
+    } else if (mode == "softmax") {
+      autoCut_ = AutoCutMode::Softmax;
+    } else {
+      throw VectorSearchException{absl::StrCat(
+          "The parameter `<autoCut>` expects \"csls\" (the CSLS knee cut) or "
+          "\"softmax\" (the softmax-confidence cut), but got \"",
+          mode, "\".")};
+    }
+  } else if (pred == "cslsFloor") {
+    std::optional<double> value;
+    if (object.isInt()) {
+      value = static_cast<double>(object.getInt());
+    } else if (object.isDouble()) {
+      value = object.getDouble();
+    }
+    if (!value.has_value() || !std::isfinite(value.value())) {
+      throw VectorSearchException{
+          "The parameter `<cslsFloor>` expects a finite number (the CSLS "
+          "value below which candidates never survive the `<autoCut> "
+          "\"csls\"` knee cut; default 0, negative values keep more)."};
+    }
+    cslsFloor_ = static_cast<float>(value.value());
+  } else if (pred == "softmaxTemperature") {
+    std::optional<double> value;
+    if (object.isInt()) {
+      value = static_cast<double>(object.getInt());
+    } else if (object.isDouble()) {
+      value = object.getDouble();
+    }
+    if (!value.has_value() || !std::isfinite(value.value()) ||
+        value.value() <= 0.0) {
+      throw VectorSearchException{
+          "The parameter `<softmaxTemperature>` expects a positive finite "
+          "number (the T of the `<autoCut> \"softmax\"` cut's "
+          "`softmax(cos / T)`; default 0.1, smaller = peakier)."};
+    }
+    softmaxTemperature_ = static_cast<float>(value.value());
+  } else if (pred == "softmaxN") {
+    if (!object.isInt() || object.getInt() <= 0) {
+      throw VectorSearchException{
+          "The parameter `<softmaxN>` expects a positive integer (how many "
+          "of the best candidates enter the `<autoCut> \"softmax\"` cut; "
+          "default `5 * cslsNeighbors`)."};
+    }
+    softmaxN_ = static_cast<size_t>(object.getInt());
+  } else if (pred == "breadth") {
+    // A number in [0, 1], or one of the presets.
+    std::optional<double> value;
+    if (object.isInt()) {
+      value = static_cast<double>(object.getInt());
+    } else if (object.isDouble()) {
+      value = object.getDouble();
+    } else if (object.isLiteral()) {
+      std::string_view preset =
+          asStringViewUnsafe(object.getLiteral().getContent());
+      if (preset == "precise") {
+        value = 0.0;
+      } else if (preset == "balanced") {
+        value = 0.5;
+      } else if (preset == "broad") {
+        value = 1.0;
+      }
+    }
+    if (!value.has_value() || !(value.value() >= 0.0 && value.value() <= 1.0)) {
+      throw VectorSearchException{
+          "The parameter `<breadth>` expects a number between 0 (precise) "
+          "and 1 (broad), or one of \"precise\", \"balanced\", \"broad\" "
+          "(default 0.5 = \"balanced\")."};
+    }
+    breadth_ = static_cast<float>(value.value());
   } else if (pred == "cslsNeighbors") {
     if (!object.isInt() || object.getInt() <= 0) {
       throw VectorSearchException{
@@ -200,7 +275,8 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
         "`<candidates>` (alias `<left>`), `<result>`/`<right>`, "
         "`<bindScore>`, `<bindCoarseScore>`, `<bindCsls>`, `<k>` (alias "
         "`<numNearestNeighbors>`), `<rerankK>`, `<maxDistance>`, "
-        "`<cslsThreshold>`, `<cslsNeighbors>`, `<algorithm>`.")};
+        "`<cslsThreshold>`, `<cslsNeighbors>`, `<autoCut>`, `<cslsFloor>`, "
+        "`<softmaxTemperature>`, `<softmaxN>`, `<breadth>`, `<algorithm>`.")};
   }
 }
 
@@ -277,37 +353,61 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
             "not supported in the entity-to-entity `<candidates>` form "
             "(no query point).");
   }
-  // The CSLS cut: needs a fixed query point (FORM W / FORM P; it is
-  // meaningless per-candidate in FORM E), and it scores EVERY candidate (a
-  // full scan -- of the fine layer on a single-layer index, of the coarse
-  // scan layer with a bounded fine rerank on a two-layer one), so the
-  // top-k-style coarse-pass parameters and the HNSW override contradict it.
-  throwIf(cslsThreshold_.has_value() && numQueryPoints == 0,
-          "The `<cslsThreshold>` parameter requires a query point "
+  // The CSLS-machinery cuts -- the fixed `<cslsThreshold>` and the dynamic
+  // `<autoCut>` (mutually exclusive): each needs a fixed query point (FORM W
+  // / FORM P; they are meaningless per-candidate in FORM E), and each scores
+  // EVERY candidate (a full scan -- of the fine layer on a single-layer
+  // index, of the coarse scan layer with a bounded fine rerank on a
+  // two-layer one), so the top-k-style coarse-pass parameters and the HNSW
+  // override contradict them.
+  using AutoCutMode = qlever::vector::VectorSearchConfiguration::AutoCutMode;
+  const bool hasCslsCut = cslsThreshold_.has_value() || autoCut_.has_value();
+  throwIf(cslsThreshold_.has_value() && autoCut_.has_value(),
+          "The `<cslsThreshold>` (fixed CSLS cut) and `<autoCut>` (dynamic "
+          "cut) parameters are mutually exclusive; use at most one of them.");
+  throwIf(hasCslsCut && numQueryPoints == 0,
+          "A `<cslsThreshold>`/`<autoCut>` cut requires a query point "
           "(`<queryVector>`, `<query>`, `<queryText>`, or "
           "`<imageUrl>`/`<imageBase64>`); it is not supported in the "
           "entity-to-entity `<candidates>` form (no query point).");
   throwIf(
-      cslsThreshold_.has_value() &&
+      hasCslsCut &&
           algo_ == qlever::vector::VectorSearchConfiguration::Algorithm::Hnsw,
-      "The `<cslsThreshold>` cut scores EVERY candidate (a full scan of "
-      "the fine or coarse layer), so it cannot be combined with "
+      "The `<cslsThreshold>`/`<autoCut>` cuts score EVERY candidate (a full "
+      "scan of the fine or coarse layer), so they cannot be combined with "
       "`<algorithm>` `vectorSearch:hnsw`.");
-  throwIf(cslsThreshold_.has_value() && coarseScoreVar_.has_value(),
-          "The `<cslsThreshold>` cut does not expose coarse distances: on a "
-          "two-layer index the coarse scan only preselects the fine rerank "
-          "set (every returned score is a fine-layer cosine), so "
-          "`<bindCoarseScore>` cannot be combined with it.");
-  throwIf(cslsThreshold_.has_value() && rerankK_.has_value(),
-          "The `<cslsThreshold>` cut sizes its own fine rerank (the per-index "
-          "`cslsRerankFloor` serving setting, widened automatically while the "
-          "cut reaches the coarse boundary), so `<rerankK>` cannot be "
-          "combined with it.");
-  throwIf(cslsVar_.has_value() && !cslsThreshold_.has_value(),
-          "The `<bindCsls>` parameter requires `<cslsThreshold>` (the CSLS "
-          "value is only computed for the CSLS cut).");
-  throwIf(cslsNeighbors_.has_value() && !cslsThreshold_.has_value(),
-          "The `<cslsNeighbors>` parameter requires `<cslsThreshold>`.");
+  throwIf(hasCslsCut && coarseScoreVar_.has_value(),
+          "The `<cslsThreshold>`/`<autoCut>` cuts do not expose coarse "
+          "distances: on a two-layer index the coarse scan only preselects "
+          "the fine rerank set (every returned score is a fine-layer "
+          "cosine), so `<bindCoarseScore>` cannot be combined with them.");
+  throwIf(hasCslsCut && rerankK_.has_value(),
+          "The `<cslsThreshold>`/`<autoCut>` cuts size their own fine rerank "
+          "(the per-index `cslsRerankFloor` serving setting, widened "
+          "automatically as needed), so `<rerankK>` cannot be combined with "
+          "them.");
+  // The per-mode knobs are only valid with their mode.
+  throwIf(cslsFloor_.has_value() && autoCut_ != AutoCutMode::CslsKnee,
+          "The `<cslsFloor>` parameter requires `<autoCut> \"csls\"` (the "
+          "knee cut's floor; the fixed cut's bound is `<cslsThreshold>` "
+          "itself).");
+  throwIf(softmaxTemperature_.has_value() && autoCut_ != AutoCutMode::Softmax,
+          "The `<softmaxTemperature>` parameter requires `<autoCut> "
+          "\"softmax\"`.");
+  throwIf(softmaxN_.has_value() && autoCut_ != AutoCutMode::Softmax,
+          "The `<softmaxN>` parameter requires `<autoCut> \"softmax\"`.");
+  throwIf(breadth_.has_value() && !autoCut_.has_value(),
+          "The `<breadth>` parameter requires `<autoCut>` (it tunes the "
+          "dynamic cuts; the fixed `<cslsThreshold>` IS the precision dial "
+          "of the fixed cut).");
+  throwIf(cslsVar_.has_value() && !cslsThreshold_.has_value() &&
+              autoCut_ != AutoCutMode::CslsKnee,
+          "The `<bindCsls>` parameter requires `<cslsThreshold>` or "
+          "`<autoCut> \"csls\"` (the CSLS value is only computed for the "
+          "CSLS cuts; the softmax cut defines none).");
+  throwIf(cslsNeighbors_.has_value() && !hasCslsCut,
+          "The `<cslsNeighbors>` parameter requires `<cslsThreshold>` or "
+          "`<autoCut>`.");
   throwIf(cslsVar_.has_value() && cslsVar_ == resultVar_,
           "The `<bindCsls>` and `<result>` variables of a vector search must "
           "be different.");
@@ -355,10 +455,15 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   config.cslsThreshold_ = cslsThreshold_;
   config.cslsVariable_ = cslsVar_;
   config.cslsNeighbors_ = cslsNeighbors_;
-  // With the CSLS cut, an EXPLICIT `<k>` caps the survivors; without one ALL
-  // survivors are returned (variable cardinality -- the point of the cut).
-  config.cslsKCap_ =
-      cslsThreshold_.has_value() && k_.has_value() ? k_ : std::nullopt;
+  config.autoCut_ = autoCut_;
+  config.cslsFloor_ = cslsFloor_;
+  config.softmaxTemperature_ = softmaxTemperature_;
+  config.softmaxN_ = softmaxN_;
+  config.breadth_ = breadth_;
+  // With a CSLS-machinery cut (fixed or dynamic), an EXPLICIT `<k>` caps the
+  // survivors; without one ALL survivors are returned (variable cardinality
+  // -- the point of the cuts).
+  config.cslsKCap_ = hasCslsCut && k_.has_value() ? k_ : std::nullopt;
   config.algorithm_ = algo_;
   return config;
 }
