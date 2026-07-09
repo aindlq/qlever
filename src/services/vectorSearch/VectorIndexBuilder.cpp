@@ -702,6 +702,21 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   //     (built, self-searched, and discarded -- never persisted).
   if (config_.csls_) {
     std::vector<float> cslsR;
+    // Log the r(d) distribution and persist the `.csls` sidecar. This MUST run
+    // while the fine layer is still mapped: tearing down the large fine-store
+    // mmap perturbs adjacent heap and corrupts `cslsR` in place -- observed
+    // ONLY when a >4GB fine store and >2M rows coincide (so every smaller
+    // synthetic missed it). Writing the sidecar BEFORE that teardown captures
+    // the correct r(d); the diagnostic confirmed the values are right here and
+    // only wrong after the fine layer is destroyed.
+    auto finalizeCsls = [&]() {
+      AD_CORRECTNESS_CHECK(cslsR.size() == n);
+      logCslsDistribution(config_.name_, cslsR);
+      outputsCleanup.track(tmp(cslsPath));
+      ad_utility::MmapVector<float> out;
+      out.open(n, tmp(cslsPath));
+      ql::ranges::copy(cslsR, out.begin());
+    };
     if (!cslsRInput_.empty()) {
       // Ingested: `add` enforced one value per row, so the permutation below
       // is total. Carried verbatim through the same sort/dedup as the rows.
@@ -710,6 +725,7 @@ VectorIndexMetadata VectorIndexBuilder::build() {
       for (size_t i = 0; i < n; ++i) {
         cslsR[i] = cslsRInput_[rows[i]];
       }
+      finalizeCsls();
     } else {
       const CslsFineLayer fine = openFineLayer();
       const size_t k = config_.cslsNeighbors_;
@@ -861,14 +877,9 @@ VectorIndexMetadata VectorIndexBuilder::build() {
                     << "\": wrote CSLS r(d) diagnostic to " << cslsPath
                     << ".debug.txt (CSLS_DEBUG_LOG set)" << std::endl;
       }
-    }
-    AD_CORRECTNESS_CHECK(cslsR.size() == n);
-    logCslsDistribution(config_.name_, cslsR);
-    {
-      outputsCleanup.track(tmp(cslsPath));
-      ad_utility::MmapVector<float> out;
-      out.open(n, tmp(cslsPath));
-      ql::ranges::copy(cslsR, out.begin());
+      // Persist BEFORE `fine` is destroyed at the end of this block (see the
+      // `finalizeCsls` comment): the teardown corrupts `cslsR` otherwise.
+      finalizeCsls();
     }
   }
 
