@@ -307,8 +307,7 @@ TEST(VectorPerf, DISABLED_wholeIndexScanBenchmark) {
     auto [mn, md] = timeReps(s.reps, [&] {
       idx.searchExactCoarse(s.query, k, ql::span<const Id>{allIds});
     });
-    report("coarse covering-candidates, maxT", s.n, s.coarseRowBytes(), mn,
-           md);
+    report("coarse covering-candidates, maxT", s.n, s.coarseRowBytes(), mn, md);
     printf("    marshalling overhead vs bare sweep: %+.2f ms\n",
            mn - coarseMaxT);
   }
@@ -443,4 +442,159 @@ TEST(VectorPerf, DISABLED_profileLoop) {
   const size_t rowBytes = fine ? s.fineRowBytes() : s.coarseRowBytes();
   report("profileLoop steady state", s.n, rowBytes, msPerScan, msPerScan);
   printf("[profileLoop] %zu scans in %.1f s\n", iters, elapsed);
+}
+
+// ___________________________________________________________________________
+// Round-2 benchmark: the CSLS coarse sweep, the softmax cut, the large-rerank
+// gather, and -- the key puzzle -- the covering fast path with a candidate
+// span that is a large SUPERSET of the live set (extras = non-members), which
+// the Round-1 exact-cover benchmark did not exercise.
+TEST(VectorPerf, DISABLED_scanPathsBenchmark) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  BenchSetup s = setupIndex();
+  const int maxT = maxHwThreads();
+  // The production box caps at 8 threads; measure at that too.
+  const int prodT = std::min(8, maxT);
+
+  VectorIndex idx;
+  idx.open(s.basename, "perf");
+  setThreads(maxT);
+  (void)idx.searchExactCoarse(s.query, 500);  // warm everything in
+
+  // The live members (ascending Id == mkId(100..100+n-1)).
+  std::vector<Id> allIds(idx.numLiveVectors());
+  idx.memberEntities(allIds);
+  ASSERT_EQ(allIds.size(), s.n);
+
+  // A SUPERSET covering candidate set: every live id + ~1M non-member ids
+  // (mkId(100+n ..), which are valid VocabIndex ids absent from the index).
+  // Already ascending (members are 100..100+n-1, extras follow), so the fast
+  // path's coverage check sees a sorted span.
+  const size_t extras = s.n / 2;  // 2.14M live -> ~3.21M candidates
+  std::vector<Id> superset;
+  superset.reserve(s.n + extras);
+  superset.insert(superset.end(), allIds.begin(), allIds.end());
+  for (size_t i = 0; i < extras; ++i) {
+    superset.push_back(mkId(100 + s.n + i));
+  }
+
+  printf("\n=== VectorPerf scan paths: n=%zu extras=%zu maxT=%d prodT=%d ===\n",
+         s.n, extras, maxT, prodT);
+
+  for (int t : {prodT, maxT}) {
+    setThreads(t);
+    printf("\n--- %d threads ---\n", t);
+    // (a) plain whole-index coarse (no candidates) -- the pure sweep.
+    auto [swMn, swMd] =
+        timeReps(s.reps, [&] { idx.searchExactCoarse(s.query, 500); });
+    report("plain coarse sweep (no candidates)", s.n, s.coarseRowBytes(), swMn,
+           swMd);
+    // (a2) plain coarse sweep selecting a LARGE k (a rerank-floor sized top-M):
+    // exposes the O(threads x k) heap-merge cost of a big selection.
+    auto [sw2Mn, sw2Md] =
+        timeReps(s.reps, [&] { idx.searchExactCoarse(s.query, 10000); });
+    report("plain coarse sweep k=10000", s.n, s.coarseRowBytes(), sw2Mn, sw2Md);
+    // (b) exact 2.14M covering candidates -> coverage(n) + sweep.
+    auto [exMn, exMd] = timeReps(s.reps, [&] {
+      idx.searchExactCoarse(s.query, 500, ql::span<const Id>{allIds});
+    });
+    report("coarse, exact-cover candidates (=n)", s.n, s.coarseRowBytes(), exMn,
+           exMd);
+    printf("    coverage-check(%zu) cost ~= %+.2f ms\n", allIds.size(),
+           exMn - swMn);
+    // (c) 3.1M SUPERSET covering candidates -> coverage(m>n) + sweep.
+    auto [suMn, suMd] = timeReps(s.reps, [&] {
+      idx.searchExactCoarse(s.query, 500, ql::span<const Id>{superset});
+    });
+    report("coarse, SUPERSET candidates (1.5n)", s.n, s.coarseRowBytes(), suMn,
+           suMd);
+    printf("    coverage-check(%zu) cost ~= %+.2f ms\n", superset.size(),
+           suMn - swMn);
+  }
+
+  // -------------------------------------------------------------------
+  // CSLS softmax cut (no sidecar needed): the whole hot pipeline of query B
+  // -- full coarse sweep of every live row + a bounded fine rerank. softmaxN
+  // ~ the production rerank width.
+  printf("\n--- CSLS softmax cut (coarse sweep + bounded rerank) ---\n");
+  CslsCut softmax;
+  softmax.mode_ = CslsCut::Mode::Softmax;
+  softmax.softmaxN_ = 1000;
+  for (int t : {prodT, maxT}) {
+    setThreads(t);
+    auto [mn, md] = timeReps(s.reps, [&] {
+      size_t scored = 0;
+      idx.searchCsls(s.query, softmax, 10, std::nullopt, std::nullopt, {},
+                     &scored);
+    });
+    char label[64];
+    snprintf(label, sizeof label, "CSLS softmax whole-index, %2d thr", t);
+    report(label, s.n, s.coarseRowBytes(), mn, md);
+    auto [cmn, cmd] = timeReps(s.reps, [&] {
+      idx.searchCsls(s.query, softmax, 10, ql::span<const Id>{superset},
+                     std::nullopt, {});
+    });
+    snprintf(label, sizeof label, "CSLS softmax SUPERSET cand, %2d thr", t);
+    report(label, s.n, s.coarseRowBytes(), cmn, cmd);
+  }
+
+  // -------------------------------------------------------------------
+  // Large-rerank scattered gather over the FINE layer (query C's 50k rerank).
+  printf("\n--- fine-layer scattered gather (50k candidates) ---\n");
+  std::vector<Id> gather50k;
+  gather50k.reserve(50000);
+  for (size_t i = 0; i < 50000; ++i) {
+    gather50k.push_back(allIds[(i * 41) % allIds.size()]);
+  }
+  std::sort(gather50k.begin(), gather50k.end());
+  gather50k.erase(std::unique(gather50k.begin(), gather50k.end()),
+                  gather50k.end());
+  for (int t : {prodT, maxT}) {
+    setThreads(t);
+    auto [mn, md] = timeReps(s.reps, [&] {
+      idx.searchExact(s.query, 1000, ql::span<const Id>{gather50k});
+    });
+    char label[64];
+    snprintf(label, sizeof label, "fine gather %zu cand, %2d thr",
+             gather50k.size(), t);
+    report(label, gather50k.size(), s.fineRowBytes(), mn, md);
+  }
+
+  // -------------------------------------------------------------------
+  // Correctness. (1) The SUPERSET covering fast path returns exactly the
+  // plain whole-index top-k (no false negatives that would change results,
+  // no false positives that would score a non-member).
+  {
+    setThreads(maxT);
+    auto plain = idx.searchExactCoarse(s.query, 500);
+    auto viaSuper =
+        idx.searchExactCoarse(s.query, 500, ql::span<const Id>{superset});
+    ASSERT_EQ(plain.size(), viaSuper.size());
+    for (size_t i = 0; i < plain.size(); ++i) {
+      EXPECT_EQ(plain[i].distance_, viaSuper[i].distance_) << i;
+    }
+  }
+  // (2) CSLS softmax survivors are thread-count invariant (the coarse sweep
+  // fills a per-index array, so 1 vs N threads must be bit-identical).
+  {
+    setThreads(1);
+    auto serial = idx.searchCsls(s.query, softmax, 10);
+    setThreads(maxT);
+    auto parallel = idx.searchCsls(s.query, softmax, 10);
+    ASSERT_EQ(serial.size(), parallel.size());
+    for (size_t i = 0; i < serial.size(); ++i) {
+      EXPECT_EQ(serial[i].entity_, parallel[i].entity_) << i;
+      EXPECT_EQ(serial[i].distance_, parallel[i].distance_) << i;
+    }
+    // And covering-candidates CSLS == whole-index CSLS.
+    setThreads(maxT);
+    auto viaCand =
+        idx.searchCsls(s.query, softmax, 10, ql::span<const Id>{superset});
+    ASSERT_EQ(parallel.size(), viaCand.size());
+    for (size_t i = 0; i < parallel.size(); ++i) {
+      EXPECT_EQ(parallel[i].entity_, viaCand[i].entity_) << i;
+      EXPECT_EQ(parallel[i].distance_, viaCand[i].distance_) << i;
+    }
+  }
+  printf("\n[done] scan-paths correctness checks passed\n");
 }
