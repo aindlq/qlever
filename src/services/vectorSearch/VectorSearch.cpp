@@ -115,10 +115,12 @@ IdTable computeWholeIndexSearch(
   auto checkInterrupt = [&handle]() { handle->throwIfCancelled(); };
 
   if (config.cslsThreshold_.has_value()) {
-    // CSLS cut over the WHOLE index: one FULL scan on the fine layer (CSLS
-    // needs every candidate's cosine, so the coarse/HNSW layer is not used),
-    // then the query-adaptive `2*cos_sim - r(q) - r(d) >= tau` filter.
-    // `vec:bindScore` stays the cosine distance; survivors sort by it.
+    // CSLS cut over the WHOLE index: every live vector is scored (one FULL
+    // scan on the fine layer of a single-layer index; a full COARSE scan plus
+    // a bounded, auto-widening fine rerank on a two-layer one -- see
+    // `searchCslsBytes`), then the query-adaptive `2*cos_sim - r(q) - r(d) >=
+    // tau` filter. `vec:bindScore` stays the (fine) cosine distance;
+    // survivors sort by it.
     const float threshold = config.cslsThreshold_.value();
     const size_t neighbors =
         config.cslsNeighbors_.value_or(vidx->cslsNeighbors());
@@ -133,8 +135,10 @@ IdTable computeWholeIndexSearch(
                                config.maxDistance_, checkInterrupt, &numScored);
     const double ms = cslsTimer.value().count() / 1000.0;
     logVectorSearchPhase(config.indexName_,
-                         "full fine scan (csls; coarse layer unused)", ms,
-                         numScored);
+                         vidx->hasRerankLayer()
+                             ? "coarse scan + rerank (csls)"
+                             : "full fine scan (csls; coarse layer unused)",
+                         ms, numScored);
     logVectorSearchPhase(config.indexName_,
                          absl::StrCat("csls filter: ", numScored,
                                       " candidates -> ", hits.size(), " kept"),

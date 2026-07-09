@@ -278,8 +278,10 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
             "(no query point).");
   }
   // The CSLS cut: needs a fixed query point (FORM W / FORM P; it is
-  // meaningless per-candidate in FORM E), and it is a FULL fine-layer scan,
-  // so the coarse-pass parameters and the HNSW override contradict it.
+  // meaningless per-candidate in FORM E), and it scores EVERY candidate (a
+  // full scan -- of the fine layer on a single-layer index, of the coarse
+  // scan layer with a bounded fine rerank on a two-layer one), so the
+  // top-k-style coarse-pass parameters and the HNSW override contradict it.
   throwIf(cslsThreshold_.has_value() && numQueryPoints == 0,
           "The `<cslsThreshold>` parameter requires a query point "
           "(`<queryVector>`, `<query>`, `<queryText>`, or "
@@ -288,17 +290,19 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   throwIf(
       cslsThreshold_.has_value() &&
           algo_ == qlever::vector::VectorSearchConfiguration::Algorithm::Hnsw,
-      "The `<cslsThreshold>` cut computes every candidate's cosine on "
-      "the fine layer (a full scan), so it cannot be combined with "
+      "The `<cslsThreshold>` cut scores EVERY candidate (a full scan of "
+      "the fine or coarse layer), so it cannot be combined with "
       "`<algorithm>` `vectorSearch:hnsw`.");
   throwIf(cslsThreshold_.has_value() && coarseScoreVar_.has_value(),
-          "The `<cslsThreshold>` cut is a full fine-layer scan; the coarse "
-          "scan layer is not used, so `<bindCoarseScore>` cannot be combined "
-          "with it.");
+          "The `<cslsThreshold>` cut does not expose coarse distances: on a "
+          "two-layer index the coarse scan only preselects the fine rerank "
+          "set (every returned score is a fine-layer cosine), so "
+          "`<bindCoarseScore>` cannot be combined with it.");
   throwIf(cslsThreshold_.has_value() && rerankK_.has_value(),
-          "The `<cslsThreshold>` cut is a full fine-layer scan; there is no "
-          "coarse candidate pass, so `<rerankK>` cannot be combined with "
-          "it.");
+          "The `<cslsThreshold>` cut sizes its own fine rerank (the per-index "
+          "`cslsRerankFloor` serving setting, widened automatically while the "
+          "cut reaches the coarse boundary), so `<rerankK>` cannot be "
+          "combined with it.");
   throwIf(cslsVar_.has_value() && !cslsThreshold_.has_value(),
           "The `<bindCsls>` parameter requires `<cslsThreshold>` (the CSLS "
           "value is only computed for the CSLS cut).");

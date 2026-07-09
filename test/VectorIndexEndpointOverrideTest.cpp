@@ -153,6 +153,54 @@ TEST(VectorIndexEndpointOverride, parseInvalidPreloadSkipsWholeEntry) {
 }
 
 // _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, parseCslsRerankFloorOverride) {
+  // A positive integer parses, alone or alongside other keys.
+  auto overrides = parseEmbeddingEndpointOverrides(
+      R"({"images": {"cslsRerankFloor": 20000},)"
+      R"( "texts": {"embeddingModel": "m", "cslsRerankFloor": 1}})");
+  ASSERT_EQ(overrides.size(), 2u);
+  EXPECT_EQ(overrides.at("images").cslsRerankFloor_, 20000u);
+  EXPECT_FALSE(overrides.at("images").embeddingUrl_.has_value());
+  EXPECT_EQ(overrides.at("texts").cslsRerankFloor_, 1u);
+  EXPECT_EQ(overrides.at("texts").embeddingModel_, "m");
+  // Malformed values (zero, negative, fractional, string) poison the ENTIRE
+  // entry -- even a valid field next to them must not half-apply -- while
+  // well-formed entries in the same object still parse.
+  auto invalid = parseEmbeddingEndpointOverrides(
+      R"({"zero": {"cslsRerankFloor": 0},)"
+      R"( "negative": {"cslsRerankFloor": -5},)"
+      R"( "fractional": {"cslsRerankFloor": 1.5},)"
+      R"( "string": {"embeddingModel": "m", "cslsRerankFloor": "10000"},)"
+      R"( "good": {"cslsRerankFloor": 10}})");
+  ASSERT_EQ(invalid.size(), 1u);
+  EXPECT_EQ(invalid.at("good").cslsRerankFloor_, 10u);
+}
+
+// _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, cslsRerankFloorOverrideIsInMemoryOnly) {
+  auto b = buildTmpIndex();
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+  EXPECT_EQ(idx.cslsRerankFloor(), DEFAULT_CSLS_RERANK_FLOOR);
+  // Apply the override exactly as the load hook does.
+  EndpointsEnvGuard guard{R"({"images": {"cslsRerankFloor": 123}})"};
+  auto overrides = embeddingEndpointOverridesFromEnv();
+  auto it = overrides.find(b.name);
+  ASSERT_NE(it, overrides.end());
+  ASSERT_TRUE(it->second.cslsRerankFloor_.has_value());
+  idx.setCslsRerankFloor(it->second.cslsRerankFloor_.value());
+  EXPECT_EQ(idx.cslsRerankFloor(), 123u);
+  // The setter clamps to >= 1 (a floor of 0 would stall the rerank loop).
+  idx.setCslsRerankFloor(0);
+  EXPECT_EQ(idx.cslsRerankFloor(), 1u);
+  // Never persisted: a fresh open is back at the default.
+  VectorIndex reopened;
+  reopened.open(b.basename, b.name);
+  EXPECT_EQ(reopened.cslsRerankFloor(), DEFAULT_CSLS_RERANK_FLOOR);
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
 TEST(VectorIndexEndpointOverride, parseMalformedNeverThrowsAndYieldsNothing) {
   // Whole value malformed or of the wrong shape -> empty map, no exception.
   EXPECT_TRUE(parseEmbeddingEndpointOverrides("").empty());

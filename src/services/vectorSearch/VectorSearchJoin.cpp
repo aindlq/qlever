@@ -452,11 +452,13 @@ void VectorSearchJoin::computePreFilterRows(
   ad_utility::HashMap<Id, float> cslsValues;
   std::vector<qlever::vector::ScoredEntity> scored;
   if (config_.cslsThreshold_.has_value()) {
-    // CSLS cut over the BOUND set: one full fine-layer sweep of exactly the
-    // candidate members (like the annotate path -- no coarse pass), r(q) from
-    // the top-`cslsNeighbors` of that set, then the tau filter. Survivors
-    // keep their COSINE distance as the score; `vec:k` (if explicitly given)
-    // caps them, otherwise all survivors are kept (variable cardinality).
+    // CSLS cut over the BOUND set: every candidate member is scored (a full
+    // fine-layer sweep on a single-layer index; a full COARSE sweep plus a
+    // bounded, auto-widening fine rerank on a two-layer one -- see
+    // `searchCslsBytes`), r(q) from the top-`cslsNeighbors` of that set, then
+    // the tau filter. Survivors keep their (fine) COSINE distance as the
+    // score; `vec:k` (if explicitly given) caps them, otherwise all survivors
+    // are kept (variable cardinality).
     qlever::vector::validateCslsIsAvailable(config_, vidx);
     const float threshold = config_.cslsThreshold_.value();
     const size_t neighbors =
@@ -471,9 +473,11 @@ void VectorSearchJoin::computePreFilterRows(
             : vidx.searchCsls(query, threshold, neighbors, candidates,
                               config_.maxDistance_, checkInterrupt, &numScored);
     const double ms = cslsTimer.value().count() / 1000.0;
-    qlever::vector::logVectorSearchPhase(config_.indexName_,
-                                         "full fine scan (csls, index members)",
-                                         ms, numScored);
+    qlever::vector::logVectorSearchPhase(
+        config_.indexName_,
+        vidx.hasRerankLayer() ? "coarse scan + rerank (csls, index members)"
+                              : "full fine scan (csls, index members)",
+        ms, numScored);
     qlever::vector::logVectorSearchPhase(
         config_.indexName_,
         absl::StrCat("csls filter: ", numScored, " candidates -> ", hits.size(),

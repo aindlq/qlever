@@ -57,6 +57,13 @@ struct CslsScoredEntity {
 // An empty function disables the checks.
 using CheckInterruptCallback = std::function<void()>;
 
+// Default fine-rerank batch size of the two-layer CSLS cut (see
+// `VectorIndex::cslsRerankFloor()`): the coarse scan ranks ALL candidates,
+// only the coarse-best this-many are reranked on the fine layer (widened
+// automatically while the cut reaches the coarse boundary). Large enough that
+// the r(q) neighbourhood (typically ~10 fine cosines) is effectively exact.
+inline constexpr size_t DEFAULT_CSLS_RERANK_FLOOR = 10'000;
+
 // Read-only, memory-mapped accessor for a single on-disk vector index (see
 // `VectorIndexFormat.h` for the file layout). It owns the mmaped flat float
 // store, the entity mappings, and, if present, the memory-mapped usearch HNSW
@@ -181,6 +188,15 @@ class VectorIndex {
   // The same by entity (one `.rowmap` lookup); `nullopt` for an entity
   // without a (live) vector. Precondition: `hasCsls()`.
   std::optional<float> cslsRForEntity(Id entity) const;
+  // Fine-rerank batch size M of the two-layer CSLS cut (`searchCsls*` on a
+  // `hasRerankLayer()` index coarse-scans all candidates and reranks only the
+  // coarse-best M on the fine layer, widening by M while the cut reaches the
+  // coarse boundary). Defaults to `DEFAULT_CSLS_RERANK_FLOOR`; the setter is
+  // a pure IN-MEMORY serving override (never persisted, reapplied by the load
+  // hook from the `cslsRerankFloor` key of `QLEVER_VECTOR_SEARCH_ENDPOINTS`),
+  // clamped to >= 1. Irrelevant on a single-layer index.
+  size_t cslsRerankFloor() const;
+  void setCslsRerankFloor(size_t floor);
 
   // True iff this index stores a (live) vector for `entity`.
   bool hasVector(Id entity) const;
@@ -265,17 +281,25 @@ class VectorIndex {
 
   // CSLS-filtered search (`vec:cslsThreshold`); requires `hasCsls()` and the
   // cosine metric (both guaranteed at build time; violated preconditions
-  // throw). A FULL scan on the FINE layer -- CSLS needs every candidate's
-  // cosine, so there is no coarse/HNSW shortcut:
+  // throw). Every candidate is scored (CSLS is a cut over the whole scoring
+  // set, so there is no HNSW shortcut):
   //  1. compute the cosine distance from the query to EVERY candidate (all
-  //     live vectors, or -- like `searchExact` -- only the `candidates` set);
+  //     live vectors, or -- like `searchExact` -- only the `candidates` set).
+  //     On a SINGLE-LAYER index this is one full fine sweep; on a TWO-LAYER
+  //     index the full sweep runs on the cheap COARSE scan matrix and only
+  //     the coarse-best `cslsRerankFloor()` candidates get a FINE distance,
+  //     widened batch-by-batch while the cut still reaches the coarse
+  //     boundary (so everything the cut could keep is reranked);
   //  2. r(q) = mean cosine similarity (`1 - distance`) of the query to its
-  //     top-`neighbors` nearest candidates, EXCLUDING one exact self-match
-  //     (distance ~ 0 -- the query entity itself when it is a candidate);
+  //     top-`neighbors` nearest candidates (on a two-layer index: nearest
+  //     RERANKED candidates -- the only approximation of the coarse+rerank
+  //     path), EXCLUDING one exact self-match (distance ~ 0 -- the query
+  //     entity itself when it is a candidate);
   //  3. keep candidate `d` iff
   //     `CSLS = 2 * cos_sim(q, d) - r(q) - r(d) >= threshold`
   //     (and `distance <= maxDistance`, if set; r(q) is computed BEFORE the
-  //     maxDistance filter -- it describes the retrieval geometry).
+  //     maxDistance filter -- it describes the retrieval geometry). The
+  //     cosine here is always the FINE-layer distance.
   // Returns ALL survivors ascending by cosine DISTANCE (CSLS is the cut, not
   // the score); the caller applies any top-k cap. `numScored`, if set,
   // receives the number of candidates that were scored (the live set, or the
@@ -287,9 +311,11 @@ class VectorIndex {
       const CheckInterruptCallback& checkInterrupt = {},
       size_t* numScored = nullptr) const;
 
-  // The same with a STORED entity's vector as the query point (its fine-layer
-  // bytes are used directly); the entity's own row is the excluded self-match.
-  // An entity without a (live) vector yields an empty result.
+  // The same with a STORED entity's vector as the query point (its stored
+  // bytes of the layer being swept are used directly -- the fine row for the
+  // fine distances, the scan row for a two-layer coarse sweep); the entity's
+  // own row is the excluded self-match. An entity without a (live) vector
+  // yields an empty result.
   std::vector<CslsScoredEntity> searchCslsByEntity(
       Id entity, float threshold, size_t neighbors,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
@@ -410,8 +436,11 @@ unsigned physicalCoreCount();
 // once. Cap at the PHYSICAL core count (see `physicalCoreCount()`; the scans
 // are memory-bandwidth bound, so there is nothing to gain past it) AND
 // OpenMP's configured maximum, so `OMP_NUM_THREADS` can still lower it (e.g.
-// for cgroup cpu limits). Search-side only -- the index-build thread counts
-// are chosen separately.
+// for cgroup cpu limits). If the environment variable
+// `QLEVER_VECTOR_SEARCH_THREADS` holds a positive integer, it replaces the
+// physical-core count (still capped by OpenMP's maximum); anything else
+// leaves the default. Search-side only -- the index-build thread counts are
+// chosen separately.
 int vectorSearchThreadCap();
 
 }  // namespace qlever::vector

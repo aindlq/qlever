@@ -799,6 +799,16 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                     << "': embedding endpoint overridden from "
                     << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << std::endl;
       }
+      // The fine-rerank batch size of the two-layer CSLS cut -- like the
+      // endpoint fields, a pure in-memory serving setting reapplied on every
+      // load.
+      if (it->second.cslsRerankFloor_.has_value()) {
+        idx.setCslsRerankFloor(it->second.cslsRerankFloor_.value());
+        AD_LOG_INFO << "Vector index '" << name
+                    << "': csls rerank floor set to "
+                    << it->second.cslsRerankFloor_.value() << " at startup ("
+                    << VECTOR_SEARCH_ENDPOINTS_ENV_VAR << ")" << std::endl;
+      }
       endpointOverrides.erase(it);
     }
     const VectorIndexConfig& config = idx.metadata().config_;

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <queue>
 #include <string>
@@ -207,6 +209,12 @@ struct VectorIndex::Impl {
   // The row-aligned csls hubness sidecar `.csls` (one f32 r(d) per row), iff
   // `meta_.config_.csls_`.
   ad_utility::MmapVectorView<float> cslsR_;
+  // Fine-rerank batch size M of the two-layer CSLS cut (see `searchCslsBytes`:
+  // coarse-scan everything, rerank only the coarse-best M, widen by M while
+  // the cut still reaches the coarse boundary). A pure SERVING setting --
+  // never persisted; overridable per index at server start via the
+  // `cslsRerankFloor` key of `QLEVER_VECTOR_SEARCH_ENDPOINTS`.
+  size_t cslsRerankFloor_ = DEFAULT_CSLS_RERANK_FLOOR;
   std::optional<GraphIndex> graph_;  // present iff meta_.hasHnsw_
   std::unique_ptr<SearchSlotPool> searchSlots_;
   // Sticky safety net for the sequential-read hint of the merge-join gather.
@@ -604,6 +612,12 @@ std::optional<float> VectorIndex::cslsRForEntity(Id entity) const {
   }
   return impl_->cslsR_[row.value()];
 }
+size_t VectorIndex::cslsRerankFloor() const { return impl_->cslsRerankFloor_; }
+void VectorIndex::setCslsRerankFloor(size_t floor) {
+  // A floor of 0 would make the rerank loop go nowhere; clamp to 1 (the env
+  // parser already rejects 0, this is defense in depth for direct callers).
+  impl_->cslsRerankFloor_ = std::max<size_t>(floor, 1);
+}
 
 // ____________________________________________________________________________
 bool VectorIndex::hasVector(Id entity) const {
@@ -902,11 +916,31 @@ unsigned physicalCoreCount() {
 
 // Declared in `VectorIndex.h`.
 int vectorSearchThreadCap() {
-  int physical = static_cast<int>(physicalCoreCount());
+  // Optional operator override: a positive integer in
+  // `QLEVER_VECTOR_SEARCH_THREADS` replaces the physical-core-count default
+  // (it is still capped by OpenMP's configured maximum below, so
+  // `OMP_NUM_THREADS` keeps the last word). Anything else -- unset, empty,
+  // malformed, zero, negative, or out of range -- keeps the default. Memoized:
+  // the environment does not change at runtime.
+  static const std::optional<int> envThreads = []() -> std::optional<int> {
+    const char* value = std::getenv("QLEVER_VECTOR_SEARCH_THREADS");
+    if (value == nullptr) {
+      return std::nullopt;
+    }
+    char* end = nullptr;
+    errno = 0;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || errno == ERANGE || parsed <= 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+      return std::nullopt;
+    }
+    return static_cast<int>(parsed);
+  }();
+  int cap = envThreads.value_or(static_cast<int>(physicalCoreCount()));
 #ifdef _OPENMP
-  return std::max(1, std::min(omp_get_max_threads(), physical));
+  return std::max(1, std::min(omp_get_max_threads(), cap));
 #else
-  return std::max(1, physical);
+  return std::max(1, cap);
 #endif
 }
 
@@ -1441,21 +1475,86 @@ namespace {
 // this close, so at most the genuine self is excluded. (An entity query point
 // excludes its own ROW instead -- exact, no epsilon.)
 constexpr float CSLS_SELF_EPSILON = 1e-6f;
+
+// One distance sweep of the CSLS search, shared by its passes (the
+// single-layer full fine sweep, the two-layer coarse sweep, and the fine
+// rerank batches): `dists[i] = layer.distanceToRow(queryBytes, rowOf(i))` for
+// `i` in `[0, n)`. The mmap-heavy SIMD work runs in parallel above the usual
+// threshold, with the same interrupt-latching pattern as `scanIntoTopK` (an
+// exception must never unwind out of the OpenMP region); below it, a serial
+// loop with periodic interrupt polls.
+template <typename LayerT, typename RowFn>
+void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
+                       const RowFn& rowOf, float* dists,
+                       const CheckInterruptCallback& checkInterrupt) {
+#ifdef _OPENMP
+  const int numThreads = vectorSearchThreadCap();
+  if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+    std::atomic<bool> cancelled{false};
+#pragma omp parallel for schedule(dynamic, VEC_SEARCH_PARALLEL_CHUNK) \
+    num_threads(numThreads)
+    for (size_t i = 0; i < n; ++i) {
+      // An exception must never unwind out of the OpenMP region: poll the
+      // (throwing) interrupt once per chunk, latch, re-raise after.
+      if (cancelled.load(std::memory_order_relaxed)) {
+        continue;
+      }
+      if (checkInterrupt && i % VEC_SEARCH_PARALLEL_CHUNK == 0) {
+        try {
+          checkInterrupt();
+        } catch (...) {
+          cancelled.store(true, std::memory_order_relaxed);
+          continue;
+        }
+      }
+      dists[i] = layer.distanceToRow(queryBytes, rowOf(i));
+    }
+    if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+      checkInterrupt();  // re-raise outside the parallel region
+    }
+    return;
+  }
+#endif
+  size_t sinceCheck = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+      sinceCheck = 0;
+      checkInterrupt();
+    }
+    dists[i] = layer.distanceToRow(queryBytes, rowOf(i));
+  }
+}
 }  // namespace
 
 // ____________________________________________________________________________
 // The core of the CSLS-filtered search (see the header comment of
-// `searchCsls`): a FULL cosine-distance sweep of the scoring set on the FINE
-// layer, then the query-adaptive cut `2 * cos_sim - r(q) - r(d) >=
-// threshold`, with `cos_sim = 1 - distance` (the usearch/NumKong angular
-// convention -- the cosine metric is guaranteed by the caller). `selfRow`,
-// when set, is the query entity's own row, excluded from the r(q)
+// `searchCsls`): cosine distances of the scoring set, then the query-adaptive
+// cut `2 * cos_sim - r(q) - r(d) >= threshold`, with `cos_sim = 1 - distance`
+// (the usearch/NumKong angular convention -- the cosine metric is guaranteed
+// by the caller).
+//
+// SINGLE-LAYER index: one FULL sweep on the (only) fine layer -- CSLS needs
+// every candidate's cosine and there is no cheaper matrix to consult.
+// TWO-LAYER index: the full sweep runs on the cheap COARSE scan matrix
+// instead (`coarseQueryBytes` is the query encoded into ITS scalar; unused on
+// a single-layer index), and only the coarse-best `impl.cslsRerankFloor_`
+// candidates get a FINE distance -- widened by another batch while the cut
+// still reaches the coarse boundary, so every candidate the cut could keep
+// is, by construction, reranked before the widening stops. Survivor scores
+// and csls values come from the fine layer either way; the only approximation
+// of the two-layer path is r(q), whose top-`neighbors` neighbourhood is
+// collected from the RERANKED (coarse-preselected) set instead of all matched
+// candidates -- the coarse layer ranks the very top well, and the floor is
+// orders of magnitude above `neighbors`.
+//
+// `selfRow`, when set, is the query entity's own row, excluded from the r(q)
 // neighbourhood by identity; for a raw query vector the single nearest
 // candidate is excluded iff its distance is < `CSLS_SELF_EPSILON`.
 template <typename ImplT, typename LayerT>
 std::vector<CslsScoredEntity> searchCslsBytes(
     ImplT& impl, LayerT& layer, const char* queryBytes,
-    std::optional<size_t> selfRow, float threshold, size_t neighbors,
+    const char* coarseQueryBytes, std::optional<size_t> selfRow,
+    float threshold, size_t neighbors,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored) {
@@ -1492,106 +1591,237 @@ std::vector<CslsScoredEntity> searchCslsBytes(
   if (matched.empty()) {
     return {};
   }
-
-  // 2. The full fine-layer distance sweep (CSLS needs EVERY cosine, so there
-  //    is no top-k shortcut). Rows come out of step 1 (near-)ascending, so
-  //    the sequential read-ahead hint applies; the mmap-heavy SIMD work runs
-  //    in parallel above the usual threshold.
   const size_t n = matched.size();
-  std::vector<float> dists(n);
-  SeqScanHint hint{layer, !layer.alignedBuf_};
-#ifdef _OPENMP
-  const int numThreads = vectorSearchThreadCap();
-  if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
-    std::atomic<bool> cancelled{false};
-#pragma omp parallel for schedule(dynamic, VEC_SEARCH_PARALLEL_CHUNK) \
-    num_threads(numThreads)
-    for (size_t i = 0; i < n; ++i) {
-      // An exception must never unwind out of the OpenMP region: poll the
-      // (throwing) interrupt once per chunk, latch, re-raise after.
-      if (cancelled.load(std::memory_order_relaxed)) {
-        continue;
-      }
-      if (checkInterrupt && i % VEC_SEARCH_PARALLEL_CHUNK == 0) {
-        try {
-          checkInterrupt();
-        } catch (...) {
-          cancelled.store(true, std::memory_order_relaxed);
-          continue;
+
+  // Survivors are returned ascending by cosine DISTANCE (CSLS is the cut, the
+  // cosine distance stays the score); ties break by entity id.
+  auto byDistanceThenId = [](const CslsScoredEntity& a,
+                             const CslsScoredEntity& b) {
+    return a.distance_ != b.distance_
+               ? a.distance_ < b.distance_
+               : a.entity_.getBits() < b.entity_.getBits();
+  };
+
+  if (!impl.rerank_.has_value()) {
+    // SINGLE-LAYER: the coarse and fine layers coincide, so a coarse
+    // preselection would buy nothing -- one full sweep of the only matrix.
+    //
+    // 2. The full fine-layer distance sweep (CSLS needs EVERY cosine, so
+    //    there is no top-k shortcut). Rows come out of step 1
+    //    (near-)ascending, so the sequential read-ahead hint applies.
+    std::vector<float> dists(n);
+    {
+      SeqScanHint hint{layer, !layer.alignedBuf_};
+      cslsDistanceSweep(
+          layer, queryBytes, n, [&](size_t i) { return matched[i].first; },
+          dists.data(), checkInterrupt);
+    }
+
+    // 3. r(q): the mean cosine similarity of the query to its top-`neighbors`
+    //    nearest SCORED candidates, the exact self-match excluded. Computed
+    //    BEFORE any `maxDistance` filter (it describes the retrieval
+    //    geometry).
+    size_t excluded = n;  // index into `matched`/`dists`; `n` = none
+    if (selfRow.has_value()) {
+      for (size_t i = 0; i < n; ++i) {
+        if (matched[i].first == selfRow.value()) {
+          excluded = i;
+          break;
         }
       }
-      dists[i] = layer.distanceToRow(queryBytes, matched[i].first);
+    } else {
+      size_t best = 0;
+      for (size_t i = 1; i < n; ++i) {
+        if (dists[i] < dists[best]) {
+          best = i;
+        }
+      }
+      if (dists[best] < CSLS_SELF_EPSILON) {
+        excluded = best;
+      }
     }
-    if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
-      checkInterrupt();  // re-raise outside the parallel region
+    CslsNeighborhood neighborhood{neighbors};
+    for (size_t i = 0; i < n; ++i) {
+      if (i != excluded) {
+        neighborhood.offer(dists[i]);
+      }
     }
-  } else
-#endif
+    const float rq = neighborhood.meanCosSim();
+
+    // 4. The cut: keep candidate d iff `2 * cos_sim(q, d) - r(q) - r(d) >=
+    //    threshold` (and its cosine distance passes `maxDistance`, if set).
+    //    ALL survivors are returned; the caller applies any top-k cap.
+    std::vector<CslsScoredEntity> out;
+    for (size_t i = 0; i < n; ++i) {
+      const float d = dists[i];
+      if (maxDistance.has_value() && d > maxDistance.value()) {
+        continue;
+      }
+      const float csls = static_cast<float>(
+          2.0 * (1.0 - static_cast<double>(d)) - static_cast<double>(rq) -
+          static_cast<double>(impl.cslsR_[matched[i].first]));
+      if (csls >= threshold) {
+        out.push_back(
+            CslsScoredEntity{Id::fromBits(matched[i].second), d, csls});
+      }
+    }
+    ql::ranges::sort(out, byDistanceThenId);
+    return out;
+  }
+
+  // TWO-LAYER: coarse scan of everything, fine rerank of a bounded chunk.
+  //
+  // 2. The full sweep runs on the cheap COARSE scan matrix (same parallel
+  //    pattern and sequential hint as the fine sweep above). Smaller coarse
+  //    distance = closer: Hamming for a binary scan layer, cosine distance
+  //    for i8.
+  std::vector<float> coarseDists(n);
   {
-    size_t sinceCheck = 0;
-    for (size_t i = 0; i < n; ++i) {
-      if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
-        sinceCheck = 0;
-        checkInterrupt();
-      }
-      dists[i] = layer.distanceToRow(queryBytes, matched[i].first);
-    }
+    SeqScanHint hint{impl.scan_, !impl.scan_.alignedBuf_};
+    cslsDistanceSweep(
+        impl.scan_, coarseQueryBytes, n,
+        [&](size_t i) { return matched[i].first; }, coarseDists.data(),
+        checkInterrupt);
   }
 
-  // 3. r(q): the mean cosine similarity of the query to its top-`neighbors`
-  //    nearest SCORED candidates, the exact self-match excluded. Computed
-  //    BEFORE any `maxDistance` filter (it describes the retrieval geometry).
-  size_t excluded = n;  // index into `matched`/`dists`; `n` = none
-  if (selfRow.has_value()) {
-    for (size_t i = 0; i < n; ++i) {
-      if (matched[i].first == selfRow.value()) {
-        excluded = i;
-        break;
-      }
-    }
-  } else {
-    size_t best = 0;
-    for (size_t i = 1; i < n; ++i) {
-      if (dists[i] < dists[best]) {
-        best = i;
-      }
-    }
-    if (dists[best] < CSLS_SELF_EPSILON) {
-      excluded = best;
-    }
-  }
-  CslsNeighborhood neighborhood{neighbors};
-  for (size_t i = 0; i < n; ++i) {
-    if (i != excluded) {
-      neighborhood.offer(dists[i]);
-    }
-  }
-  const float rq = neighborhood.meanCosSim();
+  // 3. Rerank in coarse-best batches of M = `cslsRerankFloor`: `order` is a
+  //    permutation of [0, n) whose reranked prefix is sorted ascending by
+  //    coarse distance. Coarse ties break by index, so the batch boundary --
+  //    and with it the whole result, batched or not -- is deterministic.
+  const size_t floorM = std::max<size_t>(impl.cslsRerankFloor_, 1);
+  std::vector<size_t> order(n);
+  std::iota(order.begin(), order.end(), size_t{0});
+  auto byCoarse = [&](size_t a, size_t b) {
+    return coarseDists[a] != coarseDists[b] ? coarseDists[a] < coarseDists[b]
+                                            : a < b;
+  };
+  // The fine cosine distance of `matched[order[j]]`, filled for j < reranked.
+  std::vector<float> fineDists(n);
+  size_t reranked = 0;
+  float rq = 0.f;
 
-  // 4. The cut: keep candidate d iff `2 * cos_sim(q, d) - r(q) - r(d) >=
-  //    threshold` (and its cosine distance passes `maxDistance`, if set).
-  //    ALL survivors are returned, ascending by cosine DISTANCE -- CSLS is
-  //    the cut, the cosine distance stays the score; the caller applies any
-  //    top-k cap.
+  // 5. r(q) over the reranked prefix [0, count): the mean cosine similarity
+  //    of the query to its top-`neighbors` nearest RERANKED candidates, the
+  //    exact self-match excluded -- the same computation as the single-layer
+  //    step 3, over the reranked set instead of all matched. (A genuine
+  //    self-match has coarse distance ~0, so it is always in the first
+  //    batch.)
+  auto computeRq = [&](size_t count) {
+    size_t excluded = count;  // position in the `order` prefix; `count` = none
+    if (selfRow.has_value()) {
+      for (size_t j = 0; j < count; ++j) {
+        if (matched[order[j]].first == selfRow.value()) {
+          excluded = j;
+          break;
+        }
+      }
+    } else {
+      size_t best = 0;
+      for (size_t j = 1; j < count; ++j) {
+        if (fineDists[j] < fineDists[best]) {
+          best = j;
+        }
+      }
+      if (fineDists[best] < CSLS_SELF_EPSILON) {
+        excluded = best;
+      }
+    }
+    CslsNeighborhood neighborhood{neighbors};
+    for (size_t j = 0; j < count; ++j) {
+      if (j != excluded) {
+        neighborhood.offer(fineDists[j]);
+      }
+    }
+    return neighborhood.meanCosSim();
+  };
+  // The CSLS value of reranked candidate `j` under a given r(q) -- the same
+  // arithmetic as the single-layer step 4.
+  auto cslsOf = [&](size_t j, float rqNow) {
+    return static_cast<float>(
+        2.0 * (1.0 - static_cast<double>(fineDists[j])) -
+        static_cast<double>(rqNow) -
+        static_cast<double>(impl.cslsR_[matched[order[j]].first]));
+  };
+
+  while (true) {
+    const size_t batchStart = reranked;
+    const size_t batchEnd = std::min(batchStart + floorM, n);
+    // Select the coarse-best batch of the remaining candidates: partition
+    // them to the front (`nth_element`), then sort just the batch -- never a
+    // full sort of all matched.
+    if (batchEnd < n) {
+      std::nth_element(order.begin() + batchStart, order.begin() + batchEnd,
+                       order.end(), byCoarse);
+    }
+    std::sort(order.begin() + batchStart, order.begin() + batchEnd, byCoarse);
+    if (checkInterrupt) {
+      checkInterrupt();
+    }
+    // 4. Rerank the batch on the FINE layer. Its rows are coarse-ranked, i.e.
+    //    scattered -- no sequential hint.
+    cslsDistanceSweep(
+        layer, queryBytes, batchEnd - batchStart,
+        [&](size_t j) { return matched[order[batchStart + j]].first; },
+        fineDists.data() + batchStart, checkInterrupt);
+    reranked = batchEnd;
+    // Widening only ever ADDS candidates to the r(q) neighbourhood pool, so
+    // r(q) is non-decreasing across batches and the widen decisions below --
+    // taken with the then-current r(q) -- are conservative w.r.t. the final
+    // cut (a candidate passing the final cut also passes it here).
+    rq = computeRq(reranked);
+    if (reranked == n) {
+      break;
+    }
+    // 7. Widen (a safety net that rarely fires)? First batch: only when the
+    //    coarse-WORST reranked candidate (the M-th) passes the cut -- then
+    //    the cut region may extend past the coarse boundary. Later batches:
+    //    while the batch yields ANY survivor. Neither holds => a whole
+    //    coarse-contiguous batch was rejected, so the (coarse-worse) rest is
+    //    left unranked. `maxDistance` is deliberately ignored here: it only
+    //    filters the output, and ignoring it can only widen further.
+    bool widen;
+    if (batchStart == 0) {
+      widen = cslsOf(batchEnd - 1, rq) >= threshold;
+    } else {
+      widen = false;
+      for (size_t j = batchStart; j < batchEnd; ++j) {
+        if (cslsOf(j, rq) >= threshold) {
+          widen = true;
+          break;
+        }
+      }
+    }
+    if (!widen) {
+      break;
+    }
+    AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
+                << "\": csls rerank widened to "
+                << std::min(reranked + floorM, n) << " of " << n
+                << " candidates (cut reaches the coarse boundary)" << std::endl;
+  }
+
+  // 6. The final cut over every reranked candidate, with the final r(q) --
+  //    identical scoring to the single-layer path: the survivor score is the
+  //    fine COSINE distance, the csls value is the cut value.
   std::vector<CslsScoredEntity> out;
-  for (size_t i = 0; i < n; ++i) {
-    const float d = dists[i];
+  for (size_t j = 0; j < reranked; ++j) {
+    const float d = fineDists[j];
     if (maxDistance.has_value() && d > maxDistance.value()) {
       continue;
     }
-    const float csls = static_cast<float>(
-        2.0 * (1.0 - static_cast<double>(d)) - static_cast<double>(rq) -
-        static_cast<double>(impl.cslsR_[matched[i].first]));
+    const float csls = cslsOf(j, rq);
     if (csls >= threshold) {
-      out.push_back(CslsScoredEntity{Id::fromBits(matched[i].second), d, csls});
+      out.push_back(
+          CslsScoredEntity{Id::fromBits(matched[order[j]].second), d, csls});
     }
   }
-  ql::ranges::sort(out,
-                   [](const CslsScoredEntity& a, const CslsScoredEntity& b) {
-                     return a.distance_ != b.distance_
-                                ? a.distance_ < b.distance_
-                                : a.entity_.getBits() < b.entity_.getBits();
-                   });
+  // 8. One INFO line with all three counts (`numScored` stays the matched
+  //    count, exactly like the single-layer path).
+  AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
+              << "\": csls coarse+rerank: " << n << " candidates -> "
+              << reranked << " reranked -> " << out.size() << " kept"
+              << std::endl;
+  ql::ranges::sort(out, byDistanceThenId);
   return out;
 }
 
@@ -1616,9 +1846,17 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
   }
   std::vector<char> buffer;
   const char* queryBytes = layer.encodeQuery(query, buffer);
-  return searchCslsBytes(impl, layer, queryBytes, std::nullopt, threshold,
-                         neighbors, candidates, maxDistance, checkInterrupt,
-                         numScored);
+  // The two-layer coarse sweep reads the SCAN matrix, so the query is
+  // additionally encoded into ITS scalar (exactly like `searchExactCoarse`);
+  // on a single-layer index the layers coincide and the fine bytes are reused
+  // (the coarse bytes go unused there anyway).
+  std::vector<char> coarseBuffer;
+  const char* coarseQueryBytes =
+      impl.rerank_.has_value() ? impl.scan_.encodeQuery(query, coarseBuffer)
+                               : queryBytes;
+  return searchCslsBytes(impl, layer, queryBytes, coarseQueryBytes,
+                         std::nullopt, threshold, neighbors, candidates,
+                         maxDistance, checkInterrupt, numScored);
 }
 
 // ____________________________________________________________________________
@@ -1641,7 +1879,11 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
     }
     return {};
   }
-  return searchCslsBytes(impl, layer, layer.rowPtr(row.value()), row, threshold,
+  // The query point per layer is the entity's STORED bytes of that layer (no
+  // f32 round trip): the fine row for the fine distances, the scan row for
+  // the coarse sweep (exactly like `searchExactCoarseByEntity`).
+  return searchCslsBytes(impl, layer, layer.rowPtr(row.value()),
+                         impl.scan_.rowPtr(row.value()), row, threshold,
                          neighbors, candidates, maxDistance, checkInterrupt,
                          numScored);
 }

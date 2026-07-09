@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <numbers>
 #include <random>
 #include <string>
 #include <vector>
@@ -259,9 +260,8 @@ QueryExecutionContext* qecWithCslsIndexes() {
           basename + ".vec." + std::string{name} + std::string{suffix}, ec);
     }
   }
-  for (std::string_view suffix :
-       {".input.npy", ".input.iris", ".input.r.npy", ".input.bf16.npy",
-        ".input.bf16.iris"}) {
+  for (std::string_view suffix : {".input.npy", ".input.iris", ".input.r.npy",
+                                  ".input.bf16.npy", ".input.bf16.iris"}) {
     std::error_code ec;
     std::filesystem::remove(basename + std::string{suffix}, ec);
   }
@@ -681,6 +681,165 @@ TEST(VectorCsls, binaryScanRdAtScaleTracksReference) {
   EXPECT_LT(saturated, N / 10)
       << saturated << "/" << N << " rows r(d) > 0.95 (coarse-path leak?)";
   cleanupTmp(basename, "csbinbig");
+}
+
+// _____________________________________________________________________________
+// TWO-LAYER (binary+bf16) query-time csls cut: the coarse-scan + bounded
+// fine-rerank path must return EXACTLY the survivors of a full fine sweep --
+// same entities in the same order, same (fine) cosine scores, same csls
+// values. The full-sweep reference is the same index with a huge
+// `cslsRerankFloor` (one batch reranks ALL candidates == the old full-sweep
+// path); a pruning floor (400 of 1200) and a small floor (64 -- both
+// thresholds keep far more than 64 survivors, so a single batch cannot cover
+// them and the WIDEN loop must extend the reranked set) must both reproduce
+// it. Two thresholds, raw-vector and entity query points.
+//
+// The fixture is TIERED around a common center (150 near vectors at 10-20
+// degrees, 100 mid vectors at 45-55 degrees, 950 random background): the cut
+// regions of the two thresholds (~150 and ~250 survivors, picked from the
+// fixture's own csls distribution) are then COMPACT in coarse (Hamming) rank,
+// which is the regime the widen loop is built for -- with dim-256 sign codes
+// the tiers' Hamming bands (~14-28, ~64-78, ~128) are cleanly separated, so
+// batches beyond the cut region come up empty and stop the widening only
+// after every survivor was reranked. (Fully random low-dimensional data has
+// no such coarse-fine correlation, and no floor short of "everything" -- the
+// production default relative to these sizes -- could guarantee equality.)
+TEST(VectorCsls, twoLayerCoarseRerankMatchesFullFineSweep) {
+  constexpr size_t N = 1200;
+  constexpr size_t NEAR = 150;
+  constexpr size_t MID = 100;
+  constexpr size_t D = 256;
+  constexpr size_t K = 10;
+  std::mt19937 rng{20260709};
+  std::normal_distribution<float> g{0.f, 1.f};
+  auto randomUnit = [&] {
+    std::vector<float> v(D);
+    float norm = 0;
+    for (auto& x : v) {
+      x = g(rng);
+      norm += x * x;
+    }
+    norm = std::sqrt(norm);
+    for (auto& x : v) x /= norm;
+    return v;
+  };
+  const std::vector<float> center = randomUnit();
+  // A unit vector at an angle uniform in [degLo, degHi] from `center`, in a
+  // fresh random plane through it.
+  auto tiered = [&](float degLo, float degHi) {
+    std::vector<float> w = randomUnit();
+    float dot = 0;
+    for (size_t j = 0; j < D; ++j) dot += w[j] * center[j];
+    float norm = 0;
+    for (size_t j = 0; j < D; ++j) {
+      w[j] -= dot * center[j];
+      norm += w[j] * w[j];
+    }
+    norm = std::sqrt(norm);
+    const float a = std::uniform_real_distribution<float>{degLo, degHi}(
+                        rng)*std::numbers::pi_v<float> /
+                    180.f;
+    std::vector<float> v(D);
+    for (size_t j = 0; j < D; ++j) {
+      v[j] = std::cos(a) * center[j] + std::sin(a) * w[j] / norm;
+    }
+    return v;
+  };
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = "cs2layer";
+  cfg.dimensions_ = D;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.buildHnsw_ = false;
+  cfg.csls_ = true;
+  cfg.cslsNeighbors_ = K;
+  cfg.scalar_ = VectorScalar::Binary;
+  cfg.rerankScalar_ = VectorScalar::Bf16;
+  VectorIndexBuilder builder{basename, cfg};
+  for (size_t i = 0; i < N; ++i) {
+    std::vector<float> v = i < NEAR         ? tiered(10.f, 20.f)
+                           : i < NEAR + MID ? tiered(45.f, 55.f)
+                                            : randomUnit();
+    builder.add(mkId(1000 + i * 7), "<http://ex/" + std::to_string(i) + ">", v);
+  }
+  builder.build();
+  VectorIndex idx;
+  idx.open(basename, "cs2layer");
+  ASSERT_TRUE(idx.hasCsls());
+  ASSERT_TRUE(idx.hasRerankLayer());
+  EXPECT_EQ(idx.cslsRerankFloor(), DEFAULT_CSLS_RERANK_FLOOR);
+
+  auto expectSameHits = [](const std::vector<CslsScoredEntity>& expected,
+                           const std::vector<CslsScoredEntity>& actual) {
+    ASSERT_EQ(expected.size(), actual.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      EXPECT_EQ(expected[i].entity_, actual[i].entity_) << "hit " << i;
+      EXPECT_EQ(expected[i].distance_, actual[i].distance_) << "hit " << i;
+      EXPECT_EQ(expected[i].csls_, actual[i].csls_) << "hit " << i;
+    }
+  };
+  // Two thresholds picked from the fixture's own csls distribution of a
+  // keep-all reference run (csls >= -4 always, so tau = -10 keeps every
+  // candidate): one at the near/mid tier boundary (~150 survivors), one at
+  // the mid/background boundary (~250) -- both far more than the small floor
+  // of 64, so those runs can only be correct if they widen.
+  auto pickTaus = [](const std::vector<CslsScoredEntity>& all) {
+    std::vector<float> csls;
+    csls.reserve(all.size());
+    for (const auto& hit : all) csls.push_back(hit.csls_);
+    std::sort(csls.rbegin(), csls.rend());
+    return std::pair{(csls[NEAR - 1] + csls[NEAR]) / 2.f,
+                     (csls[NEAR + MID - 1] + csls[NEAR + MID]) / 2.f};
+  };
+
+  const std::vector<float>& query = center;
+  idx.setCslsRerankFloor(1'000'000);
+  auto all = idx.searchCsls(query, /*threshold=*/-10.f, K);
+  ASSERT_EQ(all.size(), N);
+  const auto [tauNear, tauMid] = pickTaus(all);
+  for (float tau : {tauNear, tauMid}) {
+    // Full-fine-sweep reference: the huge floor reranks ALL candidates.
+    idx.setCslsRerankFloor(1'000'000);
+    size_t numScoredRef = 0;
+    auto ref = idx.searchCsls(query, tau, K, std::nullopt, std::nullopt, {},
+                              &numScoredRef);
+    EXPECT_EQ(numScoredRef, N);
+    ASSERT_LT(ref.size(), N);
+    // Proof that the small floor below cannot cover the survivors in one
+    // batch (so the widen loop is genuinely exercised).
+    ASSERT_GT(ref.size(), 64u);
+    // A pruning floor: only the coarse-best 400 of 1200 get a fine distance.
+    // `numScored` must still report the whole matched set.
+    idx.setCslsRerankFloor(400);
+    size_t numScoredPruned = 0;
+    auto pruned = idx.searchCsls(query, tau, K, std::nullopt, std::nullopt, {},
+                                 &numScoredPruned);
+    EXPECT_EQ(numScoredPruned, N);
+    expectSameHits(ref, pruned);
+    // A small floor: the widen loop must keep extending the reranked set
+    // until every survivor is found.
+    idx.setCslsRerankFloor(64);
+    auto widened = idx.searchCsls(query, tau, K);
+    expectSameHits(ref, widened);
+  }
+
+  // The entity-query form (per-layer STORED row bytes as the query points,
+  // the self row excluded from r(q)) must agree the same way.
+  const Id queryEntity = mkId(1000 + 5 * 7);  // a near-tier member
+  idx.setCslsRerankFloor(1'000'000);
+  auto allEnt = idx.searchCslsByEntity(queryEntity, /*threshold=*/-10.f, K);
+  ASSERT_EQ(allEnt.size(), N);
+  const auto [tauEntNear, tauEntMid] = pickTaus(allEnt);
+  for (float tau : {tauEntNear, tauEntMid}) {
+    idx.setCslsRerankFloor(1'000'000);
+    auto ref = idx.searchCslsByEntity(queryEntity, tau, K);
+    ASSERT_GT(ref.size(), 64u);
+    ASSERT_LT(ref.size(), N);
+    idx.setCslsRerankFloor(64);
+    auto widened = idx.searchCslsByEntity(queryEntity, tau, K);
+    expectSameHits(ref, widened);
+  }
+  cleanupTmp(basename, "cs2layer");
 }
 
 // _____________________________________________________________________________
@@ -1104,7 +1263,8 @@ TEST(VectorCsls, parseErrors) {
                            "vec:queryVector \"0,1,0,0\" ; "
                            "vec:cslsNeighbors 5 .")),
       HasSubstr("requires `<cslsThreshold>`"));
-  // The csls cut is a full fine scan: no coarse pass, no HNSW.
+  // The csls cut manages its own scan/rerank: no top-k coarse-pass
+  // parameters, no HNSW.
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec,
                 query("_:c vec:index \"embc\" ; vec:result ?x ; "
@@ -1142,4 +1302,3 @@ TEST(VectorCsls, parseErrors) {
                       "vec:bindCsls ?x .")),
       HasSubstr("must be different"));
 }
-

@@ -143,41 +143,47 @@ inline std::optional<std::string> indexNameFromMetadataIri(
   return std::string{iri};
 }
 
-// The environment variable through which the embedding endpoints and the RAM
-// residency (`preload`/`preloadRerank`) are configured AT SERVER START. These
-// are serving concerns, not index data: they are NEVER set at build time and
-// NEVER persisted in the per-index `.meta` files -- this variable is their
-// only source, applied fresh in memory on every server start. It is a JSON
-// object keyed by index name, each value an object with the optional string
-// keys "embeddingUrl", "embeddingModel", "preload", and "preloadRerank" (the
-// latter two each "none"|"advise"|"lock"|"aligned"), e.g.
+// The environment variable through which the embedding endpoints, the RAM
+// residency (`preload`/`preloadRerank`), and the CSLS rerank floor are
+// configured AT SERVER START. These are serving concerns, not index data:
+// they are NEVER set at build time and NEVER persisted in the per-index
+// `.meta` files -- this variable is their only source, applied fresh in
+// memory on every server start. It is a JSON object keyed by index name, each
+// value an object with the optional keys "embeddingUrl", "embeddingModel",
+// "preload", and "preloadRerank" (strings; the latter two each
+// "none"|"advise"|"lock"|"aligned") plus "cslsRerankFloor" (a positive
+// integer -- the fine-rerank batch size of the two-layer CSLS cut, see
+// `VectorIndex::cslsRerankFloor()`), e.g.
 //   QLEVER_VECTOR_SEARCH_ENDPOINTS='{
 //     "images":   {"embeddingUrl": "unix:/siglip2.private",
 //                  "embeddingModel": "siglip"},
 //     "metadata": {"embeddingUrl": "unix:/qwen3.private",
-//                  "preload": "lock", "preloadRerank": "none"}}'
+//                  "preload": "lock", "preloadRerank": "none",
+//                  "cslsRerankFloor": 20000}}'
 // Only the fields present are set. The load hook applies them IN MEMORY; the
-// on-disk `.meta` is never touched. The endpoint fields mutate the
-// already-opened index; "preload" (the SCAN matrix) and "preloadRerank" (the
-// fine RERANK matrix of a two-layer index, ignored otherwise) must be decided
-// WHEN the index is opened, so the load hook threads them into
-// `VectorIndex::open(..., residency, rerankResidency)` as the per-layer
-// residencies to apply -- e.g. pin the small i8 scan matrix ("preload":
-// "lock") while the bf16 rerank matrix stays demand-paged (the default
-// "preloadRerank": "none").
+// on-disk `.meta` is never touched. The endpoint fields and the rerank floor
+// mutate the already-opened index; "preload" (the SCAN matrix) and
+// "preloadRerank" (the fine RERANK matrix of a two-layer index, ignored
+// otherwise) must be decided WHEN the index is opened, so the load hook
+// threads them into `VectorIndex::open(..., residency, rerankResidency)` as
+// the per-layer residencies to apply -- e.g. pin the small i8 scan matrix
+// ("preload": "lock") while the bf16 rerank matrix stays demand-paged (the
+// default "preloadRerank": "none").
 inline constexpr const char* VECTOR_SEARCH_ENDPOINTS_ENV_VAR =
     "QLEVER_VECTOR_SEARCH_ENDPOINTS";
 
 // One per-index override parsed from the environment variable above; an absent
 // field leaves the corresponding default in place (empty endpoint, `None`
-// residency). `preload_` (the scan matrix) and `preloadRerank_` (the rerank
-// matrix) are each validated to be one of "none"|"advise"|"lock"|"aligned"
-// and select the per-layer RAM residency at `open` time.
+// residency, `DEFAULT_CSLS_RERANK_FLOOR`). `preload_` (the scan matrix) and
+// `preloadRerank_` (the rerank matrix) are each validated to be one of
+// "none"|"advise"|"lock"|"aligned" and select the per-layer RAM residency at
+// `open` time; `cslsRerankFloor_` is validated to be a positive integer.
 struct EmbeddingEndpointOverride {
   std::optional<std::string> embeddingUrl_;
   std::optional<std::string> embeddingModel_;
   std::optional<std::string> preload_;
   std::optional<std::string> preloadRerank_;
+  std::optional<size_t> cslsRerankFloor_;
 };
 using EmbeddingEndpointOverrides =
     ad_utility::HashMap<std::string, EmbeddingEndpointOverride>;
@@ -186,9 +192,9 @@ using EmbeddingEndpointOverrides =
 // overrides. NEVER throws -- a bad value must not prevent the server from
 // starting: an empty value yields an empty map, malformed JSON (or a
 // non-object top level) logs a warning and yields an empty map, and a
-// malformed entry (non-object value, unknown key, non-string field, an
-// invalid "preload" value, or no fields at all) logs a warning and is skipped
-// ENTIRELY, so a typo cannot half-apply an override.
+// malformed entry (non-object value, unknown key, a wrongly-typed field, an
+// invalid "preload"/"cslsRerankFloor" value, or no fields at all) logs a
+// warning and is skipped ENTIRELY, so a typo cannot half-apply an override.
 inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
     std::string_view json) {
   EmbeddingEndpointOverrides overrides;
@@ -213,9 +219,9 @@ inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
     if (!value.is_object()) {
       AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
                   << " entry for vector index '" << name
-                  << "': expected an object with the optional string keys "
-                     "\"embeddingUrl\", \"embeddingModel\", \"preload\", and "
-                     "\"preloadRerank\"."
+                  << "': expected an object with the optional keys "
+                     "\"embeddingUrl\", \"embeddingModel\", \"preload\", "
+                     "\"preloadRerank\", and \"cslsRerankFloor\"."
                   << std::endl;
       continue;
     }
@@ -250,13 +256,28 @@ inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
         (key == "preload" ? endpointOverride.preload_
                           : endpointOverride.preloadRerank_) =
             std::move(preload);
+      } else if (key == "cslsRerankFloor") {
+        // The fine-rerank batch size of the two-layer CSLS cut; must be a
+        // positive JSON integer (0 would stall the rerank loop).
+        if (!field.is_number_unsigned() || field.get<uint64_t>() == 0) {
+          AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                      << " entry for vector index '" << name
+                      << "': \"cslsRerankFloor\" must be a positive integer "
+                         "(got "
+                      << field.dump() << ")." << std::endl;
+          ok = false;
+          break;
+        }
+        endpointOverride.cslsRerankFloor_ =
+            static_cast<size_t>(field.get<uint64_t>());
       } else {
         AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
                     << " entry for vector index '" << name << "': the key \""
                     << key
-                    << "\" is unknown or not a string (known keys: "
+                    << "\" is unknown or has the wrong type (known keys: "
                        "\"embeddingUrl\", \"embeddingModel\", \"preload\", "
-                       "\"preloadRerank\")."
+                       "\"preloadRerank\" -- strings -- and "
+                       "\"cslsRerankFloor\" -- a positive integer)."
                     << std::endl;
         ok = false;
         break;
@@ -265,13 +286,14 @@ inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
     if (!endpointOverride.embeddingUrl_.has_value() &&
         !endpointOverride.embeddingModel_.has_value() &&
         !endpointOverride.preload_.has_value() &&
-        !endpointOverride.preloadRerank_.has_value()) {
+        !endpointOverride.preloadRerank_.has_value() &&
+        !endpointOverride.cslsRerankFloor_.has_value()) {
       if (ok) {
         AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
                     << " entry for vector index '" << name
                     << "': it overrides none of \"embeddingUrl\", "
-                       "\"embeddingModel\", \"preload\", and "
-                       "\"preloadRerank\"."
+                       "\"embeddingModel\", \"preload\", \"preloadRerank\", "
+                       "and \"cslsRerankFloor\"."
                     << std::endl;
       }
       continue;
