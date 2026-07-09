@@ -18,6 +18,7 @@
 #include <thread>
 
 #include "backports/algorithm.h"
+#include "backports/span.h"
 #include "services/vectorSearch/UsearchGraph.h"
 #include "services/vectorSearch/VectorMemory.h"
 #include "util/Exception.h"
@@ -129,11 +130,11 @@ struct CslsFineLayer {
 // cos ~ 1 everywhere makes CSLS ~ 0 for every candidate, so the threshold cut
 // carries almost no signal -- the documented CSLS failure mode).
 void logCslsDistribution(const std::string& indexName,
-                         const std::vector<float>& r) {
+                         ql::span<const float> r) {
   if (r.empty()) {
     return;
   }
-  std::vector<float> sorted = r;
+  std::vector<float> sorted(r.begin(), r.end());
   ql::ranges::sort(sorted);
   const size_t n = sorted.size();
   const float min = sorted.front();
@@ -164,7 +165,7 @@ void logCslsDistribution(const std::string& indexName,
 // candidates; if BOTH are ~1.0, the fine layer itself reads identical/aliased
 // rows; if they agree, r(d) is genuinely that value.
 void writeCslsDebugLog(const std::string& logPath, const std::string& name,
-                       const std::vector<float>& cslsR, const CslsFineLayer& fine,
+                       ql::span<const float> cslsR, const CslsFineLayer& fine,
                        size_t n, size_t k, size_t numThreads,
                        const std::vector<std::string>& graphCands) {
   std::ofstream log{logPath, std::ios::trunc};
@@ -188,7 +189,7 @@ void writeCslsDebugLog(const std::string& logPath, const std::string& name,
   }
 
   {
-    std::vector<float> s = cslsR;
+    std::vector<float> s(cslsR.begin(), cslsR.end());
     ql::ranges::sort(s);
     log << "generation r(d): min=" << s.front() << " p50=" << s[s.size() / 2]
         << " p95=" << s[std::min(s.size() - 1, (s.size() * 95) / 100)]
@@ -200,7 +201,8 @@ void writeCslsDebugLog(const std::string& logPath, const std::string& name,
     log << "  row " << row << "  selfDist=" << fine.distance(row, row)
         << "  gen_r(d)=" << cslsR[row] << "\n";
   }
-  log << "\n=== EXACT brute-force r(d) (full fine scan) vs generation r(d) ===\n";
+  log << "\n=== EXACT brute-force r(d) (full fine scan) vs generation r(d) "
+         "===\n";
   std::vector<std::string> lines(samples.size());
   parallelOverRows(
       samples.size(), std::max<size_t>(1, std::min(numThreads, samples.size())),
@@ -219,11 +221,11 @@ void writeCslsDebugLog(const std::string& logPath, const std::string& name,
               nearestRow = j;
             }
           }
-          lines[si] = "  row " + std::to_string(row) + "  brute_r(d)=" +
-                      std::to_string(top.meanCosSim()) + "  gen_r(d)=" +
-                      std::to_string(cslsR[row]) + "  true_nearest_cos=" +
-                      std::to_string(1.0f - nearest) + "  (nearestRow=" +
-                      std::to_string(nearestRow) + ")";
+          lines[si] = "  row " + std::to_string(row) +
+                      "  brute_r(d)=" + std::to_string(top.meanCosSim()) +
+                      "  gen_r(d)=" + std::to_string(cslsR[row]) +
+                      "  true_nearest_cos=" + std::to_string(1.0f - nearest) +
+                      "  (nearestRow=" + std::to_string(nearestRow) + ")";
         }
       });
   for (const auto& l : lines) {
@@ -701,35 +703,31 @@ VectorIndexMetadata VectorIndexBuilder::build() {
   //     `cslsBruteForceMax_`, else a DEDICATED recall-tuned fine-layer HNSW
   //     (built, self-searched, and discarded -- never persisted).
   if (config_.csls_) {
-    std::vector<float> cslsR;
-    // Log the r(d) distribution and persist the `.csls` sidecar. This MUST run
-    // while the fine layer is still mapped: tearing down the large fine-store
-    // mmap perturbs adjacent heap and corrupts `cslsR` in place -- observed
-    // ONLY when a >4GB fine store and >2M rows coincide (so every smaller
-    // synthetic missed it). Writing the sidecar BEFORE that teardown captures
-    // the correct r(d); the diagnostic confirmed the values are right here and
-    // only wrong after the fine layer is destroyed.
-    auto finalizeCsls = [&]() {
-      AD_CORRECTNESS_CHECK(cslsR.size() == n);
-      logCslsDistribution(config_.name_, cslsR);
-      outputsCleanup.track(tmp(cslsPath));
-      ad_utility::MmapVector<float> out;
-      out.open(n, tmp(cslsPath));
-      ql::ranges::copy(cslsR, out.begin());
-    };
+    // r(d) is computed DIRECTLY into the memory-mapped `.csls` sidecar, never
+    // into a heap buffer: on full-scale builds (>4 GiB fine store, >2M rows,
+    // full index-build heap state) a latent heap corruption stomped a
+    // heap-allocated r(d) vector AFTER the values were correctly computed --
+    // the `CSLS_DEBUG_LOG` diagnostic read the correct distribution
+    // (p50 ~ 0.90, exact brute-force match) from the very same array that the
+    // log line and the persisted sidecar moments later showed as 0/1/1/1. A
+    // file-backed mmap lives outside the malloc arena, so a heap overflow
+    // cannot reach it; and since the sidecar IS the r(d) array, there is no
+    // separate copy-write step during which it could be clobbered.
+    outputsCleanup.track(tmp(cslsPath));
+    ad_utility::MmapVector<float> cslsR;
+    // Zero-filled: `open` truncates the fresh file to length and extends it
+    // with `truncate`, and POSIX zero-fills the extension.
+    cslsR.open(n, tmp(cslsPath));
     if (!cslsRInput_.empty()) {
       // Ingested: `add` enforced one value per row, so the permutation below
       // is total. Carried verbatim through the same sort/dedup as the rows.
       AD_CORRECTNESS_CHECK(cslsRInput_.size() == ids_.size());
-      cslsR.resize(n);
       for (size_t i = 0; i < n; ++i) {
         cslsR[i] = cslsRInput_[rows[i]];
       }
-      finalizeCsls();
     } else {
       const CslsFineLayer fine = openFineLayer();
       const size_t k = config_.cslsNeighbors_;
-      cslsR.assign(n, 0.f);
       // Optional diagnostic (env `CSLS_DEBUG_LOG`): capture the dedicated
       // graph's candidates for a spread of sample rows, then dump a full
       // diagnostic file next to the index. Inert unless the env var is set.
@@ -858,8 +856,9 @@ VectorIndexMetadata VectorIndexBuilder::build() {
                                     " cands:";
                   for (size_t i = 0; i < count && i < 12; ++i) {
                     dbg += " k=" + std::to_string(cand[i]) +
-                           (cand[i] == row ? "[self]" : "") + "(d=" +
-                           std::to_string(fine.distance(row, cand[i])) + ")";
+                           (cand[i] == row ? "[self]" : "") +
+                           "(d=" + std::to_string(fine.distance(row, cand[i])) +
+                           ")";
                   }
                   std::lock_guard<std::mutex> lg{cslsDebugMutex};
                   cslsDebugCands.push_back(std::move(dbg));
@@ -871,16 +870,19 @@ VectorIndexMetadata VectorIndexBuilder::build() {
         // query-time graph of step 6).
       }
       if (cslsDebug) {
-        writeCslsDebugLog(cslsPath + ".debug.txt", config_.name_, cslsR, fine, n,
-                          k, numThreads, cslsDebugCands);
+        writeCslsDebugLog(cslsPath + ".debug.txt", config_.name_,
+                          ql::span<const float>{cslsR.data(), cslsR.size()},
+                          fine, n, k, numThreads, cslsDebugCands);
         AD_LOG_WARN << "Vector index \"" << config_.name_
                     << "\": wrote CSLS r(d) diagnostic to " << cslsPath
                     << ".debug.txt (CSLS_DEBUG_LOG set)" << std::endl;
       }
-      // Persist BEFORE `fine` is destroyed at the end of this block (see the
-      // `finalizeCsls` comment): the teardown corrupts `cslsR` otherwise.
-      finalizeCsls();
     }
+    AD_CORRECTNESS_CHECK(cslsR.size() == n);
+    logCslsDistribution(config_.name_,
+                        ql::span<const float>{cslsR.data(), cslsR.size()});
+    // `cslsR`'s destructor writes the trailer and flushes; the `.tmp` file is
+    // renamed into place in step 8.
   }
 
   // 7. Write the metadata file.
