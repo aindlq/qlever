@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <iomanip>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -423,6 +424,20 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
              ad_utility::AccessPattern::Random);
     if (impl.cslsR_.size() != impl.meta_.numVectors_) {
       complainInterrupted("the csls sidecar size on disk");
+    }
+    // The on-disk r(d) distribution the RUNTIME will actually use, computed
+    // fresh in THIS (server) process and independent of any build-time log --
+    // same min/p50/p95/max shape so it can be compared directly, at full float
+    // precision (setprecision(9)) so a near-1 value cannot masquerade as 1.
+    if (impl.cslsR_.size() > 0) {
+      std::vector<float> sidecar(impl.cslsR_.begin(), impl.cslsR_.end());
+      std::sort(sidecar.begin(), sidecar.end());
+      const size_t nn = sidecar.size();
+      AD_LOG_INFO << std::setprecision(9) << "Vector index \"" << name
+                  << "\": loaded csls r(d) sidecar: min/p50/p95/max = "
+                  << sidecar.front() << "/" << sidecar[nn / 2] << "/"
+                  << sidecar[std::min(nn - 1, (nn * 95) / 100)] << "/"
+                  << sidecar.back() << std::endl;
     }
   }
 

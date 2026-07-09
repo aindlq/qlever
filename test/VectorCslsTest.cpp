@@ -504,6 +504,31 @@ TEST(VectorCsls, bf16NpyInputRdMatchesF32Input) {
 }
 
 // _____________________________________________________________________________
+// The ON-DISK csls r(d) sidecar the RUNTIME uses (read via the loaded index)
+// exposes a real r(d) spread -- min < max, matching the known fixture values --
+// NOT a degenerate all-1.0. I.e. what is persisted is what the build computed;
+// the load-time diagnostic (`loaded csls r(d) sidecar: min/p50/p95/max = ...`,
+// full-precision, in VectorIndex::open) reports these same values on startup.
+TEST(VectorCsls, loadedCslsSidecarIsRealDistribution) {
+  auto* qec = qecWithCslsIndexes();
+  auto getId = makeGetId(qec->getIndex());
+  auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "embc");
+  ASSERT_TRUE(vidx != nullptr);
+  std::vector<float> r;
+  for (std::string_view iri : {"<a>", "<b>", "<c>", "<d>", "<e>"}) {
+    auto v = vidx->cslsRForEntity(getId(std::string{iri}));
+    ASSERT_TRUE(v.has_value()) << iri;
+    r.push_back(v.value());
+  }
+  std::sort(r.begin(), r.end());
+  // Fixture r(d) (cslsNeighbors=2): a=0.7 b=0.88 c=0.88 d=0.7 e=0.
+  EXPECT_NEAR(r.front(), 0.0f, 1e-3f);
+  EXPECT_NEAR(r.back(), 0.88f, 1e-2f);
+  EXPECT_LT(r.front(), r.back())
+      << "a degenerate all-equal (1/1/1) sidecar would fail here";
+}
+
+// _____________________________________________________________________________
 // Binary scan + bf16 rerank WITHOUT a main graph (`hnsw: false`): the r(d)
 // self-kNN runs entirely on the FINE bf16 (cosine) layer -- the coarse binary
 // Hamming bytes never participate -- so csls builds a correct `.csls` (and no
