@@ -1312,16 +1312,17 @@ std::vector<ScoredEntity> searchExactBytes(
     return top.sorted();
   }
 
-  AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
-              << "\": filtered scan (" << candidates->size() << " candidates)"
-              << std::endl;
   // Restricted search: merge-join the candidate id set against the id-sorted
-  // `.rowmap`. This replaces both the old per-candidate `lower_bound` gather
-  // (sparse sets) and the whole-index membership scan (dense sets) with a
-  // single O(#candidates + #rows) pass whose row reads are sequential (see
-  // `mergeJoinRowmap`). NOTE: an empty candidate set deliberately yields an
-  // empty result -- the caller has already restricted the search space to
-  // nothing.
+  // `.rowmap` to find which candidates are live members (`mergeJoinRowmap`
+  // emits each member row at most once). This replaces both the old
+  // per-candidate `lower_bound` gather (sparse sets) and the whole-index
+  // membership scan (dense sets) with a single O(#candidates + #rows) pass
+  // whose row reads are sequential. A SUPERSET candidate set -- every live
+  // vector is a candidate, the common shape of a broad metadata pre-filter --
+  // is detected after the merge and routed to the dedicated whole-index sweep.
+  // NOTE: an empty candidate set deliberately yields an empty result -- the
+  // caller restricted the search space to nothing. The branch taken (whole-
+  // index sweep vs scattered gather) is logged once the merge count is known.
   std::vector<uint64_t> candBits;
   candBits.reserve(candidates->size());
   for (Id c : candidates.value()) {
@@ -1344,7 +1345,7 @@ std::vector<ScoredEntity> searchExactBytes(
   // arrive in ascending row order on a monotonic store, so the sequential-scan
   // hint still applies while scoring.
   std::vector<std::pair<size_t, uint64_t>> matched;
-  matched.reserve(candBits.size());
+  matched.reserve(std::min<size_t>(candBits.size(), impl.numLive()));
   bool monotonic = true;
   {
     SeqScanHint hint{layer, seqHint};
@@ -1359,6 +1360,42 @@ std::vector<ScoredEntity> searchExactBytes(
   if (seqHint && !monotonic) {
     impl.gatherNonMonotonic_.store(true, std::memory_order_relaxed);
   }
+  const size_t live = impl.numLive();
+  // Candidate set covers EVERY live vector => the filtered top-k IS the
+  // whole-index top-k. Take the dedicated whole-index sweep (a running
+  // `p += stride` pointer walk with direct key reads -- no per-row multiply or
+  // gather callback) instead of the scattered gather. Correct ONLY at EXACT
+  // coverage: with even one live non-candidate, the sweep would score it too
+  // and change the result.
+  if (matched.size() == live) {
+    int numThreads = 1;
+#ifdef _OPENMP
+    if (live >= VEC_SEARCH_PARALLEL_THRESHOLD) {
+      numThreads = vectorSearchThreadCap();
+    }
+#endif
+    AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
+                << "\": filtered scan: " << candidates->size()
+                << " candidates cover all " << live
+                << " live vectors -> whole-index sweep (" << live
+                << " vectors, " << numThreads << " threads)" << std::endl;
+    SeqScanHint hint{layer, !layer.alignedBuf_};
+    scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
+                           checkInterrupt, numThreads);
+    reportScored(live);
+    return top.sorted();
+  }
+  int gatherThreads = 1;
+#ifdef _OPENMP
+  if (matched.size() >= VEC_SEARCH_PARALLEL_THRESHOLD) {
+    gatherThreads = vectorSearchThreadCap();
+  }
+#endif
+  AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
+              << "\": filtered scan: " << candidates->size() << " candidates -> "
+              << matched.size() << " of " << live
+              << " live members (scattered gather, " << gatherThreads
+              << " threads)" << std::endl;
   {
     SeqScanHint hint{layer, seqHint && monotonic};
     scanIntoTopK(

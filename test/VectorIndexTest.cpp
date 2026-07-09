@@ -391,6 +391,59 @@ TEST(VectorIndex, exactSearchOverCandidateSubset) {
 }
 
 // _____________________________________________________________________________
+// A candidate set that COVERS every live vector (here a superset -- the list is
+// duplicated, so it is larger than the index, exactly the shape of a broad
+// metadata pre-filter) must be recognised and routed to the whole-index sweep
+// (the `p += stride` pointer walk), not the scattered gather. The result must
+// be bit-identical to an unrestricted whole-index search, and the log must name
+// the branch taken. A strict subset keeps the gather path.
+TEST(VectorIndex, candidatesCoveringWholeIndexTakeWholeIndexSweep) {
+  auto b = buildTmp(/*withHnsw=*/false);
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+  const auto& query = b.data.vecs[7];
+
+  // Reference: the unrestricted whole-index top-k.
+  auto whole = idx.searchExact(query, 10);
+
+  // Candidates = every member, repeated (a superset larger than the index).
+  std::vector<Id> superset;
+  for (size_t i = 0; i < NUM_VECTORS; ++i) {
+    superset.push_back(b.data.id(i));
+  }
+  superset.insert(superset.end(), superset.begin(),
+                  superset.begin() + static_cast<long>(NUM_VECTORS));
+
+  testing::internal::CaptureStdout();
+  size_t numScored = 0;
+  auto covered = idx.searchExact(query, 10, ql::span<const Id>{superset},
+                                 std::nullopt, {}, &numScored);
+  std::string log = testing::internal::GetCapturedStdout();
+
+  EXPECT_EQ(numScored, idx.numLiveVectors());
+  EXPECT_NE(log.find("whole-index sweep"), std::string::npos) << log;
+  EXPECT_EQ(log.find("scattered gather"), std::string::npos) << log;
+  ASSERT_EQ(covered.size(), whole.size());
+  for (size_t i = 0; i < whole.size(); ++i) {
+    EXPECT_EQ(covered[i].entity_.getBits(), whole[i].entity_.getBits()) << i;
+    EXPECT_EQ(covered[i].distance_, whole[i].distance_) << i;
+  }
+
+  // A strict SUBSET instead keeps the scattered-gather path.
+  std::vector<Id> subset;
+  for (size_t i = 0; i < NUM_VECTORS; i += 3) {
+    subset.push_back(b.data.id(i));
+  }
+  testing::internal::CaptureStdout();
+  auto partial = idx.searchExact(query, 10, ql::span<const Id>{subset});
+  std::string log2 = testing::internal::GetCapturedStdout();
+  EXPECT_NE(log2.find("scattered gather"), std::string::npos) << log2;
+  EXPECT_EQ(log2.find("whole-index sweep"), std::string::npos) << log2;
+
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
 // Regression test: an EMPTY candidate list must yield an empty result, not
 // fall back to searching the whole index (the restriction matched nothing).
 TEST(VectorIndex, emptyCandidateListYieldsEmptyResult) {
