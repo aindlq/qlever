@@ -34,7 +34,10 @@ namespace sparqlExpression {
 //                     vec:embed(<.../index/emb>, "a red bicycle")) AS ?d)
 //
 // Results are MEMOIZED by input, so a constant input embeds exactly once per
-// query (and a per-row variable embeds once per distinct value). NOTE: passing
+// query (and a per-row variable embeds once per distinct value); underneath,
+// the PROCESS-LIFETIME query-embedding cache (`embedQueryCached`, shared with
+// the SERVICE's `vec:queryText`/`vec:imageUrl` path) makes a repeat of the
+// same input across queries skip the round trip, too. NOTE: passing
 // the query as raw bytes instead of a float-list string -- a query-side vector
 // value that is serialized only on projection -- is a possible future
 // optimization for a hot per-row embed; a constant query embeds once, so the

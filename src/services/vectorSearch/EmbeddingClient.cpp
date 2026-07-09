@@ -21,8 +21,12 @@
 #endif
 
 #include "backports/StartsWithAndEndsWith.h"
+#include "util/Cache.h"
+#include "util/ConcurrentCache.h"
 #include "util/Exception.h"
 #include "util/HashMap.h"
+#include "util/MemorySize/MemorySize.h"
+#include "util/Timer.h"
 #include "util/http/HttpClient.h"
 #include "util/http/HttpUtils.h"
 #include "util/http/beast.h"
@@ -371,5 +375,82 @@ std::vector<std::vector<float>> embedBatchOpenAI(
     ad_utility::SharedCancellationHandle handle) {
   return embedManyOpenAI(baseUrl, model, texts, std::move(handle));
 }
+
+namespace {
+// One entry of the process-wide query-embedding cache. Alongside the
+// embedding we remember the wall time of the round trip that produced it (so
+// a hit can report how much time it saved) and the size of the cache key (so
+// the byte budget also accounts for large keys, e.g. multi-megabyte
+// `data:...;base64,` image inputs -- the `ValueSizeGetter` below only ever
+// sees the value).
+struct QueryEmbeddingEntry {
+  std::vector<float> embedding_;
+  double computeMs_;
+  size_t keyBytes_;
+};
+
+struct QueryEmbeddingEntrySizeGetter {
+  ad_utility::MemorySize operator()(const QueryEmbeddingEntry& entry) const {
+    return ad_utility::MemorySize::bytes(
+        entry.embedding_.size() * sizeof(float) + entry.keyBytes_ +
+        sizeof(QueryEmbeddingEntry));
+  }
+};
+
+using QueryEmbeddingCache = ad_utility::ConcurrentCache<ad_utility::LRUCache<
+    std::string, QueryEmbeddingEntry, QueryEmbeddingEntrySizeGetter>>;
+
+// Bounds of the query-embedding cache: a few thousand distinct query inputs
+// (an fp32 embedding is a few KB, so this is typically low tens of MB), a
+// hard byte budget on top, and a per-entry cap so one giant `data:` URI input
+// cannot evict everything else (an over-cap entry is simply not cached).
+constexpr size_t QUERY_EMBEDDING_CACHE_MAX_ENTRIES = 4096;
+constexpr ad_utility::MemorySize QUERY_EMBEDDING_CACHE_MAX_SIZE =
+    ad_utility::MemorySize::megabytes(64);
+constexpr ad_utility::MemorySize QUERY_EMBEDDING_CACHE_MAX_SIZE_SINGLE_ENTRY =
+    ad_utility::MemorySize::megabytes(8);
+
+// The PROCESS-LIFETIME query-embedding cache (lazily initialized, lives until
+// process exit). Purely a query-time concern: it is never persisted and does
+// not interact with the index or its build.
+QueryEmbeddingCache& queryEmbeddingCache() {
+  static QueryEmbeddingCache cache{QUERY_EMBEDDING_CACHE_MAX_ENTRIES,
+                                   QUERY_EMBEDDING_CACHE_MAX_SIZE,
+                                   QUERY_EMBEDDING_CACHE_MAX_SIZE_SINGLE_ENTRY};
+  return cache;
+}
+}  // namespace
+
+// ____________________________________________________________________________
+CachedQueryEmbedding embedQueryCached(
+    const std::string& baseUrl, const std::string& model, bool isImage,
+    const std::string& input,
+    const std::function<std::vector<float>()>& computeFunction) {
+  // '\x1f' (ASCII unit separator) keeps the key fields from aliasing each
+  // other (it cannot appear in a URL or model name).
+  std::string key = absl::StrCat(baseUrl, "\x1f", model, "\x1f",
+                                 isImage ? "image" : "text", "\x1f", input);
+  size_t keyBytes = key.size();
+  auto compute = [&computeFunction, keyBytes]() -> QueryEmbeddingEntry {
+    ad_utility::Timer timer{ad_utility::Timer::Started};
+    std::vector<float> embedding = computeFunction();
+    return QueryEmbeddingEntry{std::move(embedding),
+                               timer.value().count() / 1000.0, keyBytes};
+  };
+  auto result = queryEmbeddingCache().computeOnce(
+      key, compute, /*onlyReadFromCache=*/false,
+      [](const QueryEmbeddingEntry&) { return true; });
+  // NOTE: a concurrent waiter that piggybacked on another thread's in-flight
+  // computation also gets status `computed` -- it did wait for the round
+  // trip, so reporting it as a miss is the honest choice.
+  bool cacheHit = result._cacheStatus != ad_utility::CacheStatus::computed;
+  const QueryEmbeddingEntry& entry = *result._resultPointer;
+  return CachedQueryEmbedding{std::shared_ptr<const std::vector<float>>{
+                                  result._resultPointer, &entry.embedding_},
+                              cacheHit, entry.computeMs_};
+}
+
+// ____________________________________________________________________________
+void clearQueryEmbeddingCacheForTesting() { queryEmbeddingCache().clearAll(); }
 
 }  // namespace qlever::vector

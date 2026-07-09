@@ -36,7 +36,9 @@ class VectorIndex;
 using QueryPoint = std::variant<std::monostate, std::vector<float>, Id>;
 
 // Resolve the query point of `config` against the index `vidx` (embedding text
-// or an image via the index's endpoint if needed). Throws on a dimension
+// or an image via the index's endpoint if needed; the embedding goes through
+// the process-lifetime query-embedding cache, see `embedQueryCached`, so a
+// repeat of the same input skips the round trip). Throws on a dimension
 // mismatch or a missing embedding endpoint. Used by the `VectorSearch`
 // operation (the SERVICE's `vec:queryText`/`vec:imageUrl` surface); the
 // function surface embeds via `vec:embed` instead.
@@ -44,10 +46,10 @@ QueryPoint resolveQueryPoint(const VectorSearchConfiguration& config,
                              const VectorIndex& vidx, const IndexImpl& index,
                              ad_utility::SharedCancellationHandle handle);
 
-// Log one phase of a vector SERVICE search at INFO (mirroring the `vec:distance`
-// timing line), so a SERVICE query reports where its time went: query embedding,
-// the brute-force/coarse scan, and the rerank pass. `numVectors`, when given, is
-// the number of vectors that phase touched.
+// Log one phase of a vector SERVICE search at INFO (mirroring the
+// `vec:distance` timing line), so a SERVICE query reports where its time went:
+// query embedding, the brute-force/coarse scan, and the rerank pass.
+// `numVectors`, when given, is the number of vectors that phase touched.
 void logVectorSearchPhase(std::string_view indexName, std::string_view phase,
                           double milliseconds,
                           std::optional<size_t> numVectors = std::nullopt);

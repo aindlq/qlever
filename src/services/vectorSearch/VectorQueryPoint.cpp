@@ -18,7 +18,6 @@
 #include "services/vectorSearch/EmbeddingClient.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "util/Log.h"
-#include "util/Timer.h"
 
 namespace qlever::vector {
 
@@ -51,6 +50,23 @@ std::string buildImagePayload(
   }
   return image.value_;
 }
+
+// Report the embedding phase of a SERVICE search: the usual timing line for a
+// real round trip, or an explicit `CACHED (... ms saved)` line when the
+// process-wide query-embedding cache answered (so a hit is visible in the
+// log).
+void logQueryEmbedding(std::string_view indexName, std::string_view modality,
+                       const CachedQueryEmbedding& cached) {
+  if (cached.cacheHit_) {
+    AD_LOG_INFO << "vec:search[" << indexName << "]: query embedding ("
+                << modality << ") CACHED (" << cached.computeMs_ << " ms saved)"
+                << std::endl;
+  } else {
+    logVectorSearchPhase(indexName,
+                         absl::StrCat("query embedding (", modality, ")"),
+                         cached.computeMs_);
+  }
+}
 }  // namespace
 
 // ____________________________________________________________________________
@@ -71,11 +87,17 @@ QueryPoint resolveQueryPoint(const VectorSearchConfiguration& config,
           "' has no embedding endpoint configured, so `vec:queryText` cannot "
           "be used.")};
     }
-    ad_utility::Timer embedTimer{ad_utility::Timer::Started};
-    query = embedTextOpenAI(meta.embeddingUrl_, meta.embeddingModel_,
-                            config.queryText_.value(), std::move(handle));
-    logVectorSearchPhase(config.indexName_, "query embedding (text)",
-                         embedTimer.value().count() / 1000.0);
+    // Embed through the process-lifetime query-embedding cache: a repeat of
+    // the same text (with any retrieval parameters) skips the round trip.
+    const std::string& text = config.queryText_.value();
+    CachedQueryEmbedding cached = embedQueryCached(
+        meta.embeddingUrl_, meta.embeddingModel_, /*isImage=*/false, text,
+        [&meta, &text, &handle]() {
+          return embedTextOpenAI(meta.embeddingUrl_, meta.embeddingModel_, text,
+                                 handle);
+        });
+    query = *cached.embedding_;
+    logQueryEmbedding(config.indexName_, "text", cached);
   } else if (config.queryImage_.has_value()) {
     const auto& meta = vidx.metadata().config_;
     if (meta.embeddingUrl_.empty()) {
@@ -84,12 +106,18 @@ QueryPoint resolveQueryPoint(const VectorSearchConfiguration& config,
           "' has no embedding endpoint configured, so image queries cannot be "
           "used.")};
     }
-    ad_utility::Timer embedTimer{ad_utility::Timer::Started};
-    query = embedImageOpenAI(meta.embeddingUrl_, meta.embeddingModel_,
-                             buildImagePayload(config.queryImage_.value()),
-                             std::move(handle));
-    logVectorSearchPhase(config.indexName_, "query embedding (image)",
-                         embedTimer.value().count() / 1000.0);
+    // Key the cache by the PAYLOAD actually sent to the endpoint (URL or
+    // `data:` URI), so `vec:imageUrl` and raw-base64 inputs that resolve to
+    // the same payload share one entry.
+    std::string payload = buildImagePayload(config.queryImage_.value());
+    CachedQueryEmbedding cached = embedQueryCached(
+        meta.embeddingUrl_, meta.embeddingModel_, /*isImage=*/true, payload,
+        [&meta, &payload, &handle]() {
+          return embedImageOpenAI(meta.embeddingUrl_, meta.embeddingModel_,
+                                  payload, handle);
+        });
+    query = *cached.embedding_;
+    logQueryEmbedding(config.indexName_, "image", cached);
   } else {
     TripleComponent tc{ad_utility::triple_component::Iri::fromIriref(
         config.queryEntityIri_.value())};

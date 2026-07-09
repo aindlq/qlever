@@ -589,19 +589,21 @@ TEST(VectorSearchService, annotateFormEstimateCappedAtMembers) {
   config.indexName_ = "clip";
   config.leftVariable_ = Variable{"?x"};
   config.resultVariable_ = Variable{"?x"};  // annotate in place (?in == ?out)
-  config.queryVector_ = std::vector<float>{1, 0, 0, 0};  // a query point -> FORM P
-  config.keepAllCandidates_ = true;                      // annotate, no vec:k
+  config.queryVector_ =
+      std::vector<float>{1, 0, 0, 0};  // a query point -> FORM P
+  config.keepAllCandidates_ = true;    // annotate, no vec:k
   // Five DISTINCT candidates, one row each.
-  auto child =
-      makeChild(qec, {Variable{"?x"}},
-                {{getId("<e0>")}, {getId("<e1>")}, {getId("<e2>")},
-                 {getId("<e3>")}, {getId("<e4>")}});
+  auto child = makeChild(qec, {Variable{"?x"}},
+                         {{getId("<e0>")},
+                          {getId("<e1>")},
+                          {getId("<e2>")},
+                          {getId("<e3>")},
+                          {getId("<e4>")}});
   VectorSearchJoin join{qec, config, child};
   auto vidx = qlever::vector::getVectorIndex(qec->getIndex(), "clip");
   ASSERT_TRUE(vidx != nullptr);
   double mult = std::max(1.0f, child->getMultiplicity(0));
-  uint64_t memberBound =
-      static_cast<uint64_t>(vidx->numLiveVectors() * mult);
+  uint64_t memberBound = static_cast<uint64_t>(vidx->numLiveVectors() * mult);
   EXPECT_EQ(join.getSizeEstimate(),
             std::min<uint64_t>(child->getSizeEstimate(), memberBound));
   // With fewer members than candidates, it is STRICTLY tighter than the raw
@@ -1052,6 +1054,88 @@ TEST(VectorSearchService, imageEmbeddingRequestBodyIsVllmMultimodal) {
     // The body must NOT contain the text path's `input` field.
     EXPECT_FALSE(body.contains("input"));
   }
+}
+
+// _____________________________________________________________________________
+// The process-lifetime query-embedding cache: the SAME input embeds exactly
+// once across repeated searches (retrieval parameters like `vec:k` are not
+// part of the key by construction), while a different input, a different
+// modality for the same string, a different model, or a different endpoint
+// each get their own entry.
+TEST(VectorSearchService, queryEmbeddingCacheEmbedsSameInputOnce) {
+  using qlever::vector::embedQueryCached;
+  qlever::vector::clearQueryEmbeddingCacheForTesting();
+
+  // A counting fake for the endpoint round trip: `embedding` is what the
+  // "endpoint" would return for this input.
+  size_t numRoundTrips = 0;
+  auto fakeEndpoint = [&numRoundTrips](std::vector<float> embedding) {
+    return [&numRoundTrips, embedding = std::move(embedding)]() {
+      ++numRoundTrips;
+      return embedding;
+    };
+  };
+
+  // First search with an image URL -> one round trip.
+  auto first =
+      embedQueryCached("http://endpoint", "clip", /*isImage=*/true,
+                       "http://img/cat.jpg", fakeEndpoint({1.f, 2.f, 3.f}));
+  EXPECT_FALSE(first.cacheHit_);
+  EXPECT_EQ(numRoundTrips, 1u);
+  EXPECT_THAT(*first.embedding_, ::testing::ElementsAre(1.f, 2.f, 3.f));
+
+  // A repeat search with the same image (any `vec:k`/threshold -- those never
+  // enter the key) -> served from the cache, NO second round trip.
+  auto repeat =
+      embedQueryCached("http://endpoint", "clip", /*isImage=*/true,
+                       "http://img/cat.jpg", fakeEndpoint({9.f, 9.f, 9.f}));
+  EXPECT_TRUE(repeat.cacheHit_);
+  EXPECT_EQ(numRoundTrips, 1u);
+  EXPECT_THAT(*repeat.embedding_, ::testing::ElementsAre(1.f, 2.f, 3.f));
+
+  // A DIFFERENT image -> its own entry, no collision with the first.
+  auto other =
+      embedQueryCached("http://endpoint", "clip", /*isImage=*/true,
+                       "http://img/dog.jpg", fakeEndpoint({4.f, 5.f, 6.f}));
+  EXPECT_FALSE(other.cacheHit_);
+  EXPECT_EQ(numRoundTrips, 2u);
+  EXPECT_THAT(*other.embedding_, ::testing::ElementsAre(4.f, 5.f, 6.f));
+  EXPECT_THAT(*embedQueryCached("http://endpoint", "clip", true,
+                                "http://img/cat.jpg", fakeEndpoint({}))
+                   .embedding_,
+              ::testing::ElementsAre(1.f, 2.f, 3.f));
+
+  // The same STRING as text vs as an image URL, under a different model, or
+  // against a different endpoint -> distinct keys, a round trip each.
+  EXPECT_FALSE(embedQueryCached("http://endpoint", "clip", /*isImage=*/false,
+                                "http://img/cat.jpg",
+                                fakeEndpoint({7.f, 8.f, 9.f}))
+                   .cacheHit_);
+  EXPECT_EQ(numRoundTrips, 3u);
+  EXPECT_FALSE(embedQueryCached("http://endpoint", "other-model", true,
+                                "http://img/cat.jpg", fakeEndpoint({1.f}))
+                   .cacheHit_);
+  EXPECT_EQ(numRoundTrips, 4u);
+  EXPECT_FALSE(embedQueryCached("http://other-endpoint", "clip", true,
+                                "http://img/cat.jpg", fakeEndpoint({1.f}))
+                   .cacheHit_);
+  EXPECT_EQ(numRoundTrips, 5u);
+
+  // A FAILED round trip is not cached: the next attempt tries again.
+  auto throwingEndpoint = [&numRoundTrips]() -> std::vector<float> {
+    ++numRoundTrips;
+    throw std::runtime_error{"endpoint down"};
+  };
+  EXPECT_THROW(embedQueryCached("http://endpoint", "clip", false, "flaky",
+                                throwingEndpoint),
+               std::runtime_error);
+  EXPECT_EQ(numRoundTrips, 6u);
+  EXPECT_FALSE(embedQueryCached("http://endpoint", "clip", false, "flaky",
+                                fakeEndpoint({2.f}))
+                   .cacheHit_);
+  EXPECT_EQ(numRoundTrips, 7u);
+
+  qlever::vector::clearQueryEmbeddingCacheForTesting();
 }
 
 // _____________________________________________________________________________

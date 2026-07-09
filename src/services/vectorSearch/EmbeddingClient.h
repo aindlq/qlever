@@ -8,6 +8,8 @@
 #ifndef QLEVER_SRC_SERVICES_VECTORSEARCH_EMBEDDINGCLIENT_H
 #define QLEVER_SRC_SERVICES_VECTORSEARCH_EMBEDDINGCLIENT_H
 
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,6 +61,46 @@ std::vector<std::vector<float>> embedBatchOpenAI(
     const std::string& baseUrl, const std::string& model,
     const std::vector<std::string>& texts,
     ad_utility::SharedCancellationHandle handle);
+
+// The result of a cached query-embedding lookup (see `embedQueryCached`).
+struct CachedQueryEmbedding {
+  // The embedding; never null. Points into the shared cache entry (the
+  // `shared_ptr` keeps the entry's storage alive past eviction).
+  std::shared_ptr<const std::vector<float>> embedding_;
+  // True iff the embedding was served from the process-wide cache, i.e. NO
+  // endpoint round trip happened for this call.
+  bool cacheHit_;
+  // Wall time of the endpoint round trip in milliseconds: the one THIS call
+  // performed on a miss, or -- on a hit -- the ORIGINAL one that produced the
+  // cached value (i.e. roughly the time the hit saved).
+  double computeMs_;
+};
+
+// Compute a QUERY embedding through the PROCESS-LIFETIME query-embedding
+// cache: a bounded (LRU + byte budget), thread-safe cache shared by all
+// queries, so repeat queries with the same embed input skip the embedding
+// round trip -- typically the dominant cost of a vector-SERVICE query.
+//
+// The cache key is exactly (`baseUrl`, `model`, `isImage`, `input`) -- i.e.
+// the embedding-endpoint identity, the modality (the same string embeds
+// differently as text vs as an image URL), and the exact input -- and NOTHING
+// else: retrieval parameters (`vec:k`, thresholds, ...) never enter the key,
+// so the same input embeds once regardless of them. On a miss,
+// `computeFunction` (which must perform the actual round trip and be
+// deterministic in the key) runs WITHOUT any cache lock held; concurrent
+// misses on the same key compute once and share the result (the
+// `ConcurrentCache` in-progress machinery). A failed computation is not
+// cached. The cache lives for the lifetime of the process (a lazily
+// initialized function-local static); it is a query-time concern only and
+// never touches the index or any persisted file.
+CachedQueryEmbedding embedQueryCached(
+    const std::string& baseUrl, const std::string& model, bool isImage,
+    const std::string& input,
+    const std::function<std::vector<float>()>& computeFunction);
+
+// TESTING ONLY: drop all entries of the process-wide query-embedding cache,
+// so tests start from a clean slate.
+void clearQueryEmbeddingCacheForTesting();
 
 }  // namespace qlever::vector
 

@@ -25,7 +25,6 @@
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "util/Exception.h"
 #include "util/Log.h"
-#include "util/Timer.h"
 
 namespace sparqlExpression {
 
@@ -106,28 +105,39 @@ ExpressionResult VectorEmbedExpression::evaluate(
   // The accumulated wall time of the REAL embedding requests of this
   // `evaluate` block (cache hits cost nothing and are not counted), logged
   // once below -- never per row.
-  ad_utility::Timer requestTimer{ad_utility::Timer::Stopped};
+  double requestMs = 0.0;
   size_t numRequests = 0;
 
   // Embed one input, MEMOIZED by (kind, value): a constant input embeds once,
-  // a per-row variable embeds once per distinct value.
+  // a per-row variable embeds once per distinct value. The per-instance
+  // `cache_` holds the SERIALIZED float-list string; underneath it, the
+  // process-lifetime query-embedding cache (`embedQueryCached`, shared with
+  // the SERVICE's `vec:queryText`/`vec:imageUrl` path) makes repeats across
+  // queries skip the endpoint round trip, too.
   auto embedMemoized = [&](const EmbedInput& input) -> const std::string& {
     std::string key = absl::StrCat(input.isImage_ ? "i:" : "t:", input.value_);
     if (auto it = cache_.find(key); it != cache_.end()) {
       return it->second;
     }
-    requestTimer.cont();
-    std::vector<float> embedding =
-        input.isImage_ ? qlever::vector::embedImageOpenAI(
-                             config.embeddingUrl_, config.embeddingModel_,
-                             input.value_, context->cancellationHandle_)
-                       : qlever::vector::embedTextOpenAI(
-                             config.embeddingUrl_, config.embeddingModel_,
-                             input.value_, context->cancellationHandle_);
-    requestTimer.stop();
-    ++numRequests;
+    qlever::vector::CachedQueryEmbedding cached =
+        qlever::vector::embedQueryCached(
+            config.embeddingUrl_, config.embeddingModel_, input.isImage_,
+            input.value_, [&]() {
+              return input.isImage_
+                         ? qlever::vector::embedImageOpenAI(
+                               config.embeddingUrl_, config.embeddingModel_,
+                               input.value_, context->cancellationHandle_)
+                         : qlever::vector::embedTextOpenAI(
+                               config.embeddingUrl_, config.embeddingModel_,
+                               input.value_, context->cancellationHandle_);
+            });
+    if (!cached.cacheHit_) {
+      requestMs += cached.computeMs_;
+      ++numRequests;
+    }
     return cache_
-        .emplace(std::move(key), qlever::vector::toFloatListString(embedding))
+        .emplace(std::move(key),
+                 qlever::vector::toFloatListString(*cached.embedding_))
         .first->second;
   };
 
@@ -168,10 +178,10 @@ ExpressionResult VectorEmbedExpression::evaluate(
       },
       std::move(inputResult));
   // Only log when at least one REAL endpoint round-trip happened; a block
-  // served purely from the memoization cache stays silent.
+  // served purely from the memoization caches stays silent.
   if (numRequests > 0) {
     AD_LOG_INFO << "vec:embed[" << indexName_ << "]: embedded " << numRequests
-                << " input(s) in " << requestTimer.msecs().count() << " ms via "
+                << " input(s) in " << requestMs << " ms via "
                 << config.embeddingUrl_ << std::endl;
   }
   return result;
