@@ -235,6 +235,11 @@ if (QLEVER_WITH_VECTOR_SEARCH)
     # residency, the fine-layer `vec:distance` baseline, and the SERVICE's
     # coarse-scan-then-rerank pass (`vec:rerankK`/`vec:bindCoarseScore`).
     addLinkAndDiscoverTest(VectorRerankTest engine service_vectorSearch)
+
+    # The CSLS retrieval cut: the `csls`/`cslsNeighbors`/`cslsR` build keys
+    # (the `.csls` r(d) sidecar) and the query-time `vec:cslsThreshold`
+    # filter (`vec:bindCsls`, FORM W + FORM P).
+    addLinkAndDiscoverTest(VectorCslsTest engine service_vectorSearch)
 endif ()
 
 # BufferedVectorTest also uses conflicting filenames.
