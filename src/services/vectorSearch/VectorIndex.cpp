@@ -1991,6 +1991,211 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelect(
   return sel.drainSorted();
 }
 
+// The two-layer CSLS coarse pass for an INTEGER coarse metric (the binary scan
+// layer's Hamming distance is an integer in [0, distMax=dim]): select the
+// coarse-best `topM` (the first rerank batch) via a COUNTING/HISTOGRAM select
+// instead of a bounded heap. One compute pass writes every Hamming distance
+// into `coarseDists[i]` (non-null; reused for the rare widening -- the Hamming
+// is NEVER recomputed) and bins it into per-thread histograms over `dim+1`
+// small integer buckets (cache-resident, branchless increment). Merging the
+// tiny histograms and walking the cumulative counts yields the k-th-smallest
+// distance in O(dim); a final O(n) collect pass gathers every row below that
+// boundary plus the smallest-scoring-index rows AT the boundary. No `k log k`
+// heap, no O(threads*k) merge, so it neither anti-scales with threads nor
+// with `k` (unlike `CoarseSelector`, whose ~k*ln(n/k) cache-spilling heap
+// pop/pushes dominated a whole-index CSLS query).
+//
+// BIT-IDENTICAL to `coarseSweepSelect`/`byCoarse`: it returns exactly the
+// `topM` smallest `(distance, index)` pairs ascending. Rows below the boundary
+// distance are all included; the boundary bucket is filled from the SMALLEST
+// scoring indices first (the ascending scan encounters them in index order),
+// which is precisely the `(distance, index)` tiebreak, and the final `sort`
+// on the raw (exact-integer) float distances reproduces that total order.
+template <typename LayerT, typename RowFn>
+std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
+    const LayerT& layer, const char* queryBytes, size_t n, const RowFn& rowOf,
+    bool contiguous, float* coarseDists, size_t topM, size_t distMax,
+    const CheckInterruptCallback& checkInterrupt) {
+  const size_t m = std::min(topM, n);
+  const size_t nb = distMax + 1;  // buckets 0..distMax
+  const bool compact = layer.stride_ <= 256;
+  const size_t pfAhead = compact ? 32 : 4;
+  // Bucket of an (exact non-negative integer) coarse distance. A plain
+  // truncating cast is exact for the Hamming popcount-as-float (no `lround`,
+  // which is a slow non-inlined call at this per-row rate); clamped
+  // defensively so a stray value can never index out of `nb`.
+  auto bucketOf = [nb](float d) -> size_t {
+    return std::min(static_cast<size_t>(d), nb - 1);
+  };
+  // The compute pass for a scoring-index range: Hamming distance ->
+  // `coarseDists[i]` and a histogram bin. `contiguous` (the whole-index /
+  // covering scan) carries a RUNNING row pointer -- one `p += stride` add per
+  // row and a relative prefetch -- instead of the `rowOf` multiply + double
+  // lambda call (a measurable slice at this per-row rate; the coarse compute
+  // otherwise matches the plain whole-index sweep). `chunkBreak(i)`, polled
+  // once per chunk, returns true to stop (a latched cancellation).
+  auto computeBins = [&](uint64_t* lh, size_t first, size_t last,
+                         const auto& chunkBreak) {
+    if (contiguous) {
+      const size_t stride = layer.stride_;
+      const char* p = layer.base() + first * stride;
+      for (size_t i = first; i < last; ++i, p += stride) {
+        if ((i - first) % VEC_SEARCH_PARALLEL_CHUNK == 0 && chunkBreak(i)) {
+          break;
+        }
+        if (compact) {
+          const char* f = p + 4096;
+          __builtin_prefetch(f, 0, 3);
+          __builtin_prefetch(f + 64, 0, 3);
+          __builtin_prefetch(f + 128, 0, 3);
+        }
+        const float d = layer.distanceBetweenBytes(queryBytes, p);
+        coarseDists[i] = d;
+        ++lh[bucketOf(d)];
+      }
+    } else {
+      for (size_t i = first; i < last; ++i) {
+        if ((i - first) % VEC_SEARCH_PARALLEL_CHUNK == 0 && chunkBreak(i)) {
+          break;
+        }
+        prefetchSweepRow(layer, rowOf, i, n, pfAhead, compact);
+        const float d = layer.distanceToRow(queryBytes, rowOf(i));
+        coarseDists[i] = d;
+        ++lh[bucketOf(d)];
+      }
+    }
+  };
+  std::vector<uint64_t> hist(nb, 0);
+#ifdef _OPENMP
+  const int numThreads = vectorSearchThreadCap();
+  if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+    std::vector<std::vector<uint64_t>> localHists(
+        static_cast<size_t>(numThreads), std::vector<uint64_t>(nb, 0));
+    std::atomic<bool> cancelled{false};
+    // An exception must never unwind out of the OpenMP region: poll the
+    // (throwing) interrupt once per chunk, latch, re-raise after.
+    auto chunkBreak = [&](size_t) -> bool {
+      if (cancelled.load(std::memory_order_relaxed)) {
+        return true;
+      }
+      if (checkInterrupt) {
+        try {
+          checkInterrupt();
+        } catch (...) {
+          cancelled.store(true, std::memory_order_relaxed);
+          return true;
+        }
+      }
+      return false;
+    };
+#pragma omp parallel num_threads(numThreads)
+    {
+      const size_t tid = static_cast<size_t>(omp_get_thread_num());
+      const size_t team = static_cast<size_t>(omp_get_num_threads());
+      const size_t first = n * tid / team;
+      const size_t last = n * (tid + 1) / team;
+      computeBins(localHists[tid].data(), first, last, chunkBreak);
+    }
+    if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+      checkInterrupt();  // re-raise outside the parallel region
+    }
+    for (const auto& lh : localHists) {
+      for (size_t b = 0; b < nb; ++b) {
+        hist[b] += lh[b];
+      }
+    }
+  } else
+#endif
+  {
+    // Serial: the (throwing) interrupt polled directly once per chunk.
+    auto chunkBreak = [&](size_t) -> bool {
+      if (checkInterrupt) {
+        checkInterrupt();
+      }
+      return false;
+    };
+    computeBins(hist.data(), 0, n, chunkBreak);
+  }
+  // 2. Boundary bucket `tb` = smallest distance whose cumulative count reaches
+  //    `m`; `below` rows are strictly closer, `need` come from the boundary.
+  size_t tb = 0;
+  size_t below = 0;
+  {
+    size_t cum = 0;
+    for (size_t b = 0; b < nb; ++b) {
+      cum += hist[b];
+      if (cum >= m) {
+        tb = b;
+        below = cum - hist[b];
+        break;
+      }
+    }
+  }
+  const size_t need = m - below;  // >= 1 whenever m >= 1
+  // 3. Collect: every row closer than `tb` (all `below` of them, order
+  //    irrelevant -- sorted below), plus the `need` SMALLEST-index rows at
+  //    `tb`. Parallel over contiguous ranges: each thread gathers its own
+  //    closer-rows and up to `need` of its boundary rows (its smallest
+  //    indices; capped since no single thread can contribute more than `need`
+  //    total). Threads own ascending index ranges, so walking them in order
+  //    yields the boundary rows smallest-index-first -- exactly the
+  //    `(distance, index)` tiebreak. The final `sort` on the (exact-integer)
+  //    float distances reproduces the total `(distance, index)` order.
+  using Pair = std::pair<float, uint64_t>;
+  std::vector<Pair> sel;
+  sel.reserve(m);
+  auto collectRange = [&](size_t first, size_t last, std::vector<Pair>& closer,
+                          std::vector<Pair>& boundary) {
+    for (size_t i = first; i < last; ++i) {
+      const float d = coarseDists[i];
+      const size_t b = bucketOf(d);
+      if (b < tb) {
+        closer.emplace_back(d, static_cast<uint64_t>(i));
+      } else if (b == tb && boundary.size() < need) {
+        boundary.emplace_back(d, static_cast<uint64_t>(i));
+      }
+    }
+  };
+#ifdef _OPENMP
+  if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+    const size_t T = static_cast<size_t>(numThreads);
+    std::vector<std::vector<Pair>> closer(T);
+    std::vector<std::vector<Pair>> boundary(T);
+#pragma omp parallel num_threads(numThreads)
+    {
+      const size_t tid = static_cast<size_t>(omp_get_thread_num());
+      const size_t team = static_cast<size_t>(omp_get_num_threads());
+      if (tid < team) {
+        collectRange(n * tid / team, n * (tid + 1) / team, closer[tid],
+                     boundary[tid]);
+      }
+    }
+    for (auto& c : closer) {
+      sel.insert(sel.end(), c.begin(), c.end());
+    }
+    size_t taken = 0;
+    for (auto& b : boundary) {
+      for (const Pair& e : b) {
+        if (taken == need) {
+          break;
+        }
+        sel.push_back(e);
+        ++taken;
+      }
+    }
+  } else
+#endif
+  {
+    std::vector<Pair> closer;
+    std::vector<Pair> boundary;
+    collectRange(0, n, closer, boundary);
+    sel = std::move(closer);
+    sel.insert(sel.end(), boundary.begin(), boundary.end());
+  }
+  std::sort(sel.begin(), sel.end());
+  return sel;
+}
+
 // Apply the KNEE autoCut (`CslsCut::Mode::Knee`) to `survivors` -- the
 // (maxDistance-filtered) reranked candidates with `csls >= floor`, in any
 // order. Sort them by CSLS DESCENDING, inspect only the top `cut.maxKeep_`
@@ -2331,29 +2536,47 @@ std::vector<CslsScoredEntity> searchCslsBytes(
 
   // TWO-LAYER: coarse scan of everything, fine rerank of a bounded chunk.
   //
-  // 2/3. Coarse sweep + first-batch selection, fused (`coarseSweepSelect`):
-  //    the coarse-best M = `cslsRerankFloor` -- the first rerank batch --
-  //    comes back in `sel`, ascending by (coarse distance, index), selected
-  //    via per-thread heaps DURING the sweep. This avoids the former per-query
-  //    `nth_element`/sort over ALL `n` candidates (a serial cost that did not
-  //    scale with threads and dominated a whole-index CSLS query). Smaller
-  //    coarse distance = closer (Hamming for a binary scan layer, cosine
-  //    distance for i8).
+  // 2/3. Coarse sweep + first-batch selection: the coarse-best M =
+  //    `cslsRerankFloor` -- the first rerank batch -- comes back in `sel`,
+  //    ascending by (coarse distance, index). The binary scan layer's Hamming
+  //    distance is a small integer, so it uses an O(n) counting/histogram
+  //    select (`coarseSweepSelectHistogram`) that scales with both threads and
+  //    k; a float coarse distance (i8's quantized cosine) uses a per-thread
+  //    bounded-heap select (`coarseSweepSelect`). Both avoid the former
+  //    per-query `nth_element`/sort over ALL `n` candidates that dominated a
+  //    whole-index CSLS query. Smaller coarse distance = closer.
   const size_t floorM = std::max<size_t>(impl.cslsRerankFloor_, 1);
+  // The binary scan layer's coarse distance is an integer Hamming count in
+  // [0, dim] -> a counting/histogram select (O(n), no heap, scales with
+  // threads AND k). Every other scan scalar's coarse distance is a quantized
+  // FLOAT (cosine/l2sq) -> the bounded-heap select.
+  const bool integerCoarse = impl.meta_.config_.scalar_ == VectorScalar::Binary;
+  // Materialized eagerly by the histogram path (it needs every distance for
+  // the collect pass and reuses it for any widening), lazily by the heap
+  // path's `ensureKeyed` on the first widen only.
+  std::unique_ptr<float[]> coarseDists;
   std::vector<std::pair<float, uint64_t>> sel;
   {
     SeqScanHint hint{impl.scan_, !impl.scan_.alignedBuf_};
-    // Pass null: the common no-widen path never needs the full coarse-distance
-    // array, only the coarse-best batch (`sel`).
-    sel = coarseSweepSelect(
-        impl.scan_, coarseQueryBytes, n, [&](size_t i) { return rowAt(i); },
-        nullptr, floorM, checkInterrupt);
+    if (integerCoarse) {
+      coarseDists.reset(new float[n]);
+      sel = coarseSweepSelectHistogram(
+          impl.scan_, coarseQueryBytes, n, [&](size_t i) { return rowAt(i); },
+          directWhole, coarseDists.get(), floorM, impl.dim(), checkInterrupt);
+    } else {
+      // Pass null: the common no-widen path never needs the full
+      // coarse-distance array, only the coarse-best batch (`sel`).
+      sel = coarseSweepSelect(
+          impl.scan_, coarseQueryBytes, n, [&](size_t i) { return rowAt(i); },
+          nullptr, floorM, checkInterrupt);
+    }
   }
   // The FULL coarse ranking is materialized only if the rerank WIDENS past the
   // first batch (a safety net that rarely fires). Until then `orderIdx(j)`
   // reads the coarse-best batch straight from `sel`. On the first widen,
-  // `ensureKeyed` re-sweeps the (cheap, quantized) coarse layer to recover
-  // every distance, builds the flat `(coarseDistance, index)` ranking, and
+  // `ensureKeyed` recovers every coarse distance (from `coarseDists` if the
+  // histogram path already has it, else a cheap re-sweep of the quantized
+  // coarse layer), builds the flat `(coarseDistance, index)` ranking, and
   // canonicalizes its first M entries to the SAME order `sel` holds (so the
   // already-computed fine distances stay aligned), leaving the tail as the
   // complement for further batches -- exactly the state the old all-at-once
@@ -2363,8 +2586,8 @@ std::vector<CslsScoredEntity> searchCslsBytes(
     if (!keyed.empty()) {
       return;
     }
-    std::unique_ptr<float[]> coarseDists{new float[n]};
-    {
+    if (!coarseDists) {
+      coarseDists.reset(new float[n]);
       SeqScanHint hint{impl.scan_, !impl.scan_.alignedBuf_};
       cslsDistanceSweep(
           impl.scan_, coarseQueryBytes, n, [&](size_t i) { return rowAt(i); },

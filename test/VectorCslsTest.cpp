@@ -721,7 +721,7 @@ TEST(VectorCsls, binaryScanRdAtScaleTracksReference) {
 // it. Two thresholds, raw-vector and entity query points.
 //
 // The fixture is TIERED around a common center (150 near vectors at 10-20
-// degrees, 100 mid vectors at 45-55 degrees, 950 random background): the cut
+// degrees, 100 mid vectors at 45-55 degrees, 2250 random background): the cut
 // regions of the two thresholds (~150 and ~250 survivors, picked from the
 // fixture's own csls distribution) are then COMPACT in coarse (Hamming) rank,
 // which is the regime the widen loop is built for -- with dim-256 sign codes
@@ -730,8 +730,13 @@ TEST(VectorCsls, binaryScanRdAtScaleTracksReference) {
 // after every survivor was reranked. (Fully random low-dimensional data has
 // no such coarse-fine correlation, and no floor short of "everything" -- the
 // production default relative to these sizes -- could guarantee equality.)
+//
+// N deliberately exceeds `VEC_SEARCH_PARALLEL_THRESHOLD` (2048) so the coarse
+// pass runs its PARALLEL histogram-select + parallel collect (binary scan =
+// integer Hamming), whose result this asserts is bit-identical to the
+// full-fine-sweep reference.
 TEST(VectorCsls, twoLayerCoarseRerankMatchesFullFineSweep) {
-  constexpr size_t N = 1200;
+  constexpr size_t N = 2500;
   constexpr size_t NEAR = 150;
   constexpr size_t MID = 100;
   constexpr size_t D = 256;

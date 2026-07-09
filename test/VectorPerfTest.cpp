@@ -598,3 +598,71 @@ TEST(VectorPerf, DISABLED_scanPathsBenchmark) {
   }
   printf("\n[done] scan-paths correctness checks passed\n");
 }
+
+// ___________________________________________________________________________
+// Round-3: the `cslsThreshold`-shaped whole-index query -- coarse sweep +
+// select the top-`cslsRerankFloor`=10,000, then a bounded fine rerank -- on the
+// PRELOADED (Residency::AlignedCopy, no page faults) 2.14M binary+bf16 index.
+// The coarse SELECTION at k=10,000 is the target. Set VECTOR_CSLS_PHASE=1 for
+// the per-phase split (setup / coarseSweepSelect / rerank+rq / cut+sort).
+TEST(VectorPerf, DISABLED_cslsSelectBenchmark) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  BenchSetup s = setupIndex();
+  const int maxT = maxHwThreads();
+  const int prodT = std::min(8, maxT);
+
+  // Preload both layers into aligned RAM (matches the production `aligned`
+  // residency: no mmap faults during the timed scans).
+  VectorIndex idx;
+  idx.open(s.basename, "perf", VectorIndex::Residency::AlignedCopy,
+           VectorIndex::Residency::AlignedCopy);
+
+  // Softmax cut needs no CSLS sidecar and shares the EXACT coarse
+  // sweep+select(topM=cslsRerankFloor) of the threshold/knee cuts (only the
+  // post-selection cut math differs, ~microseconds), so it faithfully measures
+  // the `cslsThreshold` coarse cost. softmaxN small so widening never fires.
+  CslsCut cut;
+  cut.mode_ = CslsCut::Mode::Softmax;
+  cut.softmaxN_ = 1000;
+
+  setThreads(maxT);
+  (void)idx.searchCsls(s.query, cut, 10);  // warm
+  (void)idx.searchExactCoarse(s.query, 500);
+
+  printf(
+      "\n=== VectorPerf CSLS select: n=%zu floorM=10000 (aligned/preloaded) "
+      "===\n",
+      s.n);
+  for (int t : {prodT, maxT}) {
+    setThreads(t);
+    // Pure coarse COMPUTE reference (running-pointer whole-index sweep, tiny
+    // heap): the floor the CSLS coarse pass should approach.
+    auto [pcMn, pcMd] =
+        timeReps(s.reps, [&] { idx.searchExactCoarse(s.query, 500); });
+    char label[80];
+    snprintf(label, sizeof label, "  ref: plain coarse k=500, %2d thr", t);
+    report(label, s.n, s.coarseRowBytes(), pcMn, pcMd);
+    auto [mn, md] = timeReps(s.reps, [&] { idx.searchCsls(s.query, cut, 10); });
+    snprintf(label, sizeof label, "CSLS whole-index (floorM 10000), %2d thr",
+             t);
+    report(label, s.n, s.coarseRowBytes(), mn, md);
+  }
+
+  // Correctness: histogram-select survivors are thread-count invariant and
+  // match the covering-candidate path (both must be bit-identical to the
+  // definitional (distance,index) coarse ranking).
+  {
+    setThreads(1);
+    auto serial = idx.searchCsls(s.query, cut, 10);
+    setThreads(maxT);
+    auto parallel = idx.searchCsls(s.query, cut, 10);
+    ASSERT_EQ(serial.size(), parallel.size());
+    for (size_t i = 0; i < serial.size(); ++i) {
+      EXPECT_EQ(serial[i].entity_, parallel[i].entity_) << i;
+      EXPECT_EQ(serial[i].distance_, parallel[i].distance_) << i;
+    }
+    printf("[cslsSelect] survivors: %zu (1-thread == %d-thread)\n",
+           serial.size(), maxT);
+  }
+  printf("[done] cslsSelect checks passed\n");
+}
