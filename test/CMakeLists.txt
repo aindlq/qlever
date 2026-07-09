@@ -215,6 +215,10 @@ addLinkAndDiscoverTest(MmapVectorTest)
 if (QLEVER_WITH_VECTOR_SEARCH)
     addLinkAndDiscoverTest(VectorIndexTest vectorStorage)
 
+    # Performance benchmark of the exact whole-index scan (DISABLED_ tests
+    # only; run with --gtest_also_run_disabled_tests).
+    addLinkAndDiscoverTest(VectorPerfTest vectorStorage)
+
     # The `QLEVER_VECTOR_SEARCH_ENDPOINTS` runtime override of the persisted
     # embedding endpoints (env parsing + the in-memory-only mutator).
     addLinkAndDiscoverTest(VectorIndexEndpointOverrideTest vectorStorage)

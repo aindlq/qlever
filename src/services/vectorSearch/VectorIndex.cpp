@@ -24,7 +24,6 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <queue>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -143,12 +142,12 @@ struct VectorIndex::Impl {
     // Raw (unpadded) per-row byte length of this layer.
     size_t rowBytes_ = 0;
     // Byte stride between consecutive rows (>= `rowBytes_`). Derived from the
-    // metadata at open; for a `Residency::AlignedCopy` it becomes the padded
-    // stride of `alignedBuf_`.
+    // metadata at open; for a `Residency::AlignedCopy` it becomes the natural
+    // (compact) stride of `alignedBuf_`.
     size_t stride_ = 0;
-    // Optional 64-byte-aligned RAM copy of the whole matrix (`Residency`
-    // `AlignedCopy`). When set, `base()` reads from it (with the padded
-    // `stride_`) instead of the memory-mapped file.
+    // Optional 64-byte-aligned, hugepage-advised RAM copy of the whole matrix
+    // (`Residency::AlignedCopy`), rows at the natural stride. When set,
+    // `base()` reads from it instead of the memory-mapped file.
     std::unique_ptr<char, AlignedFree> alignedBuf_;
     // The residency strategy last applied (best-effort; see
     // `VectorIndex::residency()`). Stays `None` when the request was skipped
@@ -548,14 +547,18 @@ void makeLayerResident(LayerT& layer, VectorIndex::Residency residency,
       }
       break;
     case Residency::AlignedCopy: {
-      // Copy the matrix into a 64-byte aligned buffer with a padded stride so
-      // every row starts on a SIMD boundary (also fixes alignment for legacy
-      // v4 files whose on-disk stride is unpadded).
+      // Copy the matrix into a 64-byte aligned RAM buffer with the NATURAL
+      // (unpadded) row stride. The buffer start is SIMD-aligned, but rows are
+      // deliberately NOT padded to 64 bytes: the NumKong kernels use
+      // unaligned loads, while padding inflates the bytes streamed by the
+      // memory-bandwidth-bound whole-index sweep (e.g. +33% for a binary
+      // 1152-dim layer, 144 -> 192 B/row -- measurably slower than even the
+      // unpadded mmap). The anonymous buffer also gets `MADV_HUGEPAGE`,
+      // which cuts the TLB-miss cost that a 4-KiB-paged file mapping pays.
       const size_t rowBytes = layer.rowBytes_;
-      const size_t stride64 = alignUp(rowBytes);
       const size_t n = numRows;
       void* buf = nullptr;
-      if (posix_memalign(&buf, SIMD_ALIGNMENT, n * stride64) != 0 ||
+      if (posix_memalign(&buf, SIMD_ALIGNMENT, n * rowBytes) != 0 ||
           buf == nullptr) {
         AD_LOG_WARN << "Vector index \"" << indexName
                     << "\": could not allocate the aligned RAM copy of the "
@@ -565,18 +568,25 @@ void makeLayerResident(LayerT& layer, VectorIndex::Residency residency,
         return;
       }
       std::unique_ptr<char, AlignedFree> owned{static_cast<char*>(buf)};
-      // Zero the pad tails, then copy each row's `rowBytes` payload.
-      std::memset(owned.get(), 0, n * stride64);
-      for (size_t i = 0; i < n; ++i) {
-        std::memcpy(owned.get() + i * stride64, layer.rowPtr(i), rowBytes);
-      }
 #if defined(MADV_HUGEPAGE)
-      madvise(owned.get(), n * stride64, MADV_HUGEPAGE);
+      // Advise BEFORE the first touch, so the copy below faults the buffer
+      // in as transparent hugepages directly.
+      madvise(owned.get(), n * rowBytes, MADV_HUGEPAGE);
 #endif
+      if (layer.stride_ == rowBytes) {
+        // The store already has the natural stride (every v5 index): one
+        // dense copy.
+        std::memcpy(owned.get(), layer.base(), n * rowBytes);
+      } else {
+        // Legacy padded stride: compact row by row.
+        for (size_t i = 0; i < n; ++i) {
+          std::memcpy(owned.get() + i * rowBytes, layer.rowPtr(i), rowBytes);
+        }
+      }
       // Repoint the read path at the aligned copy (rowPtr()/graphMetric() read
       // `base()` + `stride_`).
       layer.alignedBuf_ = std::move(owned);
-      layer.stride_ = stride64;
+      layer.stride_ = rowBytes;
       break;
     }
   }
@@ -1031,43 +1041,67 @@ constexpr size_t VEC_SEARCH_PARALLEL_CHUNK = 1024;
 #endif
 
 // A bounded max-heap that keeps the `k` smallest (best) distances seen.
+// Implemented as an explicit vector + `std::push_heap`/`pop_heap` -- exactly
+// what `std::priority_queue` does underneath, so `offer` keeps bit-identical
+// semantics -- so that `mergeLocals` can fold the per-thread heaps of a
+// parallel scan FLAT (concatenate the raw entries + one selection) instead of
+// draining them entry-by-entry through O(numThreads * k * log k) heap pops.
+// That drain ran SERIALLY after the parallel region and dominated the coarse
+// whole-index sweep at high thread counts (~1.5 ms of a ~4 ms scan at 32
+// threads with k=500).
 class TopK {
  public:
+  using Entry = std::pair<float, uint64_t>;
   explicit TopK(size_t k) : k_{k} {}
   void offer(float distance, uint64_t entity) {
     if (heap_.size() < k_) {
-      heap_.emplace(distance, entity);
-    } else if (distance < heap_.top().first) {
-      heap_.pop();
-      heap_.emplace(distance, entity);
+      heap_.emplace_back(distance, entity);
+      std::push_heap(heap_.begin(), heap_.end());
+    } else if (distance < heap_.front().first) {
+      std::pop_heap(heap_.begin(), heap_.end());
+      heap_.back() = Entry{distance, entity};
+      std::push_heap(heap_.begin(), heap_.end());
     }
   }
-  // Extract ascending by distance.
+  // Extract ascending by distance (ties by entity bits -- the same total
+  // `(distance, id)` pair order the max-heap itself uses, so this matches the
+  // old pop-and-reverse extraction exactly).
   std::vector<ScoredEntity> sorted() {
+    std::sort(heap_.begin(), heap_.end());
     std::vector<ScoredEntity> out;
     out.reserve(heap_.size());
-    while (!heap_.empty()) {
-      const auto& [dist, id] = heap_.top();
+    for (const auto& [dist, id] : heap_) {
       out.push_back(ScoredEntity{Id::fromBits(id), dist});
-      heap_.pop();
     }
-    ql::ranges::reverse(out);
+    heap_.clear();
     return out;
   }
 
-  // Drain `other`'s entries into this heap -- used to fold a thread-local
-  // partial top-k into the global one after a parallel scan.
-  void merge(TopK& other) {
-    while (!other.heap_.empty()) {
-      const auto& [dist, id] = other.heap_.top();
-      offer(dist, id);
-      other.heap_.pop();
+  // Fold the per-thread partial top-ks of a parallel scan into this (empty)
+  // heap: concatenate the raw entries and keep the `k` smallest by the
+  // `(distance, id)` pair order. For distinct distances the result is
+  // identical to offering every entry individually (the k smallest
+  // distances); ties AT the k-boundary resolve deterministically towards the
+  // smaller entity bits, independent of the thread count. O(total) selection
+  // instead of the old O(total * log k) serial heap drain.
+  void mergeLocals(std::vector<TopK>& locals) {
+    for (TopK& local : locals) {
+      heap_.insert(heap_.end(), local.heap_.begin(), local.heap_.end());
+      local.heap_.clear();
     }
+    if (heap_.size() > k_) {
+      std::nth_element(heap_.begin(),
+                       heap_.begin() + static_cast<std::ptrdiff_t>(k_),
+                       heap_.end());
+      heap_.resize(k_);
+    }
+    // Restore the heap invariant so further `offer` calls stay valid.
+    std::make_heap(heap_.begin(), heap_.end());
   }
 
  private:
   size_t k_;
-  std::priority_queue<std::pair<float, uint64_t>> heap_;
+  std::vector<Entry> heap_;
 };
 
 // Score `n` items into `top` (a `k`-bounded heap): `rowAndId(i)` returns the
@@ -1130,9 +1164,7 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
       checkInterrupt();  // re-raise the cancellation outside the parallel
                          // region
     }
-    for (TopK& local : locals) {
-      top.merge(local);
-    }
+    top.mergeLocals(locals);
     return;
   }
 #endif
@@ -1179,7 +1211,21 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
       const size_t first = n * tid / team;
       const size_t last = n * (tid + 1) / team;
       const char* p = layer.base() + first * layer.stride_;
-      for (size_t row = first; row < last; ++row, p += layer.stride_) {
+      const size_t stride = layer.stride_;
+      // Software prefetch for COMPACT rows: at ~144 B/row the per-row kernel
+      // is too short for the hardware streamer to keep enough misses in
+      // flight, so prefetch the row ~4 KiB ahead explicitly (3 lines cover
+      // one stride advance; prefetch never faults, so running past the
+      // partition or mapping end is harmless). Large rows (bf16 fine layer)
+      // already saturate the streamer and skip this.
+      const bool prefetch = stride <= 256;
+      for (size_t row = first; row < last; ++row, p += stride) {
+        if (prefetch) {
+          const char* f = p + 4096;
+          __builtin_prefetch(f, 0, 3);
+          __builtin_prefetch(f + 64, 0, 3);
+          __builtin_prefetch(f + 128, 0, 3);
+        }
         // An exception must never unwind out of the OpenMP region: poll the
         // (throwing) interrupt once per chunk, latch a flag on cancellation
         // (also noticing another worker's latch), and re-raise once AFTER the
@@ -1210,15 +1256,21 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
       checkInterrupt();  // re-raise the cancellation outside the parallel
                          // region
     }
-    for (TopK& local : locals) {
-      top.merge(local);
-    }
+    top.mergeLocals(locals);
     return;
   }
 #endif
   const char* p = layer.base();
+  const size_t stride = layer.stride_;
+  const bool prefetch = stride <= 256;  // see the parallel loop above
   size_t sinceCheck = 0;
-  for (size_t row = 0; row < n; ++row, p += layer.stride_) {
+  for (size_t row = 0; row < n; ++row, p += stride) {
+    if (prefetch) {
+      const char* f = p + 4096;
+      __builtin_prefetch(f, 0, 3);
+      __builtin_prefetch(f + 64, 0, 3);
+      __builtin_prefetch(f + 128, 0, 3);
+    }
     if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
       sinceCheck = 0;
       checkInterrupt();
@@ -1231,6 +1283,74 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
       }
     }
   }
+}
+
+// True iff EVERY live row's id (the strictly ascending `.rowmap` id column)
+// appears in `candidates` -- i.e. the candidate set covers the whole live
+// index, so a filtered search equals the whole-index one. This is the
+// dominant production shape (a broad metadata pre-filter binds every member),
+// and this check replaces, for that shape, the serial candBits copy +
+// merge-join + O(live) `matched` materialization of the gather path (which
+// cost ~7x the parallel sweep itself at 2M candidates).
+//
+// Runs as a parallel subset merge: each worker owns one contiguous rowmap
+// range, finds its candidate start by binary search, and advances through the
+// span linearly. SOUND WITHOUT PRECONDITIONS on `candidates`: "covered" is
+// only reported when every rowmap id was literally matched by equality
+// against an element of the span, which proves set membership regardless of
+// the span's order or duplicates. An unsorted span can only cause a FALSE
+// NEGATIVE (the caller then falls back to the sort + merge-join gather, which
+// handles it correctly). O(live/T + candidates/T) per worker, no allocation.
+template <typename RowmapT>
+bool candidatesCoverAllRows(const RowmapT& rowmap,
+                            ql::span<const Id> candidates,
+                            [[maybe_unused]] int numThreads) {
+  const size_t n = rowmap.size();
+  const size_t m = candidates.size();
+  if (n == 0) {
+    return true;  // An empty live set is covered vacuously.
+  }
+  if (m < n) {
+    return false;  // Fewer candidates than live rows can never cover.
+  }
+  const Id* cand = candidates.data();
+  // Check rowmap rows [first, last): binary-search the candidate start, then
+  // advance linearly. Bails out early on the first unmatched id.
+  auto rangeCovered = [&](size_t first, size_t last) {
+    size_t j = std::lower_bound(cand, cand + m, rowmap[first].idBits_,
+                                [](Id c, uint64_t id) {
+                                  return c.getBits() < id;
+                                }) -
+               cand;
+    for (size_t i = first; i < last; ++i) {
+      const uint64_t id = rowmap[i].idBits_;
+      while (j < m && cand[j].getBits() < id) {
+        ++j;
+      }
+      if (j >= m || cand[j].getBits() != id) {
+        return false;
+      }
+    }
+    return true;
+  };
+#ifdef _OPENMP
+  if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+    std::atomic<bool> covered{true};
+#pragma omp parallel num_threads(numThreads)
+    {
+      const size_t tid = static_cast<size_t>(omp_get_thread_num());
+      const size_t team = static_cast<size_t>(omp_get_num_threads());
+      const size_t first = n * tid / team;
+      const size_t last = n * (tid + 1) / team;
+      if (first < last && covered.load(std::memory_order_relaxed) &&
+          !rangeCovered(first, last)) {
+        covered.store(false, std::memory_order_relaxed);
+      }
+    }
+    return covered.load(std::memory_order_relaxed);
+  }
+#endif
+  return rangeCovered(0, n);
 }
 }  // namespace
 
@@ -1312,14 +1432,49 @@ std::vector<ScoredEntity> searchExactBytes(
     return top.sorted();
   }
 
+  const size_t live = impl.numLive();
+  // FAST PATH: a candidate set at least as large as the live set very often
+  // covers EVERY live vector (the common shape of a broad metadata
+  // pre-filter that binds every index member) -- then the filtered top-k IS
+  // the whole-index top-k. Detect exact coverage directly on the raw spans
+  // (one allocation-free parallel subset merge, `candidatesCoverAllRows`) and
+  // route straight to the dedicated whole-index sweep. This skips the serial
+  // candidate marshalling below (candBits copy + sort check + merge-join +
+  // O(live) `matched` materialization), which at ~2M covering candidates cost
+  // ~7x the parallel sweep itself. A false negative here (e.g. an unsorted
+  // candidate span) merely falls through to the gather path, whose own
+  // exact-coverage re-check makes this branch a pure fast path.
+  {
+    int checkThreads = 1;
+#ifdef _OPENMP
+    if (live >= VEC_SEARCH_PARALLEL_THRESHOLD) {
+      checkThreads = vectorSearchThreadCap();
+    }
+#endif
+    if (candidatesCoverAllRows(impl.rowmap_, candidates.value(),
+                               checkThreads)) {
+      AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
+                  << "\": filtered scan: " << candidates->size()
+                  << " candidates cover all " << live
+                  << " live vectors -> whole-index sweep (" << live
+                  << " vectors, " << checkThreads << " threads)" << std::endl;
+      SeqScanHint hint{layer, !layer.alignedBuf_};
+      scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
+                             checkInterrupt, checkThreads);
+      reportScored(live);
+      return top.sorted();
+    }
+  }
+
   // Restricted search: merge-join the candidate id set against the id-sorted
   // `.rowmap` to find which candidates are live members (`mergeJoinRowmap`
   // emits each member row at most once). This replaces both the old
   // per-candidate `lower_bound` gather (sparse sets) and the whole-index
   // membership scan (dense sets) with a single O(#candidates + #rows) pass
   // whose row reads are sequential. A SUPERSET candidate set -- every live
-  // vector is a candidate, the common shape of a broad metadata pre-filter --
-  // is detected after the merge and routed to the dedicated whole-index sweep.
+  // vector is a candidate but arrived unsorted, so the fast path above did
+  // not see it -- is still detected after the merge and routed to the
+  // dedicated whole-index sweep.
   // NOTE: an empty candidate set deliberately yields an empty result -- the
   // caller restricted the search space to nothing. The branch taken (whole-
   // index sweep vs scattered gather) is logged once the merge count is known.
@@ -1360,7 +1515,6 @@ std::vector<ScoredEntity> searchExactBytes(
   if (seqHint && !monotonic) {
     impl.gatherNonMonotonic_.store(true, std::memory_order_relaxed);
   }
-  const size_t live = impl.numLive();
   // Candidate set covers EVERY live vector => the filtered top-k IS the
   // whole-index top-k. Take the dedicated whole-index sweep (a running
   // `p += stride` pointer walk with direct key reads -- no per-row multiply or
