@@ -171,6 +171,14 @@ void VocabularyOnDisk::open(const std::string& filename) {
   AD_CORRECTNESS_CHECK(numOffsets > 0);
   size_ = numOffsets - 1;
 
+  // The two small random reads per word lookup are the hot path for
+  // string-heavy queries; serve them from a memory-mapped view (a `memcpy`)
+  // where the platform enables it, instead of a per-call read. This covers
+  // the single-word `operator[]` path; `lookupBatch` below reads via the
+  // `BatchManagerBase` backends instead.
+  file_.enableMemoryMappedReads();
+  offsetsFile_.enableMemoryMappedReads();
+
   // Initialize pool of persistent `BatchIoManager`s for `lookupBatch`.
   ioManagers_ = std::make_unique<ad_utility::data_structures::ThreadSafeQueue<
       std::unique_ptr<ad_utility::BatchManagerBase>>>(

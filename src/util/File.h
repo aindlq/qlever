@@ -185,6 +185,14 @@ class File {
     return bytesRead;
   }
 
+  // Serve subsequent positioned reads from a memory-mapped view instead of
+  // per-call reads (opt-in via `QLEVER_LINUX_MMAP`; best-effort, falls back to
+  // `pread` on failure). For read-only files that fit in RAM; call after
+  // `open(..., "r")`.
+  void enableMemoryMappedReads() {
+    positionedReader_.enableMemoryMappedReads(name_);
+  }
+
   //! Returns the number of bytes from the beginning
   //! is 0 on opening. Later equal the number of bytes written.
   //! -1 is returned when an error occurs
