@@ -200,10 +200,10 @@ struct EmbeddingEndpointOverride {
   std::optional<size_t> softmaxN_;
   std::optional<float> breadth_;
   // Per-index defaults of the TOP-ANCHORED z-cut (`zcut*` keys): the per-mode
-  // band widths, the exact no-match gate, and the floor-estimator fraction.
-  std::optional<float> zcutDeltaPrecise_;
-  std::optional<float> zcutDeltaBalanced_;
-  std::optional<float> zcutDeltaBroad_;
+  // band fractions, the exact no-match gate, and the floor-estimator fraction.
+  std::optional<float> zcutFractionPrecise_;
+  std::optional<float> zcutFractionBalanced_;
+  std::optional<float> zcutFractionBroad_;
   std::optional<float> zcutGateZ_;
   std::optional<float> zcutFloorFraction_;
 
@@ -212,9 +212,10 @@ struct EmbeddingEndpointOverride {
            !preload_.has_value() && !preloadRerank_.has_value() &&
            !cslsRerankFloor_.has_value() && !cslsFloor_.has_value() &&
            !softmaxTemperature_.has_value() && !softmaxN_.has_value() &&
-           !breadth_.has_value() && !zcutDeltaPrecise_.has_value() &&
-           !zcutDeltaBalanced_.has_value() && !zcutDeltaBroad_.has_value() &&
-           !zcutGateZ_.has_value() && !zcutFloorFraction_.has_value();
+           !breadth_.has_value() && !zcutFractionPrecise_.has_value() &&
+           !zcutFractionBalanced_.has_value() &&
+           !zcutFractionBroad_.has_value() && !zcutGateZ_.has_value() &&
+           !zcutFloorFraction_.has_value();
   }
 };
 using EmbeddingEndpointOverrides =
@@ -333,34 +334,34 @@ inline EmbeddingEndpointOverrides parseEmbeddingEndpointOverrides(
         (key == "cslsFloor"            ? endpointOverride.cslsFloor_
          : key == "softmaxTemperature" ? endpointOverride.softmaxTemperature_
                                        : endpointOverride.breadth_) = f;
-      } else if (key == "zcutDeltaPrecise" || key == "zcutDeltaBalanced" ||
-                 key == "zcutDeltaBroad" || key == "zcutGateZ" ||
-                 key == "zcutFloorFraction") {
-        // The top-anchored z-cut knobs: the band widths and the gate must be
-        // positive finite; the floor fraction must be in (0, 1].
+      } else if (key == "zcutFractionPrecise" ||
+                 key == "zcutFractionBalanced" || key == "zcutFractionBroad" ||
+                 key == "zcutGateZ" || key == "zcutFloorFraction") {
+        // The top-anchored z-cut knobs: the band fractions and the floor
+        // fraction must be in (0, 1]; the gate must be positive finite.
         const double v = field.is_number()
                              ? field.get<double>()
                              : std::numeric_limits<double>::quiet_NaN();
         const float f = static_cast<float>(v);
-        const bool isFraction = key == "zcutFloorFraction";
+        const bool isGate = key == "zcutGateZ";
         const bool valid =
-            isFraction ? (f > 0.f && f <= 1.f) : (std::isfinite(f) && f > 0.f);
+            isGate ? (std::isfinite(f) && f > 0.f) : (f > 0.f && f <= 1.f);
         if (!valid) {
           AD_LOG_WARN << "Ignoring the " << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
                       << " entry for vector index '" << name << "': \"" << key
                       << "\" must be "
-                      << (isFraction ? "a number in (0, 1]"
-                                     : "a positive finite number")
+                      << (isGate ? "a positive finite number"
+                                 : "a number in (0, 1]")
                       << " (got " << field.dump() << ")." << std::endl;
           ok = false;
           break;
         }
-        if (key == "zcutDeltaPrecise") {
-          endpointOverride.zcutDeltaPrecise_ = f;
-        } else if (key == "zcutDeltaBalanced") {
-          endpointOverride.zcutDeltaBalanced_ = f;
-        } else if (key == "zcutDeltaBroad") {
-          endpointOverride.zcutDeltaBroad_ = f;
+        if (key == "zcutFractionPrecise") {
+          endpointOverride.zcutFractionPrecise_ = f;
+        } else if (key == "zcutFractionBalanced") {
+          endpointOverride.zcutFractionBalanced_ = f;
+        } else if (key == "zcutFractionBroad") {
+          endpointOverride.zcutFractionBroad_ = f;
         } else if (key == "zcutGateZ") {
           endpointOverride.zcutGateZ_ = f;
         } else {

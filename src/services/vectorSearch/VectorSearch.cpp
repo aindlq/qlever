@@ -114,9 +114,10 @@ void validateCslsIsAvailable(const VectorSearchConfiguration& config,
 }
 
 namespace {
-// The z-threshold, softmax bar, and no-match behaviour of each coverage mode.
+// The band-fraction index, softmax bar, and no-match behaviour of each coverage
+// mode.
 struct CoverageParams {
-  int deltaMode_;  // 0=precise,1=balanced,2=broad -- indexes the per-mode Delta
+  int fractionMode_;  // 0=precise,1=balanced,2=broad -- indexes the per-mode f
   float softmaxAlpha_;
   bool keepAtLeastOne_;
 };
@@ -135,12 +136,12 @@ CoverageParams coverageParams(VectorSearchConfiguration::CoverageMode mode) {
       return {1, DEFAULT_ZCUT_SOFTMAX_ALPHA_BALANCED, true};
   }
 }
-// The per-mode band width Delta: per-index override -> constant.
-float resolveDelta(const VectorIndex& vidx, int deltaMode) {
-  constexpr float kConst[3] = {DEFAULT_ZCUT_DELTA_PRECISE,
-                               DEFAULT_ZCUT_DELTA_BALANCED,
-                               DEFAULT_ZCUT_DELTA_BROAD};
-  return vidx.zcutDeltaDefault(deltaMode).value_or(kConst[deltaMode]);
+// The per-mode band fraction f: per-index override -> constant.
+float resolveFraction(const VectorIndex& vidx, int fractionMode) {
+  constexpr float kConst[3] = {DEFAULT_ZCUT_FRACTION_PRECISE,
+                               DEFAULT_ZCUT_FRACTION_BALANCED,
+                               DEFAULT_ZCUT_FRACTION_BROAD};
+  return vidx.zcutFractionDefault(fractionMode).value_or(kConst[fractionMode]);
 }
 }  // namespace
 
@@ -158,13 +159,13 @@ CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
   using CutSignal = VectorSearchConfiguration::CutSignal;
   const CoverageParams cov = coverageParams(config.autoCut_.value());
   // The floor-estimator fraction, the exact no-match gate, and the top-anchored
-  // widen depth (broad's band + a safety margin). Each: per-index `zcut*`
-  // serving default -> constant. The widen depth uses the BROADEST band so the
+  // widen depth (broad's fraction + a margin). Each: per-index `zcut*` serving
+  // default -> constant. The widen depth uses the BROADEST fraction so the
   // cached reranked set holds everything any coverage mode could keep.
   cut.floorFraction_ =
       vidx.zcutFloorFractionDefault().value_or(DEFAULT_ZCUT_FLOOR_FRACTION);
   cut.gateZ_ = vidx.zcutGateZDefault().value_or(DEFAULT_ZCUT_GATE_Z);
-  cut.widenDelta_ = resolveDelta(vidx, 2) + DEFAULT_ZCUT_WIDEN_MARGIN;
+  cut.widenFraction_ = resolveFraction(vidx, 2) + DEFAULT_ZCUT_WIDEN_MARGIN;
   // Bound the widening so a NO-MATCH query (whose window never separates from
   // the best) reranks at most a few rerank floors, not the whole index; hitting
   // it is logged, never silent.
@@ -190,7 +191,7 @@ CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
     cut.signal_ = config.cutSignal_ == CutSignal::Csls
                       ? CslsCut::Signal::Csls
                       : CslsCut::Signal::Cosine;
-    cut.delta_ = resolveDelta(vidx, cov.deltaMode_);
+    cut.fraction_ = resolveFraction(vidx, cov.fractionMode_);
   }
   return cut;
 }
@@ -249,7 +250,7 @@ std::vector<CslsScoredEntity> runCslsCut(
   std::string key = absl::StrCat(
       "CSLS_RERANK idx=", config.indexName_, " nb=", neighbors,
       " ff=", absl::Hex(absl::bit_cast<uint32_t>(cut.floorFraction_)),
-      " wd=", absl::Hex(absl::bit_cast<uint32_t>(cut.widenDelta_)),
+      " wf=", absl::Hex(absl::bit_cast<uint32_t>(cut.widenFraction_)),
       " cap=", cut.rerankCap_);
   appendQueryPointToCacheKey(&key, config);
   absl::StrAppend(&key, " cand={", candidateIdentity, "}");
@@ -257,10 +258,10 @@ std::vector<CslsScoredEntity> runCslsCut(
     return queryEntity.has_value()
                ? vidx.computeCslsRerankedByEntity(
                      queryEntity.value(), neighbors, cut.floorFraction_,
-                     cut.widenDelta_, cut.rerankCap_, candidates,
+                     cut.widenFraction_, cut.rerankCap_, candidates,
                      checkInterrupt)
                : vidx.computeCslsReranked(query, neighbors, cut.floorFraction_,
-                                          cut.widenDelta_, cut.rerankCap_,
+                                          cut.widenFraction_, cut.rerankCap_,
                                           candidates, checkInterrupt);
   };
   auto res =

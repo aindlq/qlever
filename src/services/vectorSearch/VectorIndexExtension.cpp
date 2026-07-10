@@ -840,12 +840,13 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                     << std::endl;
       }
       // The top-anchored z-cut serving defaults.
-      if (o.zcutDeltaPrecise_.has_value() || o.zcutDeltaBalanced_.has_value() ||
-          o.zcutDeltaBroad_.has_value() || o.zcutGateZ_.has_value() ||
+      if (o.zcutFractionPrecise_.has_value() ||
+          o.zcutFractionBalanced_.has_value() ||
+          o.zcutFractionBroad_.has_value() || o.zcutGateZ_.has_value() ||
           o.zcutFloorFraction_.has_value()) {
-        idx.setZcutDeltaDefault(0, o.zcutDeltaPrecise_);
-        idx.setZcutDeltaDefault(1, o.zcutDeltaBalanced_);
-        idx.setZcutDeltaDefault(2, o.zcutDeltaBroad_);
+        idx.setZcutFractionDefault(0, o.zcutFractionPrecise_);
+        idx.setZcutFractionDefault(1, o.zcutFractionBalanced_);
+        idx.setZcutFractionDefault(2, o.zcutFractionBroad_);
         idx.setZcutGateZDefault(o.zcutGateZ_);
         idx.setZcutFloorFractionDefault(o.zcutFloorFraction_);
         auto fmt = [](const auto& opt) {
@@ -855,9 +856,10 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
         AD_LOG_INFO << "Vector index '" << name
                     << "': z-cut defaults set at startup ("
                     << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
-                    << "): zcutDelta [precise " << fmt(o.zcutDeltaPrecise_)
-                    << ", balanced " << fmt(o.zcutDeltaBalanced_) << ", broad "
-                    << fmt(o.zcutDeltaBroad_) << "], zcutGateZ "
+                    << "): zcutFraction [precise "
+                    << fmt(o.zcutFractionPrecise_) << ", balanced "
+                    << fmt(o.zcutFractionBalanced_) << ", broad "
+                    << fmt(o.zcutFractionBroad_) << "], zcutGateZ "
                     << fmt(o.zcutGateZ_) << ", zcutFloorFraction "
                     << fmt(o.zcutFloorFraction_) << std::endl;
       }
