@@ -205,7 +205,15 @@ TEST(TripleSerializer, rethrowsOnInvalidFileAccess) {
   auto tmpFile = ql::filesystem::temp_directory_path() / "fileNoPermissions";
   // Create empty file
   std::ofstream{tmpFile.string()}.close();
-  absl::Cleanup cleanup{[&tmpFile]() { ql::filesystem::remove(tmpFile); }};
+  absl::Cleanup cleanup{[&tmpFile]() {
+    // Restore the permissions before removing: on Windows,
+    // `perms::none` maps to the read-only attribute, and read-only files
+    // cannot be removed. Use the non-throwing overloads, cleanup must not
+    // throw.
+    ql::error_code errorCode;
+    ql::filesystem::permissions(tmpFile, ql::filesystem_perms_all, errorCode);
+    ql::filesystem::remove(tmpFile, errorCode);
+  }};
   // Remove all permissions to make read fail
   ql::filesystem::permissions(tmpFile, ql::filesystem_perms_none);
 
