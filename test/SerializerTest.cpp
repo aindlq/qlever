@@ -591,7 +591,7 @@ TEST(VectorIncrementalSerializer, Serialize) {
   auto testIncrementalSerialization = [filename](const auto& inputVector) {
     using T = std::decay_t<decltype(inputVector)>;
     VectorIncrementalSerializer<typename T::value_type, FileWriteSerializer>
-        writer{filename};
+        writer{FileWriteSerializer{filename}};
     for (const auto& element : inputVector) {
       writer.push(element);
     }

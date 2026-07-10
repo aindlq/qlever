@@ -12,6 +12,8 @@
 #ifndef QLEVER_SRC_INDEX_DELTATRIPLES_H
 #define QLEVER_SRC_INDEX_DELTATRIPLES_H
 
+#include <filesystem>
+
 #include "backports/three_way_comparison.h"
 #include "engine/UpdateMetadata.h"
 #include "global/IdTriple.h"
@@ -120,7 +122,7 @@ class DeltaTriples {
   LocalVocab localVocab_;
 
   // See the documentation of `setPersist()` below.
-  std::optional<std::string> filenameForPersisting_;
+  std::optional<std::filesystem::path> filenameForPersisting_;
 
   // Store the id of the `ql:langtag` predicate to avoid repeated disk lookups.
   // This is initialized on first use.
@@ -262,7 +264,7 @@ class DeltaTriples {
   // If the `filename` is set, then `writeToDisk()` will write these
   // `DeltaTriples` to `filename.value()`. If `filename` is `nullopt`, then
   // `writeToDisk` will be a nullop.
-  void setPersists(std::optional<std::string> filename);
+  void setPersists(std::optional<std::filesystem::path> filename);
 
   // Write the delta triples to disk to persist them between restarts.
   void writeToDisk() const;
@@ -428,7 +430,8 @@ class DeltaTriplesManager {
                     ad_utility::timer::TimeTracer& tracer =
                         ad_utility::timer::DEFAULT_TIME_TRACER);
 
-  void setFilenameForPersistentUpdatesAndReadFromDisk(std::string filename);
+  void setFilenameForPersistentUpdatesAndReadFromDisk(
+      std::filesystem::path filename);
 
   // Reset the updates represented by the underlying `DeltaTriples` and then
   // update the current snapshot.

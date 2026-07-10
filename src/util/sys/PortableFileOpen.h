@@ -13,11 +13,15 @@
 
 namespace ad_utility::detail {
 
-inline FILE* openFilePortable(const char* filename, const char* mode) {
-  return std::fopen(filename, mode);
+// Opens the native (wide on Windows) path, so non-ASCII paths work.
+inline FILE* openFilePortable(const std::filesystem::path& path,
+                              const char* mode) {
+  return std::fopen(path.c_str(), mode);
 }
 
-// Prepare `path` for a truncating (non-append) rewrite; a no-op on POSIX.
+// Prepare `path` for a truncating rewrite; a no-op on POSIX. `args` are the
+// stream's open flags: a non-POSIX backend must inspect them and skip
+// preparation for an append/at-end open.
 template <typename... Args>
 void prepareTruncatingRewrite(const std::filesystem::path& path,
                               const Args&... args) {

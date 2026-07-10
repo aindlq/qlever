@@ -37,7 +37,8 @@ class File {
  private:
   using string = std::string;
 
-  string name_;
+  // The path this file was opened with.
+  std::filesystem::path path_;
   FILE* file_;
 
   // Strategy for positioned reads (`read` at an explicit offset), platform-
@@ -46,18 +47,15 @@ class File {
 
  public:
   //! Default constructor
-  File() {
-    file_ = NULL;
-    name_ = "";
-  }
+  File() { file_ = NULL; }
 
   //! Constructor that creates an instance from the
   //! file system.
-  File(const char* filename, const char* mode) : name_(filename) {
-    open(filename, mode);
-  }
+  File(const char* filename, const char* mode) { open(filename, mode); }
 
-  File(const string& filename, const char* mode) : name_(filename) {
+  File(const string& filename, const char* mode) { open(filename, mode); }
+
+  File(const std::filesystem::path& filename, const char* mode) {
     open(filename, mode);
   }
 
@@ -71,13 +69,13 @@ class File {
     }
 
     file_ = std::exchange(rhs.file_, nullptr);
-    name_ = std::move(rhs.name_);
+    path_ = std::move(rhs.path_);
     positionedReader_ = std::move(rhs.positionedReader_);
     return *this;
   }
 
   File(File&& rhs) noexcept
-      : name_{std::move(rhs.name_)},
+      : path_{std::move(rhs.path_)},
         file_{std::exchange(rhs.file_, nullptr)},
         positionedReader_{std::move(rhs.positionedReader_)} {}
 
@@ -87,24 +85,28 @@ class File {
   }
 
   //! OPEN FILE (exit with error if fails, returns true otherwise)
-  bool open(const char* filename, const char* mode) {
+  bool open(const std::filesystem::path& filename, const char* mode) {
     // Reset the positioned reader so a reused `File` doesn't serve reads from
     // the previous file.
     positionedReader_.close();
     file_ = detail::openFilePortable(filename, mode);
     if (file_ == NULL) {
       std::stringstream err;
-      err << "! ERROR opening file \"" << filename << "\" with mode \"" << mode
+      err << "! ERROR opening file " << filename << " with mode \"" << mode
           << "\" (" << strerror(errno) << ")" << std::endl;
       throw std::runtime_error(std::move(err).str());
     }
-    name_ = filename;
+    path_ = filename;
     return true;
+  }
+
+  bool open(const char* filename, const char* mode) {
+    return open(std::filesystem::path{filename}, mode);
   }
 
   // overload  for c++ strings
   bool open(const string& filename, const char* mode) {
-    return open(filename.c_str(), mode);
+    return open(std::filesystem::path{filename}, mode);
   }
 
   //! checks if the file is open.
@@ -123,8 +125,8 @@ class File {
     }
     positionedReader_.close();
     if (fclose(file_) != 0) {
-      std::cout << "! ERROR closing file \"" << name_ << "\" ("
-                << strerror(errno) << ")" << std::endl;
+      std::cout << "! ERROR closing file " << path_ << " (" << strerror(errno)
+                << ")" << std::endl;
       exit(1);
     }
     file_ = NULL;
@@ -133,7 +135,7 @@ class File {
 
   bool empty() { return sizeOfFile() == 0; }
 
-  const std::string& name() const { return name_; }
+  const std::filesystem::path& path() const { return path_; }
 
   // read from current file pointer position
   // returns the number of bytes read
@@ -174,7 +176,7 @@ class File {
     while (bytesRead < nofBytesToRead) {
       size_t toRead = nofBytesToRead - bytesRead;
       const ssize_t ret = positionedReader_.readAtOffset(
-          fd, name_, to + bytesRead, toRead, offset + bytesRead);
+          fd, path_, to + bytesRead, toRead, offset + bytesRead);
 
       if (ret < 0) {
         return ret;
@@ -239,7 +241,7 @@ Stream makeFilestream(const std::filesystem::path& path, auto&&... args) {
   if constexpr (forWriting) {
     prepareTruncatingRewrite(path, args...);
   }
-  Stream stream{path.string(), AD_FWD(args)...};
+  Stream stream{path, AD_FWD(args)...};
   std::string_view mode = forWriting ? "for writing" : "for reading";
   if (!stream.is_open()) {
     std::string error =

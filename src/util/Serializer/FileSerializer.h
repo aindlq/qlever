@@ -5,6 +5,7 @@
 #ifndef QLEVER_FILESERIALIZER_H
 #define QLEVER_FILESERIALIZER_H
 
+#include <filesystem>
 #include <memory>
 
 #include "util/File.h"
@@ -21,7 +22,8 @@ class FileWriteSerializer {
 
   FileWriteSerializer(File&& file) : _file{std::move(file)} {};
 
-  FileWriteSerializer(std::string filename) : _file{filename, "w"} {
+  FileWriteSerializer(const std::filesystem::path& filename)
+      : _file{filename, "w"} {
     AD_CONTRACT_CHECK(_file.isOpen());
     // TODO<joka921> File should be a move-only type, should support
     // "isOpenForReading" and should automatically check for "isOpen() when
@@ -54,7 +56,7 @@ class FileReadSerializer {
 
   explicit FileReadSerializer(File&& file) : _file{std::move(file)} {};
 
-  explicit FileReadSerializer(const std::string& filename)
+  explicit FileReadSerializer(const std::filesystem::path& filename)
       : _file{filename, "r"} {
     AD_CONTRACT_CHECK(_file.isOpen());
   }
@@ -87,7 +89,7 @@ class CopyableFileReadSerializer {
   explicit CopyableFileReadSerializer(std::shared_ptr<File> filePtr)
       : _file{std::move(filePtr)} {};
 
-  explicit CopyableFileReadSerializer(std::string filename)
+  explicit CopyableFileReadSerializer(const std::filesystem::path& filename)
       : _file{std::make_shared<File>(filename, "r")} {
     AD_CONTRACT_CHECK(_file->isOpen());
   }

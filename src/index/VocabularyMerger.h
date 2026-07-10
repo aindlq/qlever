@@ -34,7 +34,8 @@ class IdMapWriter {
 
  public:
   explicit IdMapWriter(const std::string& filename) : filename_(filename) {
-    serializer_ = std::make_unique<Serializer>(filename);
+    serializer_ = std::make_unique<Serializer>(
+        ad_utility::serialization::FileWriteSerializer{filename});
   }
 
   void push_back(const std::pair<Id, Id>& pair) { serializer_->push(pair); }

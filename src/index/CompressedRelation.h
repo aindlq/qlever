@@ -875,7 +875,7 @@ class CompressedRelationReader {
   CompressedRelationReader makeReaderWithReboundAllocator(
       Allocator allocator) const {
     return CompressedRelationReader{std::move(allocator),
-                                    ad_utility::File{file_.name(), "r"},
+                                    ad_utility::File{file_.path(), "r"},
                                     useGraphPostProcessing_};
   }
 

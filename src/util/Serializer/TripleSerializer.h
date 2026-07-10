@@ -172,7 +172,7 @@ CPP_template(typename Range)(
     requires ql::ranges::range<
         Range>) void serializeIds(const std::filesystem::path& path,
                                   const LocalVocab& vocab, Range&& idRanges) {
-  serialization::FileWriteSerializer serializer{path.c_str()};
+  serialization::FileWriteSerializer serializer{path};
   detail::writeHeader(serializer);
   detail::serializeLocalVocab(serializer, vocab);
   serializer << uint64_t{ql::ranges::size(idRanges)};
@@ -190,12 +190,12 @@ inline std::tuple<LocalVocab, std::vector<std::vector<Id>>> deserializeIds(
   if (!std::filesystem::exists(path)) {
     return {};
   }
-  auto serializer = [p = path.c_str()]() {
+  auto serializer = [&path]() {
     try {
-      return serialization::FileReadSerializer{p};
+      return serialization::FileReadSerializer{path};
     } catch (const std::runtime_error& err) {
       throw std::runtime_error{absl::StrCat(
-          "The file '", p,
+          "The file '", path.string(),
           "' exists, but cannot be opened for reading. Please check the file "
           "permissions. The error received when opening it was: ",
           err.what())};

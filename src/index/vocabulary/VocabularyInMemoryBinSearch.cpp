@@ -53,7 +53,9 @@ void VocabularyInMemoryBinSearch::close() {
 
 // _____________________________________________________________________________
 VocabularyInMemoryBinSearch::WordWriter::WordWriter(const std::string& filename)
-    : writer_{filename}, offsetWriter_{filename + ".ids"} {}
+    : writer_{filename},
+      offsetWriter_{
+          ad_utility::serialization::FileWriteSerializer{filename + ".ids"}} {}
 
 // _____________________________________________________________________________
 uint64_t VocabularyInMemoryBinSearch::WordWriter::operator()(

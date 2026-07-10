@@ -16,7 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <string>
+#include <filesystem>
 
 #include "util/Exception.h"
 #include "util/sys/AccessPattern.h"
@@ -36,7 +36,8 @@ class FileMapping {
   }
 
   // Map `bytesize` bytes of `filename` (`MAP_SHARED`) and return the address.
-  void* map(const std::string& filename, size_t bytesize, bool writable) {
+  void* map(const std::filesystem::path& filename, size_t bytesize,
+            bool writable) {
     // open to get valid file descriptor
     const int fd = ::open(filename.c_str(), writable ? O_RDWR : O_RDONLY);
     const int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
@@ -94,8 +95,8 @@ class FileMapping {
   static size_t pageSize() { return getpagesize(); }
 
   // Resize the backing file by path (POSIX `truncate`). Returns 0 on success.
-  static int resizeFile(const char* path, int64_t length) {
-    return ::truncate(path, length);
+  static int resizeFile(const std::filesystem::path& path, int64_t length) {
+    return ::truncate(path.c_str(), length);
   }
 };
 

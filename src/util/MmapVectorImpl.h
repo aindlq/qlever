@@ -27,8 +27,8 @@ constexpr float MmapVector<T>::ResizeFactor;
 template <class T>
 void MmapVector<T>::writeMetaDataToEnd() {
   // Truncate away any previous trailer, then append the new one below.
-  if (FileMapping::resizeFile(_filename.c_str(), _bytesize)) {
-    throw TruncateException(_filename, _bytesize, errno);
+  if (FileMapping::resizeFile(_filename, _bytesize)) {
+    throw TruncateException(_filename.string(), _bytesize, errno);
   }
 
   // Open the file for updating (mode "r+" does not truncate it), seek to the
@@ -226,7 +226,7 @@ void MmapVector<T>::close() {
 template <class T>
 MmapVector<T>::~MmapVector() {
   std::string message = absl::StrCat(
-      "Error while unmapping a file with name \"", _filename, "\"");
+      "Error while unmapping a file with name \"", _filename.string(), "\"");
   ad_utility::terminateIfThrows([this]() { this->close(); }, message);
 }
 

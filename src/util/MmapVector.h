@@ -6,6 +6,7 @@
 #define QLEVER_SRC_UTIL_MMAPVECTOR_H
 
 #include <exception>
+#include <filesystem>
 #include <sstream>
 #include <string>
 
@@ -319,7 +320,9 @@ class MmapVector {
   ResetWhenMoved<size_t, 0> _size;
   ResetWhenMoved<size_t, 0> _capacity;
   ResetWhenMoved<size_t, 0> _bytesize;
-  std::string _filename = "";
+  // A `path` (not a `std::string`) so that all file operations use the native
+  // wide APIs on Windows (non-ASCII paths).
+  std::filesystem::path _filename;
   AccessPattern _pattern = AccessPattern::None;
   FileMapping fileMapping_;
   static constexpr float ResizeFactor = 1.5;
@@ -425,9 +428,10 @@ class MmapVectorTmp : public MmapVector<T> {
   // everything else
   ~MmapVectorTmp() override {
     // if the filename is not empty, we still own a file
-    std::string oldFilename = this->_filename;
-    std::string message = absl::StrCat(
-        "Error while unmapping a file with name \"", oldFilename, "\"");
+    std::filesystem::path oldFilename = this->_filename;
+    std::string message =
+        absl::StrCat("Error while unmapping a file with name \"",
+                     oldFilename.string(), "\"");
     ad_utility::terminateIfThrows([this]() { this->close(); }, message);
     if (!oldFilename.empty()) {
       ad_utility::deleteFile(oldFilename);

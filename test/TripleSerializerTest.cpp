@@ -9,6 +9,7 @@
 #include "util/IndexTestHelpers.h"
 #include "util/Serializer/ByteBufferSerializer.h"
 #include "util/Serializer/TripleSerializer.h"
+#include "util/sys/PortableFileOpen.h"
 
 namespace {
 auto I = ad_utility::testing::IntId;
@@ -208,7 +209,7 @@ TEST(TripleSerializer, rethrowsOnInvalidFileAccess) {
   // Remove all permissions to make read fail
   std::filesystem::permissions(tmpFile, std::filesystem::perms::none);
 
-  if (FILE* handle = fopen(tmpFile.c_str(), "r")) {
+  if (FILE* handle = ad_utility::detail::openFilePortable(tmpFile, "r")) {
     fclose(handle);
     // This can happen in docker environments.
     GTEST_SKIP_("File permissions are not set to none");

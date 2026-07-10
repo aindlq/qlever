@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 #include <cstddef>
-#include <string>
+#include <filesystem>
 
 namespace ad_utility::posix {
 
@@ -21,8 +21,8 @@ class PositionedReader {
  public:
   // Read up to `count` bytes at `offset` via `pread` on `fd`. `filename` is
   // unused on POSIX. Returns the number of bytes read, 0 at EOF, -1 on error.
-  ssize_t readAtOffset(int fd, const std::string& filename, void* buffer,
-                       size_t count, off_t offset) const {
+  ssize_t readAtOffset(int fd, const std::filesystem::path& filename,
+                       void* buffer, size_t count, off_t offset) const {
     (void)filename;
     return ::pread(fd, buffer, count, offset);
   }
