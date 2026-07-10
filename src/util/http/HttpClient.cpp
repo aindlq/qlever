@@ -9,8 +9,10 @@
 
 #include <absl/strings/str_cat.h>
 
+#include <algorithm>
 #include <boost/url/url.hpp>
 #include <string>
+#include <vector>
 
 #include "global/Constants.h"
 #include "util/AsioHelpers.h"
@@ -29,6 +31,42 @@ using ad_utility::httpUtils::Url;
 // https://www.boost.org/doc/libs/master/libs/beast/example/http/client/sync/http_client_sync.cpp
 // https://www.boost.org/doc/libs/master/libs/beast/example/http/client/sync-ssl/http_client_sync_ssl.cpp
 
+namespace {
+// Return the resolver results as a vector of endpoints, with IPv4 endpoints
+// ordered first. Hostnames like "localhost" typically resolve to both an
+// IPv6 and an IPv4 address. On some platforms (observed on Windows),
+// connecting to an IPv6 loopback endpoint that has no listener can hang in
+// long TCP timeouts instead of being refused immediately, so try the IPv4
+// endpoints (where QLever servers listen) first.
+std::vector<tcp::endpoint> endpointsWithIpv4First(
+    const tcp::resolver::results_type& results) {
+  std::vector<tcp::endpoint> endpoints;
+  endpoints.reserve(results.size());
+  for (const auto& entry : results) {
+    endpoints.push_back(entry.endpoint());
+  }
+  // Only reorder when *every* endpoint is loopback: the observed hang is an
+  // IPv6 loopback with no listener (localhost resolves to both ::1 and
+  // 127.0.0.1). For remote hosts keep the resolver's RFC 6724 ordering, so
+  // federated SERVICE requests to dual-stack hosts are unaffected on every
+  // platform.
+  // TODO: verify this is needed on a normally-configured host -- the ~21s
+  // stall it avoids was seen on a VM whose IPv6 loopback black-holes
+  // no-listener connects instead of refusing them; a normal host refuses
+  // immediately and falls back to IPv4 without stalling.
+  const bool allLoopback = std::all_of(
+      endpoints.begin(), endpoints.end(),
+      [](const tcp::endpoint& e) { return e.address().is_loopback(); });
+  if (allLoopback) {
+    std::stable_partition(endpoints.begin(), endpoints.end(),
+                          [](const tcp::endpoint& endpoint) {
+                            return endpoint.address().is_v4();
+                          });
+  }
+  return endpoints;
+}
+}  // namespace
+
 // ____________________________________________________________________________
 template <typename StreamType>
 HttpClientImpl<StreamType>::HttpClientImpl(std::string_view host,
@@ -42,7 +80,7 @@ HttpClientImpl<StreamType>::HttpClientImpl(std::string_view host,
     tcp::resolver resolver{ioContext_};
     stream_ = std::make_unique<StreamType>(ioContext_);
     auto const results = resolver.resolve(host, port);
-    stream_->connect(results);
+    stream_->connect(endpointsWithIpv4First(results));
   } else {
     static_assert(std::is_same_v<StreamType, ssl::stream<tcp::socket>>,
                   "StreamType must be either boost::beast::tcp_stream or "
@@ -58,7 +96,9 @@ HttpClientImpl<StreamType>::HttpClientImpl(std::string_view host,
       throw boost::system::system_error{ec};
     }
     auto const results = resolver.resolve(host, port);
-    boost::asio::connect(stream_->next_layer(), results.begin(), results.end());
+    auto const endpoints = endpointsWithIpv4First(results);
+    boost::asio::connect(stream_->next_layer(), endpoints.begin(),
+                         endpoints.end());
     stream_->handshake(ssl::stream_base::client);
   }
 }

@@ -1,0 +1,7 @@
+// Embed the manifest that declares QLever executables long-path aware (paths
+// longer than MAX_PATH (260 characters) work whenever the system has long paths
+// enabled) and sets the process active code page to UTF-8 (Windows 10 1903+),
+// so the narrow file APIs interpret paths and `argv` as UTF-8. Resource ID 1 =
+// CREATEPROCESS_MANIFEST_RESOURCE_ID, type 24 = RT_MANIFEST (numeric literals to
+// keep this file self-contained).
+1 24 "LongPathAware.manifest"

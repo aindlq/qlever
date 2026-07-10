@@ -6,6 +6,8 @@
 
 #include "index/CompressedRelation.h"
 
+#include <absl/strings/str_cat.h>
+
 #include <thread>
 
 #include "engine/idTable/CompressedExternalIdTable.h"

@@ -204,7 +204,16 @@ TEST(TripleSerializer, rethrowsOnInvalidFileAccess) {
   auto tmpFile = std::filesystem::temp_directory_path() / "fileNoPermissions";
   // Create empty file
   std::ofstream{tmpFile}.close();
-  absl::Cleanup cleanup{[&tmpFile]() { std::filesystem::remove(tmpFile); }};
+  absl::Cleanup cleanup{[&tmpFile]() {
+    // Restore the permissions before removing: on Windows,
+    // `perms::none` maps to the read-only attribute, and read-only files
+    // cannot be removed. Use the non-throwing overloads, cleanup must not
+    // throw.
+    std::error_code errorCode;
+    std::filesystem::permissions(tmpFile, std::filesystem::perms::all,
+                                 errorCode);
+    std::filesystem::remove(tmpFile, errorCode);
+  }};
   // Remove all permissions to make read fail
   std::filesystem::permissions(tmpFile, std::filesystem::perms::none);
 

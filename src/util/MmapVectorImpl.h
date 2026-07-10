@@ -11,6 +11,8 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <filesystem>
+#include <system_error>
 #include <utility>
 
 #include "util/MmapVector.h"
@@ -26,8 +28,21 @@ constexpr float MmapVector<T>::ResizeFactor;
 // __________________________________________________________________________
 template <class T>
 void MmapVector<T>::writeMetaDataToEnd() {
-  // Truncate away any previous trailer, then append the new one below.
-  if (FileMapping::resizeFile(_filename.c_str(), _bytesize)) {
+  // Windows cannot resize a file that still has an active mapping
+  // (ERROR_USER_MAPPED_FILE). When the file already has exactly the target
+  // layout, overwrite the trailer in place instead of resizing; otherwise
+  // truncate away the previous trailer before appending the new one below.
+  bool needsTruncate = true;
+  {
+    std::error_code errorCode;
+    auto currentSize = std::filesystem::file_size(_filename, errorCode);
+    if (!errorCode &&
+        currentSize ==
+            _bytesize + static_cast<size_t>(MmapVectorMetaData::numBytes)) {
+      needsTruncate = false;
+    }
+  }
+  if (needsTruncate && FileMapping::resizeFile(_filename.c_str(), _bytesize)) {
     throw TruncateException(_filename, _bytesize, errno);
   }
 
