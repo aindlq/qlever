@@ -61,6 +61,16 @@ static constexpr auto filesystem_perms_none =
 static constexpr auto filesystem_perms_none = ::std::filesystem::perms::none;
 #endif
 
+// The `perms` value that represents "all permissions" (0777), spelled
+// `perms::all` in `std::filesystem` and `perms::all_all` in
+// `boost::filesystem`.
+#ifdef QLEVER_CPP_17
+static constexpr auto filesystem_perms_all =
+    ::boost::filesystem::perms::all_all;
+#else
+static constexpr auto filesystem_perms_all = ::std::filesystem::perms::all;
+#endif
+
 // A range over the entries of a directory. Prefer this over using a
 // `ql::filesystem::directory_iterator` directly as a range (for example in a
 // `ql::ranges` algorithm). In the C++17 backports mode `directory_iterator` is

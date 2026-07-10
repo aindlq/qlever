@@ -21,14 +21,24 @@ namespace ad_utility {
 
 //______________________________________________________________________________
 void SyncIoPolicy::readFullyOrThrow(int fd, char* targetBuffer, size_t numBytes,
-                                    uint64_t fileOffset) {
+                                    uint64_t fileOffset) const {
   // `pread` reads up to `numBytes` bytes from file descriptor `fd` at offset
   // `fileOffset` (from the start of the file) into `targetBuffer`. The file
   // offset is not changed. On success, it returns the number of bytes read (0
   // indicates end of file); on error it returns -1 and sets `errno`. See
   // https://man7.org/linux/man-pages/man2/pread.2.html for more details.
+#ifdef _WIN32
+  // Windows has no `pread`. Use a dedicated handle obtained with `ReOpenFile`
+  // and an explicit `OVERLAPPED` offset. This preserves the original CRT
+  // handle's file position and also works if the open file has been renamed.
+  auto [it, wasInserted] = readHandles_.try_emplace(fd);
+  (void)wasInserted;
+  const ssize_t numBytesRead = it->second.pread(fd, targetBuffer, numBytes,
+                                                static_cast<off_t>(fileOffset));
+#else
   const ssize_t numBytesRead =
       pread(fd, targetBuffer, numBytes, static_cast<off_t>(fileOffset));
+#endif
 
   if (numBytesRead < 0) {
     AD_THROW("pread failed in readFullyOrThrow");
@@ -49,7 +59,7 @@ void SyncIoPolicy::addBatch(int fd,
   for (const auto& [numBytesToRead, fileOffset, targetBuf] :
        ::ranges::views::zip(numBytesToReadPerRequest, fileOffsetPerRequest,
                             targetBufferPerRequest)) {
-    SyncIoPolicy::readFullyOrThrow(fd, targetBuf, numBytesToRead, fileOffset);
+    readFullyOrThrow(fd, targetBuf, numBytesToRead, fileOffset);
   }
 }
 

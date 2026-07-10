@@ -11,7 +11,12 @@ function cleanup_server {
 	cat "$BINARY_DIR/query_log.txt"
 	# Killing 0 sends the signal to all processes in the current
 	# process group
-	kill "$SERVER_PID"
+	kill "$SERVER_PID" 2>/dev/null || true
+	# On Windows/MSYS a backgrounded native .exe is not reached by `kill`;
+	# fall back to taskkill by image name so the port is released.
+	if command -v taskkill >/dev/null 2>&1; then
+		taskkill //F //IM qlever-server.exe >/dev/null 2>&1 || true
+	fi
 }
 
 function print_usage {
@@ -69,15 +74,19 @@ if [ ! -e "$BINARY_DIR" ]; then
 fi
 echo "Binary dir is $BINARY_DIR"
 
-# Travis CI is super cool but also uses ancient OS images and so to get
-# a python that supports typing we need to install from the deadsnakes
-# repository which does not override the system python
-if [ -f "/usr/bin/python3.6" ]; then
-	export PYTHON_BINARY="/usr/bin/python3.6"
-else
-	export PYTHON_BINARY=`which python3`
+# Allow the caller to pre-select the Python interpreter. On Windows the e2e
+# harness needs the MSYS2 mingw python that has PyICU + PyYAML (not the system
+# python3); CI exports PYTHON_BINARY for that. Only autodetect when it is unset.
+if [ -z "${PYTHON_BINARY:-}" ]; then
+	# Travis CI is super cool but also uses ancient OS images and so to get
+	# a python that supports typing we need to install from the deadsnakes
+	# repository which does not override the system python
+	if [ -f "/usr/bin/python3.6" ]; then
+		export PYTHON_BINARY="/usr/bin/python3.6"
+	else
+		export PYTHON_BINARY=`which python3`
+	fi
 fi
-export PYTHON_BINARY=`which python3`
 
 INDEX_DIR="$PROJECT_DIR/$INDEX_DIRECTORY/e2e_data"
 INPUT_DIR="$PROJECT_DIR/e2e_data/scientist-collection"
