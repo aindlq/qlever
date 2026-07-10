@@ -15,6 +15,7 @@
 #include "util/Forward.h"
 #include "util/Iterators.h"
 #include "util/ResetWhenMoved.h"
+#include "util/sys/FileMapping.h"
 
 namespace ad_utility {
 // _________________________________________________________________________
@@ -114,9 +115,6 @@ struct MmapVectorMetaData {
 class CreateTag {};
 class ReuseTag {};
 
-// Enum that specifies access patterns to this array
-enum class AccessPattern { None, Random, Sequential };
-
 // STL-like class which implements a dynamic array (similar to std::vector)
 // whose contents are stored persistently in a file on memory and are accessed
 // using memory mapping
@@ -181,9 +179,6 @@ class MmapVector {
   // ____________________________________________________________________________
   T& back() { return *(_ptr + _size - 1); }
   const T& back() const { return *(_ptr + _size - 1); }
-
-  // _____________________________________________________________
-  std::string getFilename() const { return _filename; }
 
   // we will never have less than this capacity
   static constexpr size_t MinCapacity = 100;
@@ -326,6 +321,7 @@ class MmapVector {
   ResetWhenMoved<size_t, 0> _bytesize;
   std::string _filename = "";
   AccessPattern _pattern = AccessPattern::None;
+  FileMapping fileMapping_;
   static constexpr float ResizeFactor = 1.5;
 };
 
@@ -395,9 +391,6 @@ class MmapVectorView : private MmapVector<T> {
 
   // destructor
   ~MmapVectorView() override { close(); }
-
-  // _____________________________________________________________
-  std::string getFilename() const { return this->_filename; }
 };
 
 // MmapVector that deletes the underlying file on destruction.

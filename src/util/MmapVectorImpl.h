@@ -6,7 +6,6 @@
 #define QLEVER_SRC_UTIL_MMAPVECTOR_IMPL_H
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -27,8 +26,8 @@ constexpr float MmapVector<T>::ResizeFactor;
 // __________________________________________________________________________
 template <class T>
 void MmapVector<T>::writeMetaDataToEnd() {
-  // does  this not matter
-  if (truncate(_filename.c_str(), _bytesize)) {
+  // Truncate away any previous trailer, then append the new one below.
+  if (FileMapping::resizeFile(_filename.c_str(), _bytesize)) {
     throw TruncateException(_filename, _bytesize, errno);
   }
 
@@ -52,49 +51,25 @@ void MmapVector<T>::readMetaDataFromEnd() {
 // ________________________________________________________________
 template <class T>
 void MmapVector<T>::mapForReading() {
-  // open to get valid file descriptor
-  int orig_fd = ::open(_filename.c_str(), O_RDONLY);
-  // TODO: check if MAP_SHARED is necessary/useful
-  void* ptr = mmap(nullptr, _bytesize, PROT_READ, MAP_SHARED, orig_fd, 0);
-  AD_CONTRACT_CHECK(ptr != MAP_FAILED);
-
-  // the filedescriptor and thus our mapping will still be valid
-  // after closing, because mmap increases the count by one
-  ::close(orig_fd);
-  _ptr = static_cast<T*>(ptr);
+  _ptr = static_cast<T*>(
+      fileMapping_.map(_filename, _bytesize, /*writable=*/false));
   advise(_pattern);
 }
 
 // ________________________________________________________________
 template <class T>
 void MmapVector<T>::mapForWriting() {
-  // open to get valid file descriptor
-  int orig_fd = ::open(_filename.c_str(), O_RDWR);
-  // map_shared because we need our updates in the original file
-  void* ptr =
-      mmap(nullptr, _bytesize, PROT_WRITE | PROT_READ, MAP_SHARED, orig_fd, 0);
-  AD_CONTRACT_CHECK(ptr != MAP_FAILED);
-  // the filedescriptor and thus our mapping will still be valid
-  // after closing, because mmap increases the count by one
-  ::close(orig_fd);
-  _ptr = static_cast<T*>(ptr);
+  _ptr = static_cast<T*>(
+      fileMapping_.map(_filename, _bytesize, /*writable=*/true));
   advise(_pattern);
 }
 // ________________________________________________________________
 template <class T>
 void MmapVector<T>::remapLinux(size_t oldBytesize) {
-#ifdef __linux__
-  void* ptr =
-      mremap(static_cast<void*>(_ptr), oldBytesize, _bytesize, MREMAP_MAYMOVE);
-  AD_CONTRACT_CHECK(ptr != MAP_FAILED);
-  // the filedescriptor and thus our mapping will still be valid
-  // after closing, because mmap increases the count by one
-  _ptr = static_cast<T*>(ptr);
+  // Only ever called on Linux (see `adaptCapacity`).
+  _ptr = static_cast<T*>(
+      fileMapping_.remap(static_cast<void*>(_ptr), oldBytesize, _bytesize));
   advise(_pattern);
-#else
-  (void)oldBytesize;
-  AD_FAIL();
-#endif
 }
 
 // __________________________________________________________________
@@ -102,7 +77,7 @@ template <class T>
 VecInfo MmapVector<T>::convertArraySizeToFileSize(size_t targetSize) const {
   // calculate the smallest multiple of pagesize that can fit all the bytes
   // needed for the array.
-  size_t pagesize = getpagesize();
+  size_t pagesize = FileMapping::pageSize();
   size_t bytesize = targetSize * sizeof(T);
   // align size to pagesize. This might be |pagesize| bigger than necessary in
   // the case of an exact match, but this waste of some kb should not be bad
@@ -237,8 +212,8 @@ template <class T>
 void MmapVector<T>::close() {
   // we need the correct size to make the file persistent
   if (_ptr != nullptr) {
-    writeMetaDataToEnd();
-    unmap();
+    fileMapping_.persistAndUnmap([this] { writeMetaDataToEnd(); },
+                                 [this] { unmap(); });
   }
   _filename = "";
   _size = 0;
@@ -259,7 +234,7 @@ MmapVector<T>::~MmapVector() {
 template <class T>
 void MmapVector<T>::unmap() {
   if (_ptr != nullptr) {
-    munmap(static_cast<void*>(_ptr), _bytesize);
+    fileMapping_.unmap(static_cast<void*>(_ptr), _bytesize);
     _ptr = nullptr;
   }
 }
@@ -282,32 +257,14 @@ MmapVector<T>& MmapVector<T>::operator=(MmapVector<T>&& other) noexcept {
   _bytesize = std::move(other._bytesize);
   _filename = std::move(other._filename);
   _pattern = std::move(other._pattern);
+  fileMapping_ = std::move(other.fileMapping_);
   return *this;
 }
 
 // ________________________________________________________________
 template <class T>
 void MmapVector<T>::advise(AccessPattern pattern) {
-  // The constants `MADV_SEQUENTIAL` etc. don't seem to be present on all POSIX
-  // systems, in particular they are not present on the `QNX` platform which
-  // we target with the `REDUCED_FEATURE_SET` mode. Therefore, we simply disable
-  // the following `madvise` calls, as they only are hints to the runtime and
-  // do not change the program semantics.
-#ifndef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
-  switch (pattern) {
-    case AccessPattern::Sequential:
-      madvise(static_cast<void*>(_ptr), _bytesize, MADV_SEQUENTIAL);
-      break;
-    case AccessPattern::Random:
-      madvise(static_cast<void*>(_ptr), _bytesize, MADV_RANDOM);
-      break;
-    default:
-      madvise(static_cast<void*>(_ptr), _bytesize, MADV_NORMAL);
-      break;
-  }
-#else
-  (void)pattern;
-#endif
+  fileMapping_.advise(static_cast<void*>(_ptr), _bytesize, pattern);
 }
 
 // ________________________________________________________________
@@ -329,6 +286,7 @@ MmapVectorView<T>& MmapVectorView<T>::operator=(
   this->_bytesize = std::move(other._bytesize);
   this->_filename = std::move(other._filename);
   this->_pattern = std::move(other._pattern);
+  this->fileMapping_ = std::move(other.fileMapping_);
   return *this;
 }
 
