@@ -666,3 +666,54 @@ TEST(VectorPerf, DISABLED_cslsSelectBenchmark) {
   }
   printf("[done] cslsSelect checks passed\n");
 }
+
+// ___________________________________________________________________________
+// Round-4: the `vec:autoCut` mode-switch cost -- the cold reranked-to-plateau
+// COMPUTE stage vs. re-applying a cut over the cached reranked set (what a
+// mode switch does). On the preloaded 2.14M binary+bf16 index, cosine signal
+// (needs no csls sidecar).
+TEST(VectorPerf, DISABLED_autoCutModeSwitchBenchmark) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  BenchSetup s = setupIndex();
+  const int maxT = maxHwThreads();
+  const int prodT = std::min(8, maxT);
+  VectorIndex idx;
+  idx.open(s.basename, "perf", VectorIndex::Residency::AlignedCopy,
+           VectorIndex::Residency::AlignedCopy);
+  const float ff = DEFAULT_ZCUT_FLOOR_FRACTION;
+  const float eps = DEFAULT_ZCUT_PLATEAU_EPS;
+  // The production rerank cap (`resolveCslsCut` = cslsRerankFloor * 8); a
+  // random synthetic index never plateaus, so the cap bounds the depth.
+  const size_t cap = idx.cslsRerankFloor() * 8;
+  setThreads(maxT);
+  (void)idx.computeCslsReranked(s.query, 10, ff, eps, cap);  // warm
+  auto mkCut = [](float z) {
+    CslsCut c;
+    c.mode_ = CslsCut::Mode::ZCut;
+    c.signal_ = CslsCut::Signal::Cosine;
+    c.z_ = z;
+    c.keepAtLeastOne_ = true;
+    return c;
+  };
+  printf("\n=== autoCut mode-switch: n=%zu (aligned) ===\n", s.n);
+  for (int t : {prodT, maxT}) {
+    setThreads(t);
+    // Cold: the whole reranked-to-plateau compute (a cache MISS).
+    auto [cMn, cMd] = timeReps(s.reps, [&] {
+      auto r = idx.computeCslsReranked(s.query, 10, ff, eps, cap);
+      (void)r;
+    });
+    // Cached: re-apply a (different-mode) cut over an already-computed set.
+    auto reranked = idx.computeCslsReranked(s.query, 10, ff, eps, cap);
+    auto [aMn, aMd] = timeReps(s.reps, [&] {
+      auto hits = idx.applyCslsCut(reranked, mkCut(2.0f));
+      (void)hits;
+    });
+    char label[80];
+    snprintf(label, sizeof label, "cold compute (miss), %2d thr", t);
+    report(label, s.n, s.coarseRowBytes(), cMn, cMd);
+    printf("  mode-switch cut-only (cache hit), %2d thr: min %.3f ms  "
+           "(reranked=%zu)\n",
+           t, aMn, reranked.rerankDepth());
+  }
+}

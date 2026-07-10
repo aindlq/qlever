@@ -167,32 +167,66 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
   } else if (pred == "bindCsls") {
     setVariable("bindCsls", object, cslsVar_);
   } else if (pred == "autoCut") {
-    using AutoCutMode = qlever::vector::VectorSearchConfiguration::AutoCutMode;
+    using CoverageMode =
+        qlever::vector::VectorSearchConfiguration::CoverageMode;
+    using CutSignal = qlever::vector::VectorSearchConfiguration::CutSignal;
+    // A back-compat `vec:autoCut "softmax"/"csls"` fixes the signal too; a
+    // conflicting explicit `vec:cutSignal` is rejected below.
+    auto setSignalOnce = [this](CutSignal s) {
+      if (cutSignal_.has_value() && cutSignal_.value() != s) {
+        throw VectorSearchException{
+            "Conflicting `<cutSignal>` and back-compat `<autoCut> "
+            "\"softmax\"/\"csls\"`; use the coverage words for `<autoCut>` and "
+            "set the signal with `<cutSignal>`."};
+      }
+      cutSignal_ = s;
+    };
     std::string mode = requireLiteral();
-    if (mode == "csls") {
-      autoCut_ = AutoCutMode::CslsKnee;
+    if (mode == "precise") {
+      autoCut_ = CoverageMode::Precise;
+    } else if (mode == "balanced") {
+      autoCut_ = CoverageMode::Balanced;
+    } else if (mode == "broad") {
+      autoCut_ = CoverageMode::Broad;
+    } else if (mode == "exact") {
+      autoCut_ = CoverageMode::Exact;
     } else if (mode == "softmax") {
-      autoCut_ = AutoCutMode::Softmax;
+      autoCut_ = CoverageMode::Balanced;
+      setSignalOnce(CutSignal::Softmax);
+    } else if (mode == "csls") {
+      autoCut_ = CoverageMode::Balanced;
+      setSignalOnce(CutSignal::Csls);
     } else {
       throw VectorSearchException{absl::StrCat(
-          "The parameter `<autoCut>` expects \"csls\" (the CSLS knee cut) or "
-          "\"softmax\" (the softmax-confidence cut), but got \"",
+          "The parameter `<autoCut>` expects a coverage mode -- \"precise\", "
+          "\"balanced\", \"broad\", or \"exact\" -- (or the back-compat "
+          "\"softmax\"/\"csls\" signal shortcuts), but got \"",
           mode, "\".")};
     }
-  } else if (pred == "cslsFloor") {
-    std::optional<double> value;
-    if (object.isInt()) {
-      value = static_cast<double>(object.getInt());
-    } else if (object.isDouble()) {
-      value = object.getDouble();
+  } else if (pred == "cutSignal") {
+    using CutSignal = qlever::vector::VectorSearchConfiguration::CutSignal;
+    std::string sig = requireLiteral();
+    CutSignal s;
+    if (sig == "cosine") {
+      s = CutSignal::Cosine;
+    } else if (sig == "softmax") {
+      s = CutSignal::Softmax;
+    } else if (sig == "csls") {
+      s = CutSignal::Csls;
+    } else {
+      throw VectorSearchException{absl::StrCat(
+          "The parameter `<cutSignal>` expects \"cosine\" (the scale-invariant "
+          "noise-floor cut, the default), \"softmax\", or \"csls\", but got "
+          "\"",
+          sig, "\".")};
     }
-    if (!value.has_value() || !std::isfinite(value.value())) {
+    if (cutSignal_.has_value() && cutSignal_.value() != s) {
       throw VectorSearchException{
-          "The parameter `<cslsFloor>` expects a finite number (the CSLS "
-          "value below which candidates never survive the `<autoCut> "
-          "\"csls\"` knee cut; default 0, negative values keep more)."};
+          "Conflicting `<cutSignal>` and back-compat `<autoCut> "
+          "\"softmax\"/\"csls\"`; use the coverage words for `<autoCut>` and "
+          "set the signal with `<cutSignal>`."};
     }
-    cslsFloor_ = static_cast<float>(value.value());
+    cutSignal_ = s;
   } else if (pred == "softmaxTemperature") {
     std::optional<double> value;
     if (object.isInt()) {
@@ -204,7 +238,7 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
         value.value() <= 0.0) {
       throw VectorSearchException{
           "The parameter `<softmaxTemperature>` expects a positive finite "
-          "number (the T of the `<autoCut> \"softmax\"` cut's "
+          "number (the T of the `<cutSignal> \"softmax\"` cut's "
           "`softmax(cos / T)`; default 0.1, smaller = peakier)."};
     }
     softmaxTemperature_ = static_cast<float>(value.value());
@@ -212,35 +246,10 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
     if (!object.isInt() || object.getInt() <= 0) {
       throw VectorSearchException{
           "The parameter `<softmaxN>` expects a positive integer (how many "
-          "of the best candidates enter the `<autoCut> \"softmax\"` cut; "
+          "of the best candidates enter the `<cutSignal> \"softmax\"` cut; "
           "default `5 * cslsNeighbors`)."};
     }
     softmaxN_ = static_cast<size_t>(object.getInt());
-  } else if (pred == "breadth") {
-    // A number in [0, 1], or one of the presets.
-    std::optional<double> value;
-    if (object.isInt()) {
-      value = static_cast<double>(object.getInt());
-    } else if (object.isDouble()) {
-      value = object.getDouble();
-    } else if (object.isLiteral()) {
-      std::string_view preset =
-          asStringViewUnsafe(object.getLiteral().getContent());
-      if (preset == "precise") {
-        value = 0.0;
-      } else if (preset == "balanced") {
-        value = 0.5;
-      } else if (preset == "broad") {
-        value = 1.0;
-      }
-    }
-    if (!value.has_value() || !(value.value() >= 0.0 && value.value() <= 1.0)) {
-      throw VectorSearchException{
-          "The parameter `<breadth>` expects a number between 0 (precise) "
-          "and 1 (broad), or one of \"precise\", \"balanced\", \"broad\" "
-          "(default 0.5 = \"balanced\")."};
-    }
-    breadth_ = static_cast<float>(value.value());
   } else if (pred == "cslsNeighbors") {
     if (!object.isInt() || object.getInt() <= 0) {
       throw VectorSearchException{
@@ -275,8 +284,8 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
         "`<candidates>` (alias `<left>`), `<result>`/`<right>`, "
         "`<bindScore>`, `<bindCoarseScore>`, `<bindCsls>`, `<k>` (alias "
         "`<numNearestNeighbors>`), `<rerankK>`, `<maxDistance>`, "
-        "`<cslsThreshold>`, `<cslsNeighbors>`, `<autoCut>`, `<cslsFloor>`, "
-        "`<softmaxTemperature>`, `<softmaxN>`, `<breadth>`, `<algorithm>`.")};
+        "`<cslsThreshold>`, `<cslsNeighbors>`, `<autoCut>`, `<cutSignal>`, "
+        "`<softmaxTemperature>`, `<softmaxN>`, `<algorithm>`.")};
   }
 }
 
@@ -360,8 +369,16 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   // index, of the coarse scan layer with a bounded fine rerank on a
   // two-layer one), so the top-k-style coarse-pass parameters and the HNSW
   // override contradict them.
-  using AutoCutMode = qlever::vector::VectorSearchConfiguration::AutoCutMode;
+  using CutSignal = qlever::vector::VectorSearchConfiguration::CutSignal;
   const bool hasCslsCut = cslsThreshold_.has_value() || autoCut_.has_value();
+  const CutSignal signal = cutSignal_.value_or(CutSignal::Cosine);
+  const bool softmaxSignal =
+      autoCut_.has_value() && signal == CutSignal::Softmax;
+  // The CSLS value (`vec:bindCsls`) is defined only by the fixed threshold or
+  // the `csls` signal.
+  const bool cutNeedsCslsValue =
+      cslsThreshold_.has_value() ||
+      (autoCut_.has_value() && signal == CutSignal::Csls);
   throwIf(cslsThreshold_.has_value() && autoCut_.has_value(),
           "The `<cslsThreshold>` (fixed CSLS cut) and `<autoCut>` (dynamic "
           "cut) parameters are mutually exclusive; use at most one of them.");
@@ -386,25 +403,21 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
           "(the per-index `cslsRerankFloor` serving setting, widened "
           "automatically as needed), so `<rerankK>` cannot be combined with "
           "them.");
-  // The per-mode knobs are only valid with their mode.
-  throwIf(cslsFloor_.has_value() && autoCut_ != AutoCutMode::CslsKnee,
-          "The `<cslsFloor>` parameter requires `<autoCut> \"csls\"` (the "
-          "knee cut's floor; the fixed cut's bound is `<cslsThreshold>` "
-          "itself).");
-  throwIf(softmaxTemperature_.has_value() && autoCut_ != AutoCutMode::Softmax,
-          "The `<softmaxTemperature>` parameter requires `<autoCut> "
-          "\"softmax\"`.");
-  throwIf(softmaxN_.has_value() && autoCut_ != AutoCutMode::Softmax,
-          "The `<softmaxN>` parameter requires `<autoCut> \"softmax\"`.");
-  throwIf(breadth_.has_value() && !autoCut_.has_value(),
-          "The `<breadth>` parameter requires `<autoCut>` (it tunes the "
-          "dynamic cuts; the fixed `<cslsThreshold>` IS the precision dial "
-          "of the fixed cut).");
-  throwIf(cslsVar_.has_value() && !cslsThreshold_.has_value() &&
-              autoCut_ != AutoCutMode::CslsKnee,
-          "The `<bindCsls>` parameter requires `<cslsThreshold>` or "
-          "`<autoCut> \"csls\"` (the CSLS value is only computed for the "
-          "CSLS cuts; the softmax cut defines none).");
+  // `<cutSignal>` and the per-signal knobs are only valid with `<autoCut>`.
+  throwIf(cutSignal_.has_value() && !autoCut_.has_value(),
+          "The `<cutSignal>` parameter requires `<autoCut>` (it selects the "
+          "dynamic cut's method; the fixed `<cslsThreshold>` has none).");
+  throwIf(softmaxTemperature_.has_value() && !softmaxSignal,
+          "The `<softmaxTemperature>` parameter requires `<cutSignal> "
+          "\"softmax\"` (or the back-compat `<autoCut> \"softmax\"`).");
+  throwIf(softmaxN_.has_value() && !softmaxSignal,
+          "The `<softmaxN>` parameter requires `<cutSignal> \"softmax\"` (or "
+          "the back-compat `<autoCut> \"softmax\"`).");
+  throwIf(
+      cslsVar_.has_value() && !cutNeedsCslsValue,
+      "The `<bindCsls>` parameter requires `<cslsThreshold>` or `<cutSignal> "
+      "\"csls\"` (the CSLS value is only computed for the CSLS cuts; the "
+      "cosine/softmax cuts define none).");
   throwIf(cslsNeighbors_.has_value() && !hasCslsCut,
           "The `<cslsNeighbors>` parameter requires `<cslsThreshold>` or "
           "`<autoCut>`.");
@@ -456,10 +469,10 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   config.cslsVariable_ = cslsVar_;
   config.cslsNeighbors_ = cslsNeighbors_;
   config.autoCut_ = autoCut_;
-  config.cslsFloor_ = cslsFloor_;
+  config.cutSignal_ = cutSignal_.value_or(
+      qlever::vector::VectorSearchConfiguration::CutSignal::Cosine);
   config.softmaxTemperature_ = softmaxTemperature_;
   config.softmaxN_ = softmaxN_;
-  config.breadth_ = breadth_;
   // With a CSLS-machinery cut (fixed or dynamic), an EXPLICIT `<k>` caps the
   // survivors; without one ALL survivors are returned (variable cardinality
   // -- the point of the cuts).

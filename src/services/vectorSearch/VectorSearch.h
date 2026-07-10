@@ -38,21 +38,38 @@ void appendCslsCutToCacheKey(std::string* key,
 void validateCslsIsAvailable(const VectorSearchConfiguration& config,
                              const VectorIndex& vidx);
 
-// Resolve the effective `CslsCut` of `config` against `vidx`: each knob falls
-// back query parameter -> per-index serving default (the `cslsFloor`/
-// `softmaxTemperature`/`softmaxN`/`breadth` keys of
-// `QLEVER_VECTOR_SEARCH_ENDPOINTS`) -> constant default (`DEFAULT_CSLS_*`).
-// Precondition: `config.hasCslsCut()` and `vidx.hasCsls()` (call
-// `validateCslsIsAvailable` first). The BREADTH dial (0 = precise, 0.5 = the
-// defaults, 1 = broad) maps ONE lever per mode, exponentially with a factor
-// of 2 at the extremes:
-//  * Knee:    `significanceFactor = 3.0 * 2^(2*breadth - 1)`  (1.5 .. 6.0).
-//    A LARGER factor makes the knee fire less readily, falling back to "keep
-//    everything >= cslsFloor" more often -- i.e. BROADER results.
-//  * Softmax: `alpha = 2.0 * 2^(1 - 2*breadth)`               (4.0 .. 1.0).
-//    A SMALLER alpha is a looser standout bar -- i.e. BROADER results.
+// Resolve the effective `CslsCut` of `config` against `vidx`. The fixed
+// `vec:cslsThreshold` is a passthrough; a `vec:autoCut` coverage mode maps to
+// a z-threshold (cosine/csls signal) or a softmax bar alpha, plus the shared
+// noise-floor + plateau knobs; the softmax knobs still fall back query param ->
+// per-index serving default (`softmaxTemperature`/`softmaxN` keys of
+// `QLEVER_VECTOR_SEARCH_ENDPOINTS`) -> constant default. Precondition:
+// `config.hasCslsCut()` (call `validateCslsIsAvailable` first).
 CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
                        const VectorIndex& vidx);
+
+// Run the resolved CSLS `cut` for a query point over `candidates` (nullopt =
+// the whole index), returning the survivors ascending by cosine distance. For
+// the dynamic COVERAGE cuts (`vec:autoCut`), stage (a) -- the rerank to the
+// noise-floor plateau -- is served from a process-lifetime cache keyed by the
+// MODE-INDEPENDENT part (index, query point, `candidateIdentity`, r(q) size,
+// depth knobs), so switching `vec:autoCut`/`vec:cutSignal` on a repeat query
+// re-applies the cut in O(reranked) with NO rescan; the fixed threshold is
+// uncached. `candidateIdentity` is the candidate set's cache identity (the
+// child operation's cache key), empty for a whole-index search. `numScored`
+// (if set) receives the scored-candidate count; `rerankCacheHit` (if set)
+// whether stage (a) hit the cache.
+std::vector<CslsScoredEntity> runCslsCut(
+    const VectorIndex& vidx, const VectorSearchConfiguration& config,
+    const CslsCut& cut, size_t neighbors, std::optional<Id> queryEntity,
+    ql::span<const float> query, std::optional<ql::span<const Id>> candidates,
+    std::string_view candidateIdentity,
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored = nullptr,
+    bool* rerankCacheHit = nullptr);
+
+// Test hooks for the reranked-score cache.
+size_t cslsRerankedCacheSizeForTesting();
+void clearCslsRerankedCacheForTesting();
 
 // The WHOLE-INDEX top-k search of `config` (FORM W): resolve the query point
 // against the index `config.indexName_` and return the k nearest entities as

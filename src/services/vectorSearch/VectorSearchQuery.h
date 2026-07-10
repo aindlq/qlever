@@ -100,21 +100,18 @@ struct VectorSearchQuery : MagicServiceQuery {
   // requires `vec:cslsThreshold` or `vec:autoCut` -- it sizes r(q), and for
   // the softmax mode the default `softmaxN = 5 * cslsNeighbors`).
   std::optional<size_t> cslsNeighbors_;
-  // The DYNAMIC result-selection cut (`vec:autoCut "csls"` -- the CSLS knee
-  // -- or `vec:autoCut "softmax"`), mutually exclusive with
-  // `vec:cslsThreshold`; like it, requires a query point and a csls-built
-  // index. See `VectorSearchConfiguration::autoCut_`.
-  std::optional<qlever::vector::VectorSearchConfiguration::AutoCutMode>
+  // The DYNAMIC coverage cut (`vec:autoCut` = the coverage MODE), mutually
+  // exclusive with `vec:cslsThreshold`. See `VectorSearchConfiguration`.
+  std::optional<qlever::vector::VectorSearchConfiguration::CoverageMode>
       autoCut_;
-  // Knee only (`vec:cslsFloor`): candidates below this CSLS never survive.
-  std::optional<float> cslsFloor_;
-  // Softmax only (`vec:softmaxTemperature`, `vec:softmaxN`).
+  // The cut method/signal (`vec:cutSignal`; default Cosine). `nullopt` = not
+  // explicitly given (so a back-compat `vec:autoCut "softmax"/"csls"` can set
+  // it, and an explicit `vec:cutSignal` conflicting with them is rejected).
+  std::optional<qlever::vector::VectorSearchConfiguration::CutSignal>
+      cutSignal_;
+  // Softmax signal only (`vec:softmaxTemperature`, `vec:softmaxN`).
   std::optional<float> softmaxTemperature_;
   std::optional<size_t> softmaxN_;
-  // Both autoCut modes (`vec:breadth`): the precise (0.0) <-> broad (1.0)
-  // dial, a number in [0, 1] or one of the presets "precise" (0.0),
-  // "balanced" (0.5), "broad" (1.0). 0.5 = the defaults.
-  std::optional<float> breadth_;
   qlever::vector::VectorSearchConfiguration::Algorithm algo_ =
       qlever::vector::VectorSearchConfiguration::Algorithm::Automatic;
 

@@ -85,6 +85,40 @@ inline constexpr size_t DEFAULT_CSLS_SOFTMAX_N_FACTOR = 5;
 inline constexpr float DEFAULT_CSLS_SOFTMAX_ALPHA = 2.0f;
 inline constexpr float DEFAULT_CSLS_AUTOCUT_BREADTH = 0.5f;
 
+// The NOISE-FLOOR Z-CUT (`vec:autoCut` coverage modes with the `cosine`/`csls`
+// signal): the reranked candidates' signal scores are z-scored against a
+// robust estimate of the background NOISE FLOOR (its median + MAD-derived
+// spread from the low tail of the reranked window), and everything with
+// `z >= Z(mode)` from the top is kept -- a scale-INVARIANT, coverage-oriented
+// cut (multiplying every score by a constant leaves z unchanged). These are
+// the USER-TUNABLE knobs (also per-index overridable via the
+// `QLEVER_VECTOR_SEARCH_ENDPOINTS` `zcut*` keys):
+//   Z(mode): how many spreads above the floor a candidate must stand to be
+//   kept. precise ~3 (only clear standouts), balanced ~2, broad ~1 (a wide
+//   net); `exact` reuses the precise Z but, unlike the others, keeps NOTHING
+//   when no candidate clears it (the no-match answer) instead of the single
+//   best.
+inline constexpr float DEFAULT_ZCUT_Z_PRECISE = 3.0f;
+inline constexpr float DEFAULT_ZCUT_Z_BALANCED = 2.0f;
+inline constexpr float DEFAULT_ZCUT_Z_BROAD = 1.0f;
+// The background is the LOW `floorFraction` of the reranked window (sorted by
+// signal): its median is the floor mu, and 1.4826 * MAD is the spread sigma
+// (a std-equivalent robust to the standout head).
+inline constexpr float DEFAULT_ZCUT_FLOOR_FRACTION = 0.5f;
+inline constexpr float ZCUT_MAD_TO_SIGMA = 1.4826f;
+// The ADAPTIVE rerank widens in `cslsRerankFloor`-sized batches until the
+// estimated floor PLATEAUS (its median moves less than `plateauEps` * sigma
+// between batches -- the window has flattened into background), or the cap is
+// hit. Smaller eps = deeper (more conservative) plateau.
+inline constexpr float DEFAULT_ZCUT_PLATEAU_EPS = 0.15f;
+// The softmax bar alpha per coverage mode (stricter = fewer standouts). These
+// reproduce the former `vec:breadth` preset mapping (balanced == the old
+// default), so a `cutSignal "softmax"` z-cut is bit-identical to today's
+// softmax cut for the matching mode.
+inline constexpr float DEFAULT_ZCUT_SOFTMAX_ALPHA_PRECISE = 4.0f;
+inline constexpr float DEFAULT_ZCUT_SOFTMAX_ALPHA_BALANCED = 2.0f;
+inline constexpr float DEFAULT_ZCUT_SOFTMAX_ALPHA_BROAD = 1.0f;
+
 // The fully-resolved cut a `searchCsls*` call applies to the reranked
 // candidate set. The classic fixed cut is `Mode::Threshold` (a bare float
 // converts implicitly, so `searchCsls(query, 0.5f, ...)` keeps meaning "fixed
@@ -92,14 +126,22 @@ inline constexpr float DEFAULT_CSLS_AUTOCUT_BREADTH = 0.5f;
 // per-index serving defaults, and the constants above by `resolveCslsCut`
 // (`VectorSearch.h`). Fields not belonging to the active mode are ignored.
 struct CslsCut {
-  enum class Mode { Threshold, Knee, Softmax };
+  // Threshold: the fixed tau `csls >= tau`. Knee: the CSLS-gap cut (retained
+  // for the `CslsCut`-level engine API; the `vec:autoCut` surface no longer
+  // routes to it). Softmax: the softmax-standout cut. ZCut: the noise-floor
+  // z-cut (the current `vec:autoCut` coverage modes, `cosine`/`csls` signal).
+  enum class Mode { Threshold, Knee, Softmax, ZCut };
+  // The signal the ZCut z-scores: the raw cosine SIMILARITY, or the CSLS value
+  // `2*cos - r(q) - r(d)`. (`Softmax` always uses cosine; the others compute a
+  // CSLS value.)
+  enum class Signal { Cosine, Csls };
   // Implicit on purpose: a bare float IS the fixed-threshold cut.
   CslsCut(float threshold = 0.0f) : threshold_{threshold} {}
 
   Mode mode_ = Mode::Threshold;
   // Threshold: the tau of `csls >= tau`. Knee: the FLOOR -- candidates below
   // it never survive, and the two-layer rerank widening stops at it exactly
-  // like a fixed tau. Unused by Softmax.
+  // like a fixed tau. Unused by Softmax/ZCut.
   float threshold_;
   // Knee: the knee is taken only if its gap > `significanceFactor_` x the
   // median gap of the inspected head (else: keep everything >= the floor),
@@ -114,6 +156,49 @@ struct CslsCut {
   size_t softmaxN_ = 0;
   float temperature_ = DEFAULT_CSLS_SOFTMAX_TEMPERATURE;
   float alpha_ = DEFAULT_CSLS_SOFTMAX_ALPHA;
+
+  // ZCut (and the shared coverage-mode floor for Softmax):
+  Signal signal_ = Signal::Cosine;
+  // The z-threshold Z(mode): keep candidates whose signal is at least `z_`
+  // spreads above the noise floor.
+  float z_ = DEFAULT_ZCUT_Z_BALANCED;
+  // Background = the low `floorFraction_` of the reranked window.
+  float floorFraction_ = DEFAULT_ZCUT_FLOOR_FRACTION;
+  // The adaptive-rerank plateau tolerance (see DEFAULT_ZCUT_PLATEAU_EPS).
+  float plateauEps_ = DEFAULT_ZCUT_PLATEAU_EPS;
+  // Non-`exact` coverage modes keep at least one result (the single best when
+  // nothing clears the bar); `exact` keeps zero -- the no-match answer.
+  // Defaults to false so a bare `CslsCut` (the direct engine API) keeps the
+  // strict "nothing stands out => nothing" behaviour; `resolveCslsCut` sets it
+  // per coverage mode.
+  bool keepAtLeastOne_ = false;
+  // Adaptive rerank cap: the widening never reranks more than this many
+  // candidates (0 = the whole scored set). The initial batch is
+  // `cslsRerankFloor`.
+  size_t rerankCap_ = 0;
+
+  // True for the dynamic cuts whose rerank depth is driven by the noise-floor
+  // PLATEAU rather than a fixed threshold boundary.
+  bool usesPlateauRerank() const { return mode_ == Mode::ZCut; }
+};
+
+// The MODE-INDEPENDENT product of a two-/single-layer CSLS search: the
+// candidates reranked to the noise-floor plateau (or the rerank cap), in
+// COARSE-RANK order, with everything a cut of ANY coverage mode / signal
+// needs. Produced by `computeCslsReranked`, consumed by `applyCslsCut`; the
+// engine caches it so switching `vec:autoCut`/`vec:cutSignal` on a repeat
+// query re-applies the cut in O(reranked) with no rescan. Storing the fine
+// cosine distance + the store row (for r(d) via the `.csls` sidecar) + r(q)
+// is enough to derive the cosine, CSLS, and softmax signals.
+struct CslsReranked {
+  std::vector<uint64_t> entityBits_;  // survivor entity id bits, coarse order
+  std::vector<uint64_t> storeRows_;   // its store row (r(d) sidecar lookup)
+  std::vector<float> fineDist_;       // fine cosine DISTANCE (1 - cos_sim)
+  float rq_ = 0.f;                    // r(q) over the reranked prefix
+  size_t scored_ = 0;                 // number of candidates scored (= n)
+  bool hasCsls_ = false;              // whether the index carries a `.csls`
+  bool plateauFound_ = true;          // false => the rerank hit its cap
+  size_t rerankDepth() const { return entityBits_.size(); }
 };
 
 // Read-only, memory-mapped accessor for a single on-disk vector index (see
@@ -407,6 +492,36 @@ class VectorIndex {
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
       size_t* numScored = nullptr) const;
+
+  // Stage (a) of the coverage-mode `vec:autoCut` (the `cosine`/`csls`/`softmax`
+  // signals): rerank the candidates to the noise-floor PLATEAU -- widen in
+  // `cslsRerankFloor`-sized batches until the estimated floor (median of the
+  // low `floorFraction` of the reranked cosines) stabilizes to within
+  // `plateauEps` spreads, or `rerankCap` (0 = whole scored set) is hit -- and
+  // return the reranked set + r(q). This is MODE-INDEPENDENT (the cut, its
+  // z-threshold, and its signal are applied by `applyCslsCut`), so the engine
+  // caches it and re-applies the cut for free on a mode switch. `candidates`,
+  // `maxDistance` semantics as `searchCsls`. `neighbors` is the r(q) count.
+  CslsReranked computeCslsReranked(
+      ql::span<const float> query, size_t neighbors, float floorFraction,
+      float plateauEps, size_t rerankCap,
+      std::optional<ql::span<const Id>> candidates = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {}) const;
+
+  // The same with a STORED entity's vector as the query point.
+  CslsReranked computeCslsRerankedByEntity(
+      Id entity, size_t neighbors, float floorFraction, float plateauEps,
+      size_t rerankCap,
+      std::optional<ql::span<const Id>> candidates = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {}) const;
+
+  // Stage (b): apply a coverage-mode `cut` (ZCut over the cosine/CSLS signal,
+  // or Softmax) to an already-`computeCslsReranked` set. O(reranked), no
+  // rescan. `maxDistance`, if set, filters the OUTPUT. Non-`exact` modes keep
+  // at least the single best; `exact` may keep zero (the no-match answer).
+  std::vector<CslsScoredEntity> applyCslsCut(
+      const CslsReranked& reranked, const CslsCut& cut,
+      std::optional<float> maxDistance = std::nullopt) const;
 
   // A reusable per-query distance functor. It encodes the query point ONCE
   // (into the FINE layer's storage scalar -- the rerank matrix when present,

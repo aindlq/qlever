@@ -16,7 +16,10 @@
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
 #include "services/vectorSearch/VectorQueryPoint.h"
+#include "util/Cache.h"
+#include "util/ConcurrentCache.h"
 #include "util/HashMap.h"
+#include "util/MemorySize/MemorySize.h"
 #include "util/Timer.h"
 
 namespace {
@@ -66,13 +69,8 @@ void appendCslsCutToCacheKey(std::string* key,
         key, " cslsThreshold=",
         absl::Hex(absl::bit_cast<uint32_t>(config.cslsThreshold_.value())));
   } else {
-    absl::StrAppend(key,
-                    " autoCut=", static_cast<int>(config.autoCut_.value()));
-    if (config.cslsFloor_.has_value()) {
-      absl::StrAppend(
-          key, " cslsFloor=",
-          absl::Hex(absl::bit_cast<uint32_t>(config.cslsFloor_.value())));
-    }
+    absl::StrAppend(key, " autoCut=", static_cast<int>(config.autoCut_.value()),
+                    " cutSignal=", static_cast<int>(config.cutSignal_));
     if (config.softmaxTemperature_.has_value()) {
       absl::StrAppend(key, " softmaxT=",
                       absl::Hex(absl::bit_cast<uint32_t>(
@@ -80,11 +78,6 @@ void appendCslsCutToCacheKey(std::string* key,
     }
     if (config.softmaxN_.has_value()) {
       absl::StrAppend(key, " softmaxN=", config.softmaxN_.value());
-    }
-    if (config.breadth_.has_value()) {
-      absl::StrAppend(
-          key, " breadth=",
-          absl::Hex(absl::bit_cast<uint32_t>(config.breadth_.value())));
     }
   }
   absl::StrAppend(key, " csls=", config.cslsVariable_.has_value(),
@@ -97,32 +90,54 @@ void appendCslsCutToCacheKey(std::string* key,
 // ____________________________________________________________________________
 void validateCslsIsAvailable(const VectorSearchConfiguration& config,
                              const VectorIndex& vidx) {
-  using AutoCutMode = VectorSearchConfiguration::AutoCutMode;
-  // The SOFTMAX autoCut is CSLS-INDEPENDENT: it thresholds the softmax of the
-  // top-`softmaxN` COSINE similarities and never consults r(d) or r(q). So it
-  // needs only a cosine-metric index, NOT one built with `csls:true` (which is
-  // what materialises the r(d) sidecar the other cuts read).
-  if (config.autoCut_.has_value() &&
-      config.autoCut_.value() == AutoCutMode::Softmax) {
+  // The cosine z-cut and the softmax cut are CSLS-INDEPENDENT (they never
+  // consult r(d)/r(q)), so they need only a cosine-metric index. The fixed
+  // `cslsThreshold` and the `csls`-signal z-cut use r(d), so they require the
+  // `.csls` sidecar.
+  if (!config.cutNeedsCsls()) {
     if (vidx.metric() != VectorMetric::Cosine) {
       throw std::runtime_error{absl::StrCat(
-          "`vec:autoCut \"softmax\"` needs a cosine-metric vector index (it "
-          "thresholds the softmax of cosine similarities), but vector index '",
+          "`vec:autoCut` (the cosine/softmax cut) needs a cosine-metric vector "
+          "index, but vector index '",
           config.indexName_, "' uses a non-cosine metric.")};
     }
     return;
   }
-  // The fixed `cslsThreshold` and the CSLS-knee both use r(d), so they require
-  // the csls sidecar.
   if (!vidx.hasCsls()) {
     throw std::runtime_error{absl::StrCat(
         "`vec:",
-        config.cslsThreshold_.has_value() ? "cslsThreshold" : "autoCut",
-        "` requires an index built with `\"csls\": true`, "
-        "but vector index '",
+        config.cslsThreshold_.has_value() ? "cslsThreshold"
+                                          : "cutSignal \"csls\"",
+        "` requires an index built with `\"csls\": true`, but vector index '",
         config.indexName_, "' was not built with csls:true.")};
   }
 }
+
+namespace {
+// The z-threshold, softmax bar, and no-match behaviour of each coverage mode.
+struct CoverageParams {
+  float z_;
+  float softmaxAlpha_;
+  bool keepAtLeastOne_;
+};
+CoverageParams coverageParams(VectorSearchConfiguration::CoverageMode mode) {
+  using M = VectorSearchConfiguration::CoverageMode;
+  switch (mode) {
+    case M::Precise:
+      return {DEFAULT_ZCUT_Z_PRECISE, DEFAULT_ZCUT_SOFTMAX_ALPHA_PRECISE, true};
+    case M::Broad:
+      return {DEFAULT_ZCUT_Z_BROAD, DEFAULT_ZCUT_SOFTMAX_ALPHA_BROAD, true};
+    case M::Exact:
+      // Exact = precise's bar, but the no-match answer is zero, not the best.
+      return {DEFAULT_ZCUT_Z_PRECISE, DEFAULT_ZCUT_SOFTMAX_ALPHA_PRECISE,
+              false};
+    case M::Balanced:
+    default:
+      return {DEFAULT_ZCUT_Z_BALANCED, DEFAULT_ZCUT_SOFTMAX_ALPHA_BALANCED,
+              true};
+  }
+}
+}  // namespace
 
 // ____________________________________________________________________________
 CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
@@ -135,40 +150,125 @@ CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
     cut.threshold_ = config.cslsThreshold_.value();
     return cut;
   }
-  using AutoCutMode = VectorSearchConfiguration::AutoCutMode;
-  // Every knob: query parameter -> per-index serving default -> constant.
-  const float breadth = config.breadth_.value_or(
-      vidx.breadthDefault().value_or(DEFAULT_CSLS_AUTOCUT_BREADTH));
-  if (config.autoCut_.value() == AutoCutMode::CslsKnee) {
-    cut.mode_ = CslsCut::Mode::Knee;
-    cut.threshold_ = config.cslsFloor_.value_or(
-        vidx.cslsFloorDefault().value_or(DEFAULT_CSLS_FLOOR));
-    // Higher breadth => LARGER significance factor => the knee fires less
-    // readily => the floor-fallback (keep everything >= floor) wins more
-    // often => BROADER results. Factor 2 at each extreme, 1 at breadth 0.5.
-    cut.significanceFactor_ =
-        DEFAULT_CSLS_KNEE_SIGNIFICANCE * std::exp2(2.f * breadth - 1.f);
-    cut.maxKeep_ = DEFAULT_CSLS_KNEE_MAX_KEEP;
-  } else {
+  using CutSignal = VectorSearchConfiguration::CutSignal;
+  const CoverageParams cov = coverageParams(config.autoCut_.value());
+  // The plateau + floor-estimator knobs are (for now) the constants; the
+  // adaptive rerank widens to the whole scored set if the floor never
+  // plateaus (rerankCap_ 0 = no cap, logged if it ever bites).
+  cut.floorFraction_ = DEFAULT_ZCUT_FLOOR_FRACTION;
+  cut.plateauEps_ = DEFAULT_ZCUT_PLATEAU_EPS;
+  // Bound the widening so a NO-MATCH query (whose floor never separates from
+  // the head, so the plateau never fires) reranks at most a few rerank floors
+  // rather than the whole index; hitting it is logged, never silent.
+  cut.rerankCap_ = std::max<size_t>(vidx.cslsRerankFloor() * 8, 10'000);
+  cut.keepAtLeastOne_ = cov.keepAtLeastOne_;
+  if (config.cutSignal_ == CutSignal::Softmax) {
     cut.mode_ = CslsCut::Mode::Softmax;
     // T precedence: per-query override -> runtime-config serving default ->
     // the BUILD-time corpus calibration (`.meta`) -> the constant fallback.
-    const float calibratedOrConst = vidx.calibratedSoftmaxTemperature().value_or(
-        DEFAULT_CSLS_SOFTMAX_TEMPERATURE);
+    const float calibratedOrConst =
+        vidx.calibratedSoftmaxTemperature().value_or(
+            DEFAULT_CSLS_SOFTMAX_TEMPERATURE);
     cut.temperature_ = config.softmaxTemperature_.value_or(
         vidx.softmaxTemperatureDefault().value_or(calibratedOrConst));
-    // Default softmaxN: a few times the neighbourhood scale r(q) uses (the
-    // effective `cslsNeighbors` -- the query override, else the build value).
     const size_t neighbors =
         config.cslsNeighbors_.value_or(vidx.cslsNeighbors());
     cut.softmaxN_ = config.softmaxN_.value_or(vidx.softmaxNDefault().value_or(
         std::max<size_t>(DEFAULT_CSLS_SOFTMAX_N_FACTOR * neighbors, 1)));
-    // Higher breadth => SMALLER alpha => a looser standout bar => BROADER
-    // results. Factor 2 at each extreme, 1 at breadth 0.5.
-    cut.alpha_ = DEFAULT_CSLS_SOFTMAX_ALPHA * std::exp2(1.f - 2.f * breadth);
+    cut.alpha_ = cov.softmaxAlpha_;
+  } else {
+    // The noise-floor z-cut over the cosine or CSLS signal.
+    cut.mode_ = CslsCut::Mode::ZCut;
+    cut.signal_ = config.cutSignal_ == CutSignal::Csls
+                      ? CslsCut::Signal::Csls
+                      : CslsCut::Signal::Cosine;
+    cut.z_ = cov.z_;
   }
   return cut;
 }
+
+namespace {
+// The process-lifetime cache of the MODE-INDEPENDENT reranked-to-plateau
+// stage. Keyed by a string (index + query point + candidate identity + r(q)
+// size + depth knobs); the value is the reranked candidate set that any
+// coverage mode / signal then cuts in O(reranked).
+struct CslsRerankedSizeGetter {
+  ad_utility::MemorySize operator()(const CslsReranked& r) const {
+    return ad_utility::MemorySize::bytes(
+        r.entityBits_.size() * sizeof(uint64_t) +
+        r.storeRows_.size() * sizeof(uint64_t) +
+        r.fineDist_.size() * sizeof(float) + sizeof(CslsReranked));
+  }
+};
+using CslsRerankedCache = ad_utility::ConcurrentCache<
+    ad_utility::LRUCache<std::string, CslsReranked, CslsRerankedSizeGetter>>;
+CslsRerankedCache& cslsRerankedCache() {
+  static CslsRerankedCache cache{/*maxNumEntries=*/256,
+                                 ad_utility::MemorySize::megabytes(512),
+                                 ad_utility::MemorySize::megabytes(128)};
+  return cache;
+}
+}  // namespace
+
+// ____________________________________________________________________________
+std::vector<CslsScoredEntity> runCslsCut(
+    const VectorIndex& vidx, const VectorSearchConfiguration& config,
+    const CslsCut& cut, size_t neighbors, std::optional<Id> queryEntity,
+    ql::span<const float> query, std::optional<ql::span<const Id>> candidates,
+    std::string_view candidateIdentity,
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored,
+    bool* rerankCacheHit) {
+  auto setScored = [&](size_t n) {
+    if (numScored != nullptr) *numScored = n;
+  };
+  auto setHit = [&](bool h) {
+    if (rerankCacheHit != nullptr) *rerankCacheHit = h;
+  };
+  // The fixed threshold (and any non-coverage cut) stays on the direct,
+  // uncached path -- it is not what mode-switching re-applies.
+  if (cut.mode_ != CslsCut::Mode::ZCut && cut.mode_ != CslsCut::Mode::Softmax) {
+    setHit(false);
+    return queryEntity.has_value()
+               ? vidx.searchCslsByEntity(queryEntity.value(), cut, neighbors,
+                                         candidates, config.maxDistance_,
+                                         checkInterrupt, numScored)
+               : vidx.searchCsls(query, cut, neighbors, candidates,
+                                 config.maxDistance_, checkInterrupt,
+                                 numScored);
+  }
+  // Cache key: the mode-independent rerank drivers. NOT the coverage mode,
+  // signal, softmax params, cslsKCap, or maxDistance (all applied at cut time).
+  std::string key = absl::StrCat(
+      "CSLS_RERANK idx=", config.indexName_, " nb=", neighbors,
+      " ff=", absl::Hex(absl::bit_cast<uint32_t>(cut.floorFraction_)),
+      " eps=", absl::Hex(absl::bit_cast<uint32_t>(cut.plateauEps_)),
+      " cap=", cut.rerankCap_);
+  appendQueryPointToCacheKey(&key, config);
+  absl::StrAppend(&key, " cand={", candidateIdentity, "}");
+  auto compute = [&]() -> CslsReranked {
+    return queryEntity.has_value()
+               ? vidx.computeCslsRerankedByEntity(
+                     queryEntity.value(), neighbors, cut.floorFraction_,
+                     cut.plateauEps_, cut.rerankCap_, candidates,
+                     checkInterrupt)
+               : vidx.computeCslsReranked(query, neighbors, cut.floorFraction_,
+                                          cut.plateauEps_, cut.rerankCap_,
+                                          candidates, checkInterrupt);
+  };
+  auto res =
+      cslsRerankedCache().computeOnce(key, compute, /*onlyReadFromCache=*/false,
+                                      [](const CslsReranked&) { return true; });
+  setHit(res._cacheStatus != ad_utility::CacheStatus::computed);
+  const CslsReranked& reranked = *res._resultPointer;
+  setScored(reranked.scored_);
+  return vidx.applyCslsCut(reranked, cut, config.maxDistance_);
+}
+
+// ____________________________________________________________________________
+size_t cslsRerankedCacheSizeForTesting() {
+  return cslsRerankedCache().numNonPinnedEntries();
+}
+void clearCslsRerankedCacheForTesting() { cslsRerankedCache().clearAll(); }
 
 // ____________________________________________________________________________
 IdTable computeWholeIndexSearch(
@@ -231,19 +331,19 @@ IdTable computeWholeIndexSearch(
         config.cslsNeighbors_.value_or(vidx->cslsNeighbors());
     ad_utility::Timer cslsTimer{ad_utility::Timer::Started};
     size_t numScored = 0;
-    std::vector<CslsScoredEntity> hits =
-        queryEntity.has_value()
-            ? vidx->searchCslsByEntity(queryEntity.value(), cut, neighbors,
-                                       std::nullopt, config.maxDistance_,
-                                       checkInterrupt, &numScored)
-            : vidx->searchCsls(query, cut, neighbors, std::nullopt,
-                               config.maxDistance_, checkInterrupt, &numScored);
+    bool cacheHit = false;
+    // Whole-index search: the candidate identity is empty.
+    std::vector<CslsScoredEntity> hits = runCslsCut(
+        *vidx, config, cut, neighbors, queryEntity, query, std::nullopt,
+        /*candidateIdentity=*/"", checkInterrupt, &numScored, &cacheHit);
     const double ms = cslsTimer.value().count() / 1000.0;
-    logVectorSearchPhase(config.indexName_,
-                         vidx->hasRerankLayer()
-                             ? "coarse scan + rerank (csls)"
-                             : "full fine scan (csls; coarse layer unused)",
-                         ms, numScored);
+    logVectorSearchPhase(
+        config.indexName_,
+        cacheHit ? "csls rerank (cache hit) + cut"
+                 : (vidx->hasRerankLayer()
+                        ? "coarse scan + rerank (csls)"
+                        : "full fine scan (csls; coarse layer unused)"),
+        ms, numScored);
     logVectorSearchPhase(config.indexName_,
                          absl::StrCat("csls filter: ", numScored,
                                       " candidates -> ", hits.size(), " kept"),

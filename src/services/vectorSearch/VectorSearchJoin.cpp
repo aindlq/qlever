@@ -458,18 +458,23 @@ void VectorSearchJoin::computePreFilterRows(
         config_.cslsNeighbors_.value_or(vidx.cslsNeighbors());
     ad_utility::Timer cslsTimer{ad_utility::Timer::Started};
     size_t numScored = 0;
-    auto hits =
-        queryEntity.has_value()
-            ? vidx.searchCslsByEntity(queryEntity.value(), cut, neighbors,
-                                      candidates, config_.maxDistance_,
-                                      checkInterrupt, &numScored)
-            : vidx.searchCsls(query, cut, neighbors, candidates,
-                              config_.maxDistance_, checkInterrupt, &numScored);
+    bool cacheHit = false;
+    // The candidate set's cache identity is the child subtree's cache key (NOT
+    // the millions of materialized ids), so a mode switch over the SAME bound
+    // set hits the cached reranked stage.
+    const std::string candidateIdentity =
+        child_ ? child_->getCacheKey() : std::string{"INCOMPLETE"};
+    auto hits = qlever::vector::runCslsCut(
+        vidx, config_, cut, neighbors, queryEntity, query,
+        std::optional<ql::span<const Id>>{candidates}, candidateIdentity,
+        checkInterrupt, &numScored, &cacheHit);
     const double ms = cslsTimer.value().count() / 1000.0;
     qlever::vector::logVectorSearchPhase(
         config_.indexName_,
-        vidx.hasRerankLayer() ? "coarse scan + rerank (csls, index members)"
-                              : "full fine scan (csls, index members)",
+        cacheHit ? "csls rerank (cache hit) + cut (index members)"
+                 : (vidx.hasRerankLayer()
+                        ? "coarse scan + rerank (csls, index members)"
+                        : "full fine scan (csls, index members)"),
         ms, numScored);
     qlever::vector::logVectorSearchPhase(
         config_.indexName_,

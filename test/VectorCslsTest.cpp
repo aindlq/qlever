@@ -1594,11 +1594,13 @@ TEST(VectorCsls, softmaxTemperatureCalibratedFromCorpusSpread) {
   EXPECT_LT(tT, sT);
 
   // `resolveCslsCut` uses the calibrated T as the softmax default...
-  using AutoCutMode = VectorSearchConfiguration::AutoCutMode;
+  using CoverageMode = VectorSearchConfiguration::CoverageMode;
+  using CutSignal = VectorSearchConfiguration::CutSignal;
   VectorSearchConfiguration config;
   config.indexName_ = "calspread";
   config.queryVector_ = kAngleQuery;
-  config.autoCut_ = AutoCutMode::Softmax;
+  config.autoCut_ = CoverageMode::Balanced;
+  config.cutSignal_ = CutSignal::Softmax;
   EXPECT_FLOAT_EQ(resolveCslsCut(config, spread).temperature_, sT);
   // ...but a per-query override still wins.
   config.softmaxTemperature_ = 0.25f;
@@ -1715,12 +1717,11 @@ TEST(VectorCsls, autoCutTwoLayerBoundedSoftmaxAndKneeIdentity) {
 }
 
 // _____________________________________________________________________________
-// `resolveCslsCut`: the query-param -> per-index-default -> constant fallback
-// chain and the documented BREADTH mapping (knee: significanceFactor =
-// 3 * 2^(2b-1), so 1.5 at b=0 and 6 at b=1 -- HIGHER breadth = knee fires
-// LESS readily = broader fallback; softmax: alpha = 2 * 2^(1-2b), so 4 at
-// b=0 and 1 at b=1 -- higher breadth = looser standout bar).
-TEST(VectorCsls, resolveCutBreadthMappingAndDefaults) {
+// `resolveCslsCut`: the fixed threshold passthrough, and the coverage-mode ->
+// (z-threshold / softmax-alpha / no-match) mapping across the cosine, csls,
+// and softmax signals, plus the query-param -> per-index-default -> constant
+// chain of the softmax knobs.
+TEST(VectorCsls, resolveCutCoverageModeMappingAndDefaults) {
   std::string basename =
       buildAngleFixtureIndex("acres", {0.f, 30.f, 60.f, 90.f},
                              /*cslsNeighbors=*/2);
@@ -1738,83 +1739,88 @@ TEST(VectorCsls, resolveCutBreadthMappingAndDefaults) {
   EXPECT_EQ(fixed.threshold_, 0.75f);
   config.cslsThreshold_ = std::nullopt;
 
-  using AutoCutMode = VectorSearchConfiguration::AutoCutMode;
-  // Knee constants: floor 0, factor 3, maxKeep 1000.
-  config.autoCut_ = AutoCutMode::CslsKnee;
-  auto knee = resolveCslsCut(config, idx);
-  EXPECT_EQ(knee.mode_, CslsCut::Mode::Knee);
-  EXPECT_EQ(knee.threshold_, DEFAULT_CSLS_FLOOR);
-  EXPECT_FLOAT_EQ(knee.significanceFactor_, DEFAULT_CSLS_KNEE_SIGNIFICANCE);
-  EXPECT_EQ(knee.maxKeep_, DEFAULT_CSLS_KNEE_MAX_KEEP);
-  // Breadth 0 halves the factor (precise), breadth 1 doubles it (broad).
-  config.breadth_ = 0.f;
-  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).significanceFactor_, 1.5f);
-  config.breadth_ = 1.f;
-  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).significanceFactor_, 6.f);
-  config.breadth_ = std::nullopt;
+  using CoverageMode = VectorSearchConfiguration::CoverageMode;
+  using CutSignal = VectorSearchConfiguration::CutSignal;
 
-  // Softmax constants: T 0.1, N = 5 * cslsNeighbors (2 here), alpha 2.
-  config.autoCut_ = AutoCutMode::Softmax;
+  // Cosine signal (the default): a ZCut whose z-threshold is the mode's Z, and
+  // which (except in exact) keeps at least the single best.
+  config.cutSignal_ = CutSignal::Cosine;
+  struct Case {
+    CoverageMode mode_;
+    float z_;
+    bool keepOne_;
+  };
+  for (const Case& c :
+       {Case{CoverageMode::Precise, DEFAULT_ZCUT_Z_PRECISE, true},
+        Case{CoverageMode::Balanced, DEFAULT_ZCUT_Z_BALANCED, true},
+        Case{CoverageMode::Broad, DEFAULT_ZCUT_Z_BROAD, true},
+        Case{CoverageMode::Exact, DEFAULT_ZCUT_Z_PRECISE, false}}) {
+    config.autoCut_ = c.mode_;
+    auto cut = resolveCslsCut(config, idx);
+    EXPECT_EQ(cut.mode_, CslsCut::Mode::ZCut);
+    EXPECT_EQ(cut.signal_, CslsCut::Signal::Cosine);
+    EXPECT_FLOAT_EQ(cut.z_, c.z_);
+    EXPECT_EQ(cut.keepAtLeastOne_, c.keepOne_);
+  }
+
+  // Csls signal: the same z-thresholds, but the csls signal.
+  config.cutSignal_ = CutSignal::Csls;
+  config.autoCut_ = CoverageMode::Broad;
+  auto csls = resolveCslsCut(config, idx);
+  EXPECT_EQ(csls.mode_, CslsCut::Mode::ZCut);
+  EXPECT_EQ(csls.signal_, CslsCut::Signal::Csls);
+  EXPECT_FLOAT_EQ(csls.z_, DEFAULT_ZCUT_Z_BROAD);
+
+  // Softmax signal: alpha per mode, N = 5 * cslsNeighbors (2 here), the
+  // calibrated/default T.
+  config.cutSignal_ = CutSignal::Softmax;
+  config.autoCut_ = CoverageMode::Balanced;
   auto soft = resolveCslsCut(config, idx);
   EXPECT_EQ(soft.mode_, CslsCut::Mode::Softmax);
   EXPECT_FLOAT_EQ(soft.temperature_, DEFAULT_CSLS_SOFTMAX_TEMPERATURE);
   EXPECT_EQ(soft.softmaxN_, 10u);
-  EXPECT_FLOAT_EQ(soft.alpha_, DEFAULT_CSLS_SOFTMAX_ALPHA);
+  EXPECT_FLOAT_EQ(soft.alpha_, DEFAULT_ZCUT_SOFTMAX_ALPHA_BALANCED);
+  EXPECT_TRUE(soft.keepAtLeastOne_);
+  config.autoCut_ = CoverageMode::Precise;
+  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).alpha_,
+                  DEFAULT_ZCUT_SOFTMAX_ALPHA_PRECISE);
+  config.autoCut_ = CoverageMode::Broad;
+  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).alpha_,
+                  DEFAULT_ZCUT_SOFTMAX_ALPHA_BROAD);
+  config.autoCut_ = CoverageMode::Exact;
+  EXPECT_FALSE(resolveCslsCut(config, idx).keepAtLeastOne_);
+  config.autoCut_ = CoverageMode::Balanced;
   // The query-side `cslsNeighbors` override scales the default softmaxN.
   config.cslsNeighbors_ = 4;
   EXPECT_EQ(resolveCslsCut(config, idx).softmaxN_, 20u);
   config.cslsNeighbors_ = std::nullopt;
-  // Breadth 0 doubles alpha (precise), breadth 1 halves it (broad).
-  config.breadth_ = 0.f;
-  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).alpha_, 4.f);
-  config.breadth_ = 1.f;
-  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).alpha_, 1.f);
-  config.breadth_ = std::nullopt;
 
-  // Per-index serving defaults kick in when the query does not override...
+  // Per-index softmax serving defaults apply when the query does not override,
+  // and the query params always win over them.
   idx.setSoftmaxTemperatureDefault(0.2f);
   idx.setSoftmaxNDefault(7);
-  idx.setBreadthDefault(1.f);
   auto served = resolveCslsCut(config, idx);
   EXPECT_FLOAT_EQ(served.temperature_, 0.2f);
   EXPECT_EQ(served.softmaxN_, 7u);
-  EXPECT_FLOAT_EQ(served.alpha_, 1.f);
-  // ... and the query params always win over them.
   config.softmaxTemperature_ = 0.05f;
   config.softmaxN_ = 3;
-  config.breadth_ = 0.5f;
   auto overridden = resolveCslsCut(config, idx);
   EXPECT_FLOAT_EQ(overridden.temperature_, 0.05f);
   EXPECT_EQ(overridden.softmaxN_, 3u);
-  EXPECT_FLOAT_EQ(overridden.alpha_, 2.f);
-  config.softmaxTemperature_ = std::nullopt;
-  config.softmaxN_ = std::nullopt;
-  config.breadth_ = std::nullopt;
-
-  // The same for the knee floor.
-  config.autoCut_ = AutoCutMode::CslsKnee;
-  idx.setCslsFloorDefault(-0.5f);
-  EXPECT_EQ(resolveCslsCut(config, idx).threshold_, -0.5f);
-  config.cslsFloor_ = -0.25f;
-  EXPECT_EQ(resolveCslsCut(config, idx).threshold_, -0.25f);
 
   cleanupTmp(basename, "acres");
 }
 
 // _____________________________________________________________________________
-// The SERVICE surface of the dynamic cuts on the hand-computed fixture
-// (r(q) = 0.7 for q = [0,1,0,0]; csls: d 0.6, c 0.02, b -0.38, e -0.7,
-// a -1.4):
-//  * `vec:autoCut "csls"` (default floor 0): survivors {d, c}; with only one
-//    gap the knee cannot be significant, so the fallback keeps both --
-//    identical to `vec:cslsThreshold 0` -- and `vec:bindCsls` binds the
-//    values.
-//  * `vec:autoCut "softmax"` (default N = 5*2 = 10, capped at the 5
-//    candidates; T 0.1, alpha 2): p(d) ~ 0.87 >= 2/5, p(c) ~ 0.12 < 2/5 --
-//    exactly {d} is kept, with the cosine distance bound.
+// The SERVICE surface of the dynamic coverage cuts on the hand-computed
+// fixture (r(q) = 0.7 for q = [0,1,0,0]; csls: d 0.6, c 0.02, b -0.38, e -0.7,
+// a -1.4; d is the clear standout).
 TEST(VectorCsls, autoCutServiceForms) {
   auto* qec = qecWithCslsIndexes();
   auto getId = makeGetId(qec->getIndex());
+  // Back-compat `vec:autoCut "csls"` = the CSLS-signal z-cut (balanced): the
+  // standout d is kept, its top row bound with the CSLS value; `vec:bindCsls`
+  // works.
   {
     QueryExecutionTree qet = planQuery(
         qec, std::string{PREFIX} +
@@ -1826,12 +1832,12 @@ TEST(VectorCsls, autoCutServiceForms) {
     size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
     size_t cslsCol = qet.getVariableColumn(Variable{"?csls"});
     const IdTable& table = result->idTable();
-    ASSERT_EQ(table.numRows(), 2u);
+    ASSERT_GE(table.numRows(), 1u);
     EXPECT_EQ(table(0, nnCol), getId("<d>"));
-    EXPECT_EQ(table(1, nnCol), getId("<c>"));
     EXPECT_NEAR(table(0, cslsCol).getDouble(), 0.6, 1e-5);
-    EXPECT_NEAR(table(1, cslsCol).getDouble(), 0.02, 1e-5);
   }
+  // Back-compat `vec:autoCut "softmax"` = the softmax signal (balanced): keeps
+  // the standout {d}.
   {
     QueryExecutionTree qet = planQuery(
         qec, std::string{PREFIX} +
@@ -1846,20 +1852,36 @@ TEST(VectorCsls, autoCutServiceForms) {
     EXPECT_EQ(table(0, nnCol), getId("<d>"));
     EXPECT_NEAR(table(0, dCol).getDouble(), 0.0, 1e-6);
   }
-  // FORM P: the softmax cut over the BOUND subset {b, c} (N = 2, bar = 1.0):
-  // even the better candidate c has p < 1, so nothing survives -- the
-  // no-match rejection also works on a pre-filtered set.
+  // The default cosine signal (no `vec:cutSignal`) needs no csls sidecar: it
+  // runs on a plain cosine index and keeps the standout d.
+  {
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} +
+                 "SELECT * WHERE { SERVICE vec: { _:c vec:index \"embplain\" ; "
+                 "vec:queryVector \"0,1,0,0\" ; vec:result ?nn ; "
+                 "vec:autoCut \"precise\" . } }");
+    auto result = qet.getResult();
+    size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
+    const IdTable& table = result->idTable();
+    ASSERT_GE(table.numRows(), 1u);
+    EXPECT_EQ(table(0, nnCol), getId("<d>"));
+  }
+  // FORM P `exact`: the softmax cut over the BOUND subset {b, c} keeps nothing
+  // (no standout), and `exact` reports that as the empty result (the
+  // non-exact modes would keep the single best instead).
   {
     QueryExecutionTree qet =
         planQuery(qec, std::string{PREFIX} +
                            "SELECT * WHERE { ?x <is-a> <SubItem> . "
                            "SERVICE vec: { _:c vec:index \"embc\" ; "
                            "vec:queryVector \"0,1,0,0\" ; vec:candidates ?x ; "
-                           "vec:result ?x ; vec:autoCut \"softmax\" . } }");
+                           "vec:result ?x ; vec:cutSignal \"softmax\" ; "
+                           "vec:autoCut \"exact\" . } }");
     auto result = qet.getResult();
     EXPECT_EQ(result->idTable().numRows(), 0u);
   }
-  // The runtime csls-availability check names `vec:autoCut`.
+  // The runtime csls-availability check fires for the `csls` signal on a
+  // non-csls index.
   {
     QueryExecutionTree qet =
         planQuery(qec, std::string{PREFIX} +
@@ -1886,95 +1908,361 @@ TEST(VectorCsls, autoCutParseErrors) {
                       "vec:queryVector \"0,1,0,0\" ; vec:cslsThreshold 0.0 ; "
                       "vec:autoCut \"csls\" .")),
       HasSubstr("mutually exclusive"));
-  // Only "csls" and "softmax" are valid autoCut values.
+  // Only the coverage words (+ back-compat "csls"/"softmax") are valid autoCut
+  // values.
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
                            "vec:queryVector \"0,1,0,0\" ; "
                            "vec:autoCut \"knee\" .")),
-      HasSubstr("\"csls\""));
+      HasSubstr("\"precise\""));
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
                            "vec:queryVector \"0,1,0,0\" ; vec:autoCut 1 .")),
       HasSubstr("string literal"));
-  // autoCut requires a query point (FORM E has none).
+  // Only the three signals are valid cutSignal values.
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec, query("_:c vec:index \"embc\" ; vec:candidates ?c ; "
-                           "vec:result ?x ; vec:autoCut \"csls\" .")),
-      HasSubstr("requires a query point"));
-  // Each knob is only valid with its mode.
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:autoCut "
+                           "\"balanced\" ; vec:cutSignal \"knee\" .")),
+      HasSubstr("\"cosine\""));
+  // cutSignal requires autoCut.
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
                            "vec:queryVector \"0,1,0,0\" ; "
-                           "vec:autoCut \"softmax\" ; vec:cslsFloor 0.1 .")),
-      HasSubstr("requires `<autoCut> \"csls\"`"));
+                           "vec:cutSignal \"cosine\" .")),
+      HasSubstr("requires `<autoCut>`"));
+  // A back-compat `vec:autoCut "softmax"` conflicting with an explicit
+  // `vec:cutSignal` is rejected.
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
-                      "vec:softmaxTemperature 0.2 .")),
-      HasSubstr("requires `<autoCut> \"softmax\"`"));
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:autoCut "
+                           "\"softmax\" ; vec:cutSignal \"cosine\" .")),
+      HasSubstr("Conflicting"));
+  // autoCut requires a query point (FORM E has none).
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:candidates ?c ; "
+                           "vec:result ?x ; vec:autoCut \"balanced\" .")),
+      HasSubstr("requires a query point"));
+  // The softmax knobs require the softmax signal.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:autoCut "
+                           "\"balanced\" ; vec:softmaxTemperature 0.2 .")),
+      HasSubstr("requires `<cutSignal> \"softmax\"`"));
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
                            "vec:queryVector \"0,1,0,0\" ; vec:softmaxN 5 .")),
-      HasSubstr("requires `<autoCut> \"softmax\"`"));
+      HasSubstr("requires `<cutSignal> \"softmax\"`"));
+  // bindCsls: rejected with the cosine/softmax signals (no CSLS value).
   AD_EXPECT_THROW_WITH_MESSAGE(
       planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                           "vec:queryVector \"0,1,0,0\" ; vec:breadth 0.7 .")),
-      HasSubstr("requires `<autoCut>`"));
-  // bindCsls: fine with the knee (see `autoCutServiceForms`), rejected with
-  // the softmax mode (which defines no CSLS value).
-  AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"softmax\" ; "
-                      "vec:bindCsls ?c .")),
+                           "vec:queryVector \"0,1,0,0\" ; vec:autoCut "
+                           "\"balanced\" ; vec:bindCsls ?c .")),
       HasSubstr("requires `<cslsThreshold>` or"));
   // Value validation of the knobs.
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"softmax\" ; "
-                      "vec:softmaxTemperature 0.0 .")),
+      planQuery(
+          qec,
+          query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                "vec:queryVector \"0,1,0,0\" ; vec:cutSignal \"softmax\" ; "
+                "vec:autoCut \"balanced\" ; vec:softmaxTemperature 0.0 .")),
       HasSubstr("positive finite"));
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"softmax\" ; "
-                      "vec:softmaxN 0 .")),
+      planQuery(
+          qec,
+          query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                "vec:queryVector \"0,1,0,0\" ; vec:cutSignal \"softmax\" ; "
+                "vec:autoCut \"balanced\" ; vec:softmaxN 0 .")),
       HasSubstr("positive integer"));
-  AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
-                      "vec:breadth 1.5 .")),
-      HasSubstr("between 0"));
-  AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
-                      "vec:breadth \"wide\" .")),
-      HasSubstr("\"precise\""));
   // The existing csls-cut incompatibilities apply to autoCut too.
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
-                      "vec:rerankK 100 .")),
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:autoCut "
+                           "\"balanced\" ; vec:rerankK 100 .")),
       HasSubstr("rerankK"));
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
-                      "vec:algorithm vec:hnsw .")),
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:autoCut "
+                           "\"balanced\" ; vec:algorithm vec:hnsw .")),
       HasSubstr("hnsw"));
   AD_EXPECT_THROW_WITH_MESSAGE(
-      planQuery(qec,
-                query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                      "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
-                      "vec:bindCoarseScore ?dc .")),
+      planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
+                           "vec:queryVector \"0,1,0,0\" ; vec:autoCut "
+                           "\"balanced\" ; vec:bindCoarseScore ?dc .")),
       HasSubstr("bindCoarseScore"));
-  // The breadth presets parse (a smoke check that the query is accepted).
+  // The coverage presets + cutSignal parse (a smoke check).
   planQuery(qec, query("_:c vec:index \"embc\" ; vec:result ?x ; "
-                       "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"csls\" ; "
-                       "vec:breadth \"broad\" ."));
+                       "vec:queryVector \"0,1,0,0\" ; vec:autoCut \"broad\" ; "
+                       "vec:cutSignal \"csls\" ."));
+}
+
+// _____________________________________________________________________________
+// The noise-floor Z-CUT (`vec:cutSignal "cosine"/"csls"`). `CslsReranked` is a
+// public struct, so these hand-build a reranked set to test the cut math
+// directly (independent of any index scan), then apply it through the public
+// `VectorIndex::applyCslsCut`.
+namespace {
+using CoverageMode = VectorSearchConfiguration::CoverageMode;
+
+qlever::vector::CslsReranked makeReranked(const std::vector<float>& cosSims,
+                                          const std::vector<uint64_t>& ids) {
+  qlever::vector::CslsReranked r;
+  r.scored_ = cosSims.size();
+  r.plateauFound_ = true;
+  for (size_t j = 0; j < cosSims.size(); ++j) {
+    r.entityBits_.push_back(mkId(ids[j]).getBits());
+    r.storeRows_.push_back(0);  // unused by the cosine signal
+    r.fineDist_.push_back(1.f - cosSims[j]);
+  }
+  return r;
+}
+
+qlever::vector::CslsCut cosineZCut(CoverageMode mode) {
+  qlever::vector::CslsCut cut;
+  cut.mode_ = qlever::vector::CslsCut::Mode::ZCut;
+  cut.signal_ = qlever::vector::CslsCut::Signal::Cosine;
+  switch (mode) {
+    case CoverageMode::Precise:
+      cut.z_ = DEFAULT_ZCUT_Z_PRECISE;
+      cut.keepAtLeastOne_ = true;
+      break;
+    case CoverageMode::Broad:
+      cut.z_ = DEFAULT_ZCUT_Z_BROAD;
+      cut.keepAtLeastOne_ = true;
+      break;
+    case CoverageMode::Exact:
+      cut.z_ = DEFAULT_ZCUT_Z_PRECISE;
+      cut.keepAtLeastOne_ = false;
+      break;
+    case CoverageMode::Balanced:
+    default:
+      cut.z_ = DEFAULT_ZCUT_Z_BALANCED;
+      cut.keepAtLeastOne_ = true;
+      break;
+  }
+  return cut;
+}
+
+std::set<uint64_t> keptIds(
+    const std::vector<qlever::vector::CslsScoredEntity>& hits) {
+  std::set<uint64_t> s;
+  for (const auto& h : hits) s.insert(h.entity_.getBits());
+  return s;
+}
+}  // namespace
+
+// A clear standout is kept by every non-degenerate mode, and -- the cross-modal
+// fix -- SCALING every cosine by a constant leaves the cut unchanged (z-scores
+// are scale-invariant).
+TEST(VectorCsls, zCutStandoutAndScaleInvariance) {
+  std::string base = buildAngleFixtureIndex("zstand", {0.f, 30.f, 60.f, 90.f},
+                                            /*cslsNeighbors=*/3,
+                                            /*csls=*/false);
+  VectorIndex idx;
+  idx.open(base, "zstand");
+  const std::vector<uint64_t> ids{10, 11, 12, 13, 14};
+  // One standout at 0.9, a flat background near 0.45.
+  auto r = makeReranked({0.9f, 0.5f, 0.48f, 0.46f, 0.44f}, ids);
+  for (CoverageMode m : {CoverageMode::Precise, CoverageMode::Balanced,
+                         CoverageMode::Broad, CoverageMode::Exact}) {
+    auto hits = idx.applyCslsCut(r, cosineZCut(m));
+    ASSERT_GE(hits.size(), 1u);
+    EXPECT_EQ(hits[0].entity_, mkId(10));  // the standout is always the top
+  }
+  // Scale ALL cosines by 0.1: the same entities survive (proving the
+  // cross-modal scale invariance).
+  auto rScaled = makeReranked({0.09f, 0.05f, 0.048f, 0.046f, 0.044f}, ids);
+  for (CoverageMode m :
+       {CoverageMode::Precise, CoverageMode::Balanced, CoverageMode::Broad}) {
+    EXPECT_EQ(keptIds(idx.applyCslsCut(r, cosineZCut(m))),
+              keptIds(idx.applyCslsCut(rScaled, cosineZCut(m))))
+        << "scale invariance, mode " << static_cast<int>(m);
+  }
+  cleanupTmp(base, "zstand");
+}
+
+// A graded tail: precise's keep set is a subset of balanced's, which is a
+// subset of broad's (a wider net keeps strictly more).
+TEST(VectorCsls, zCutGradedTailMonotone) {
+  std::string base = buildAngleFixtureIndex("zgrade", {0.f, 45.f, 90.f},
+                                            /*cslsNeighbors=*/3,
+                                            /*csls=*/false);
+  VectorIndex idx;
+  idx.open(base, "zgrade");
+  // A graded head above a flat background (~0.30, spread ~0.02).
+  std::vector<float> cos{0.62f, 0.52f, 0.42f, 0.34f, 0.32f,
+                         0.30f, 0.28f, 0.26f, 0.32f, 0.30f};
+  std::vector<uint64_t> ids;
+  for (uint64_t i = 0; i < cos.size(); ++i) ids.push_back(20 + i);
+  auto r = makeReranked(cos, ids);
+  auto precise =
+      keptIds(idx.applyCslsCut(r, cosineZCut(CoverageMode::Precise)));
+  auto balanced =
+      keptIds(idx.applyCslsCut(r, cosineZCut(CoverageMode::Balanced)));
+  auto broad = keptIds(idx.applyCslsCut(r, cosineZCut(CoverageMode::Broad)));
+  EXPECT_LE(precise.size(), balanced.size());
+  EXPECT_LE(balanced.size(), broad.size());
+  EXPECT_TRUE(std::includes(balanced.begin(), balanced.end(), precise.begin(),
+                            precise.end()));
+  EXPECT_TRUE(std::includes(broad.begin(), broad.end(), balanced.begin(),
+                            balanced.end()));
+  cleanupTmp(base, "zgrade");
+}
+
+// A flat / no-standout field: `exact` returns NOTHING (the no-match answer);
+// every other mode returns exactly the single best.
+TEST(VectorCsls, zCutFlatFieldNoMatch) {
+  std::string base = buildAngleFixtureIndex("zflat", {0.f, 45.f, 90.f},
+                                            /*cslsNeighbors=*/3,
+                                            /*csls=*/false);
+  VectorIndex idx;
+  idx.open(base, "zflat");
+  // A flat field: the reranked window has no distinguishable structure (the
+  // no-match shape -- the coarse layer cannot separate a background), so the
+  // estimated spread collapses and nothing clears the bar.
+  auto r = makeReranked({0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f},
+                        {30, 31, 32, 33, 34, 35});
+  EXPECT_EQ(idx.applyCslsCut(r, cosineZCut(CoverageMode::Exact)).size(), 0u);
+  for (CoverageMode m :
+       {CoverageMode::Precise, CoverageMode::Balanced, CoverageMode::Broad}) {
+    auto hits = idx.applyCslsCut(r, cosineZCut(m));
+    ASSERT_EQ(hits.size(), 1u);
+    EXPECT_EQ(hits[0].entity_, mkId(30));  // the single best (ties by id)
+  }
+  cleanupTmp(base, "zflat");
+}
+
+// Adaptive rerank: with a small initial batch (`cslsRerankFloor`) the widen
+// loop must extend the reranked set until the noise floor plateaus, and the
+// cut over that shallow-floor run must equal a full-depth reference.
+TEST(VectorCsls, zCutAdaptiveRerankPlateau) {
+  // A two-layer (binary + bf16) index with a near cluster + spread background
+  // (like `twoLayerCoarseRerankMatchesFullFineSweep`, smaller).
+  constexpr size_t N = 400;
+  constexpr size_t NEAR = 20;
+  constexpr size_t D = 128;
+  std::mt19937 rng{20260710};
+  std::normal_distribution<float> g{0.f, 1.f};
+  auto randomUnit = [&] {
+    std::vector<float> v(D);
+    float norm = 0;
+    for (auto& x : v) {
+      x = g(rng);
+      norm += x * x;
+    }
+    norm = std::sqrt(norm);
+    for (auto& x : v) x /= norm;
+    return v;
+  };
+  const std::vector<float> center = randomUnit();
+  auto nearCenter = [&](float deg) {
+    std::vector<float> w = randomUnit();
+    float dot = 0;
+    for (size_t j = 0; j < D; ++j) dot += w[j] * center[j];
+    float norm = 0;
+    for (size_t j = 0; j < D; ++j) {
+      w[j] -= dot * center[j];
+      norm += w[j] * w[j];
+    }
+    norm = std::sqrt(norm);
+    const float a = deg * std::numbers::pi_v<float> / 180.f;
+    std::vector<float> v(D);
+    for (size_t j = 0; j < D; ++j)
+      v[j] = std::cos(a) * center[j] + std::sin(a) * w[j] / norm;
+    return v;
+  };
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = "zadapt";
+  cfg.dimensions_ = D;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.buildHnsw_ = false;
+  cfg.csls_ = false;
+  cfg.scalar_ = VectorScalar::Binary;
+  cfg.rerankScalar_ = VectorScalar::Bf16;
+  VectorIndexBuilder builder{basename, cfg};
+  for (size_t i = 0; i < N; ++i) {
+    std::vector<float> v = i < NEAR ? nearCenter(8.f) : randomUnit();
+    builder.add(mkId(2000 + i), "<http://ex/z" + std::to_string(i) + ">", v);
+  }
+  builder.build();
+  VectorIndex idx;
+  idx.open(basename, "zadapt");
+
+  const float ff = DEFAULT_ZCUT_FLOOR_FRACTION;
+  const float eps = DEFAULT_ZCUT_PLATEAU_EPS;
+  // Shallow initial batch (4): the plateau must widen well past it (the near
+  // cluster of 20 lies beyond the first batch), and it must find it.
+  idx.setCslsRerankFloor(4);
+  auto shallow = idx.computeCslsReranked(center, 10, ff, eps, /*rerankCap=*/0);
+  EXPECT_GT(shallow.rerankDepth(), 4u);
+  EXPECT_TRUE(shallow.plateauFound_);
+  // Full-depth reference: rerank everything.
+  idx.setCslsRerankFloor(N);
+  auto full = idx.computeCslsReranked(center, 10, ff, eps, /*rerankCap=*/0);
+  ASSERT_EQ(full.rerankDepth(), N);
+  // Whether the floor was found by widening from a tiny batch or by reranking
+  // the whole set, the cosine z-cut recovers the near cluster (a clear
+  // standout above the random background) and nothing else.
+  std::set<uint64_t> nearBits;
+  for (uint64_t i = 0; i < NEAR; ++i) nearBits.insert(mkId(2000 + i).getBits());
+  auto nearRecovered = [&](const std::set<uint64_t>& s) {
+    size_t hit = 0;
+    for (uint64_t b : nearBits) hit += s.count(b);
+    return hit;
+  };
+  for (CoverageMode m : {CoverageMode::Balanced, CoverageMode::Broad}) {
+    auto a = keptIds(idx.applyCslsCut(shallow, cosineZCut(m)));
+    auto b = keptIds(idx.applyCslsCut(full, cosineZCut(m)));
+    // The adaptive rerank recovered the near cluster (the real matches),
+    // whether from the tiny widening batch or the full rerank.
+    EXPECT_GE(nearRecovered(a), NEAR - 2) << "mode " << static_cast<int>(m);
+    EXPECT_GE(nearRecovered(b), NEAR - 2);
+  }
+  cleanupTmp(basename, "zadapt");
+}
+
+// _____________________________________________________________________________
+// The SCORE CACHE: switching the coverage mode / signal on a repeat query
+// re-applies the cut over a CACHED reranked stage (no rescan). Distinct
+// coverage modes over the SAME query point share ONE reranked-cache entry.
+TEST(VectorCsls, autoCutModeSwitchHitsScoreCache) {
+  auto* qec = qecWithCslsIndexes();
+  auto getId = makeGetId(qec->getIndex());
+  qlever::vector::clearCslsRerankedCacheForTesting();
+  auto run = [&](std::string_view autoCut, std::string_view signal) {
+    std::string sig = signal.empty()
+                          ? std::string{}
+                          : absl::StrCat("vec:cutSignal \"", signal, "\" ; ");
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} +
+                 "SELECT * WHERE { SERVICE vec: { _:c vec:index \"embc\" ; "
+                 "vec:queryVector \"0,1,0,0\" ; vec:result ?nn ; " +
+                 sig + "vec:autoCut \"" + std::string{autoCut} + "\" . } }");
+    auto result = qet.getResult();
+    std::vector<Id> ids;
+    size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
+    for (size_t r = 0; r < result->idTable().numRows(); ++r)
+      ids.push_back(result->idTable()(r, nnCol));
+    return ids;
+  };
+  // First mode: a cache MISS populates one reranked entry.
+  auto precise = run("precise", "cosine");
+  EXPECT_EQ(qlever::vector::cslsRerankedCacheSizeForTesting(), 1u);
+  // A different coverage mode over the same point: HIT (still one entry), and
+  // the broader net keeps at least as many as the precise one.
+  auto broad = run("broad", "cosine");
+  EXPECT_EQ(qlever::vector::cslsRerankedCacheSizeForTesting(), 1u);
+  // A different SIGNAL over the same point: also mode-independent -> HIT.
+  auto csls = run("balanced", "csls");
+  EXPECT_EQ(qlever::vector::cslsRerankedCacheSizeForTesting(), 1u);
+  // The re-applied cuts are real results (the standout d on top, broad >=
+  // precise).
+  ASSERT_GE(precise.size(), 1u);
+  ASSERT_GE(broad.size(), 1u);
+  ASSERT_GE(csls.size(), 1u);
+  EXPECT_EQ(precise[0], getId("<d>"));
+  EXPECT_EQ(broad[0], getId("<d>"));
+  EXPECT_EQ(csls[0], getId("<d>"));
+  EXPECT_GE(broad.size(), precise.size());
 }

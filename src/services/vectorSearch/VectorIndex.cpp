@@ -2330,49 +2330,234 @@ std::vector<CslsScoredEntity> applyCslsSoftmaxCut(
               << std::endl;
   return out;
 }
+
+// A robust estimate of the background NOISE FLOOR of a reranked window's
+// signal scores: the median (mu) and MAD-derived spread (sigma) of its LOW
+// `floorFraction` -- the coarse-worst reranked candidates, which are
+// increasingly pure background as the rerank widens. `sig` is REORDERED
+// in place (partial selections, never a full sort). O(window).
+struct NoiseFloor {
+  float mu_ = 0.f;
+  float sigma_ = 0.f;
+};
+inline NoiseFloor estimateNoiseFloor(std::vector<float>& sig,
+                                     float floorFraction) {
+  const size_t m = sig.size();
+  if (m == 0) {
+    return {};
+  }
+  // The background is the `bg` SMALLEST signal values (>= 1, <= m).
+  size_t bg = static_cast<size_t>(
+      std::floor(static_cast<double>(floorFraction) * static_cast<double>(m)));
+  bg = std::clamp<size_t>(bg, 1, m);
+  // Partition so [0, bg) holds the bg smallest, then take their median.
+  if (bg < m) {
+    std::nth_element(sig.begin(), sig.begin() + static_cast<std::ptrdiff_t>(bg),
+                     sig.end());
+  }
+  auto median = [](float* first, size_t count) -> float {
+    const size_t mid = count / 2;
+    std::nth_element(first, first + static_cast<std::ptrdiff_t>(mid),
+                     first + static_cast<std::ptrdiff_t>(count));
+    return first[mid];
+  };
+  NoiseFloor f;
+  f.mu_ = median(sig.data(), bg);
+  // MAD = median absolute deviation from mu; sigma = 1.4826 * MAD (the
+  // normal-consistent std estimate). Reuse the bg prefix as scratch.
+  for (size_t i = 0; i < bg; ++i) {
+    sig[i] = std::abs(sig[i] - f.mu_);
+  }
+  f.sigma_ = ZCUT_MAD_TO_SIGMA * median(sig.data(), bg);
+  return f;
+}
+
+// Apply the noise-floor Z-CUT to a reranked set: z-score each candidate's
+// `signal` against the background floor and keep, from the top, everyone at
+// least `cut.z_` spreads above it. Scale-INVARIANT (a common scale factor
+// cancels in z). `entityBits`/`fineDist` are the reranked candidates (any
+// order); `signal[j]` is candidate j's signal (cosine similarity or CSLS).
+// `csls[j]` is its CSLS value for `vec:bindCsls` (NaN for the cosine signal).
+// Non-`exact` modes keep at least the single best; `exact` may keep zero.
+inline std::vector<CslsScoredEntity> applyZCut(
+    const std::vector<uint64_t>& entityBits, const std::vector<float>& fineDist,
+    const std::vector<float>& signal, const std::vector<float>& csls,
+    const CslsCut& cut, std::optional<float> maxDistance,
+    std::string_view indexName) {
+  const size_t m = signal.size();
+  std::vector<CslsScoredEntity> out;
+  if (m == 0) {
+    return out;
+  }
+  // Candidates by signal DESCENDING (ties by entity id) -- the keep set is a
+  // predictable prefix of this order.
+  std::vector<uint32_t> order(m);
+  std::iota(order.begin(), order.end(), 0u);
+  auto bySignalDesc = [&](uint32_t a, uint32_t b) {
+    return signal[a] != signal[b] ? signal[a] > signal[b]
+                                  : entityBits[a] < entityBits[b];
+  };
+  std::sort(order.begin(), order.end(), bySignalDesc);
+  // The noise floor from the low tail (a copy, since the estimator reorders).
+  std::vector<float> scratch(signal);
+  const NoiseFloor floor = estimateNoiseFloor(scratch, cut.floorFraction_);
+  // A degenerate (zero-spread) floor cannot z-score: keep only the top-1 for a
+  // non-exact mode, nothing for exact.
+  const float bar = cut.z_;
+  size_t keep = 0;
+  if (floor.sigma_ > 0.f) {
+    for (; keep < m; ++keep) {
+      const float z = (signal[order[keep]] - floor.mu_) / floor.sigma_;
+      if (z < bar) {
+        break;  // sorted descending, so the first below-bar ends the keep set
+      }
+    }
+  }
+  if (keep == 0 && cut.keepAtLeastOne_) {
+    keep = 1;  // precise/balanced/broad always answer with the single best
+  }
+  out.reserve(keep);
+  for (size_t r = 0; r < keep; ++r) {
+    const uint32_t j = order[r];
+    const float d = fineDist[j];
+    if (maxDistance.has_value() && d > maxDistance.value()) {
+      continue;
+    }
+    out.push_back(CslsScoredEntity{Id::fromBits(entityBits[j]), d, csls[j]});
+  }
+  AD_LOG_INFO << "Vector index \"" << indexName << "\": csls zcut ("
+              << (cut.signal_ == CslsCut::Signal::Csls ? "csls" : "cosine")
+              << " signal): floor mu " << floor.mu_ << " sigma " << floor.sigma_
+              << ", Z " << bar << " -> " << keep << " above bar, kept "
+              << out.size() << std::endl;
+  return out;
+}
+
+// Apply a fully-resolved `cut` to an already-`rerankCsls`'d set, dispatching on
+// its mode. The Threshold/Knee/Softmax branches are byte-for-byte the former
+// in-line cut (same inputs -> same output); ZCut is the new noise-floor cut.
+// Survivors are returned ascending by cosine DISTANCE (ties by entity id).
+template <typename ImplT>
+std::vector<CslsScoredEntity> applyCslsCutImpl(
+    const ImplT& impl, const CslsReranked& r, const CslsCut& cut,
+    std::optional<float> maxDistance) {
+  const std::string& name = impl.meta_.config_.name_;
+  const size_t m = r.rerankDepth();
+  auto byDistanceThenId = [](const CslsScoredEntity& a,
+                             const CslsScoredEntity& b) {
+    return a.distance_ != b.distance_
+               ? a.distance_ < b.distance_
+               : a.entity_.getBits() < b.entity_.getBits();
+  };
+  std::vector<CslsScoredEntity> out;
+  if (cut.mode_ == CslsCut::Mode::Softmax) {
+    // The softmax SELECTION is byte-for-byte the standalone cut; a non-`exact`
+    // coverage mode then guarantees at least the single best result (the top
+    // cosine), where the bare softmax would keep nothing.
+    out = applyCslsSoftmaxCut(
+        m, [&](size_t j) { return r.fineDist_[j]; },
+        [&](size_t j) { return r.entityBits_[j]; }, cut, maxDistance, name);
+    if (out.empty() && cut.keepAtLeastOne_ && m > 0) {
+      size_t best = 0;
+      for (size_t j = 1; j < m; ++j) {
+        if (r.fineDist_[j] < r.fineDist_[best] ||
+            (r.fineDist_[j] == r.fineDist_[best] &&
+             r.entityBits_[j] < r.entityBits_[best])) {
+          best = j;
+        }
+      }
+      const float d = r.fineDist_[best];
+      if (!maxDistance.has_value() || d <= maxDistance.value()) {
+        out.push_back(
+            CslsScoredEntity{Id::fromBits(r.entityBits_[best]), d,
+                             std::numeric_limits<float>::quiet_NaN()});
+      }
+    }
+  } else if (cut.mode_ == CslsCut::Mode::ZCut) {
+    const bool csSignal = cut.signal_ == CslsCut::Signal::Csls;
+    std::vector<float> signal(m);
+    std::vector<float> cslsVals(m);
+    for (size_t j = 0; j < m; ++j) {
+      const float cosSim = 1.f - r.fineDist_[j];
+      if (csSignal) {
+        const float c = static_cast<float>(
+            2.0 * static_cast<double>(cosSim) - static_cast<double>(r.rq_) -
+            static_cast<double>(impl.cslsR_[r.storeRows_[j]]));
+        signal[j] = c;
+        cslsVals[j] = c;
+      } else {
+        signal[j] = cosSim;
+        cslsVals[j] = std::numeric_limits<float>::quiet_NaN();
+      }
+    }
+    out = applyZCut(r.entityBits_, r.fineDist_, signal, cslsVals, cut,
+                    maxDistance, name);
+  } else {
+    // Threshold / Knee: keep `csls >= threshold`, then (Knee) cut at a
+    // significant gap.
+    for (size_t j = 0; j < m; ++j) {
+      const float d = r.fineDist_[j];
+      if (maxDistance.has_value() && d > maxDistance.value()) {
+        continue;
+      }
+      const float csls = static_cast<float>(
+          2.0 * (1.0 - static_cast<double>(d)) - static_cast<double>(r.rq_) -
+          static_cast<double>(impl.cslsR_[r.storeRows_[j]]));
+      if (csls >= cut.threshold_) {
+        out.push_back(
+            CslsScoredEntity{Id::fromBits(r.entityBits_[j]), d, csls});
+      }
+    }
+    if (cut.mode_ == CslsCut::Mode::Knee) {
+      out = applyCslsKneeCut(std::move(out), cut, m, name);
+    }
+  }
+  ql::ranges::sort(out, byDistanceThenId);
+  return out;
+}
 }  // namespace
 
 // ____________________________________________________________________________
-// The core of the CSLS-filtered search (see the header comment of
-// `searchCsls`): cosine distances of the scoring set, then the query-adaptive
-// cut `2 * cos_sim - r(q) - r(d) >= threshold`, with `cos_sim = 1 - distance`
-// (the usearch/NumKong angular convention -- the cosine metric is guaranteed
-// by the caller). The DYNAMIC `cut` modes replace the fixed tau with a
-// decision over the reranked set: Knee runs the tau machinery with the FLOOR
-// as the threshold and then cuts the survivors at a significant CSLS gap
-// (`applyCslsKneeCut`); Softmax ignores tau/r(q)/r(d) entirely and keeps the
-// softmax standouts of the top-`softmaxN` fine cosines
-// (`applyCslsSoftmaxCut`) -- bounded by ONE rerank batch (>= `softmaxN`), so
-// it never widens toward a full fine scan.
+// STAGE (a) of the CSLS-filtered search: score the candidate set and rerank it
+// to the depth the `cut`'s widen policy asks for, returning the MODE-
+// INDEPENDENT `CslsReranked` (entity + store row + fine cosine distance in
+// coarse-rank order, plus r(q)). A cut of ANY mode is then applied by a
+// separate `apply*` step (`searchCslsBytes` below wraps the two), so the
+// engine can cache this stage and re-apply the cut for free on a mode switch.
 //
-// SINGLE-LAYER index: one FULL sweep on the (only) fine layer -- CSLS needs
-// every candidate's cosine and there is no cheaper matrix to consult.
-// TWO-LAYER index: the full sweep runs on the cheap COARSE scan matrix
-// instead (`coarseQueryBytes` is the query encoded into ITS scalar; unused on
-// a single-layer index), and only the coarse-best `impl.cslsRerankFloor_`
-// candidates get a FINE distance -- widened by another batch while the cut
-// still reaches the coarse boundary, so every candidate the cut could keep
-// is, by construction, reranked before the widening stops. Survivor scores
-// and csls values come from the fine layer either way; the only approximation
-// of the two-layer path is r(q), whose top-`neighbors` neighbourhood is
-// collected from the RERANKED (coarse-preselected) set instead of all matched
-// candidates -- the coarse layer ranks the very top well, and the floor is
-// orders of magnitude above `neighbors`.
+// The rerank DEPTH follows `cut.mode_`:
+//  * Threshold/Knee: widen while the cut still reaches the coarse boundary
+//    (a candidate the fixed/floor cut could keep may lie past it).
+//  * Softmax: one batch bounds it (>= `softmaxN`); the coarse layer ranks the
+//    very top well.
+//  * ZCut: widen until the noise FLOOR PLATEAUS -- the median of the low
+//    `cut.floorFraction_` of the reranked cosines stabilizes to within
+//    `cut.plateauEps_` spreads between batches (the window flattened into
+//    background) -- or `cut.rerankCap_` candidates are reranked (then
+//    `plateauFound_ = false`, logged: no silent truncation).
+//
+// SINGLE-LAYER index: one FULL sweep on the (only) fine layer -- every
+// candidate is reranked, so the depth policy is moot. TWO-LAYER index: the
+// full sweep runs on the cheap COARSE scan matrix (`coarseQueryBytes` = the
+// query in ITS scalar; unused single-layer) and only the coarse-best
+// candidates get a FINE distance, widened as above. r(q) (the only two-layer
+// approximation) is the mean cosine similarity of the query to its
+// top-`neighbors` nearest RERANKED candidates.
 //
 // `selfRow`, when set, is the query entity's own row, excluded from the r(q)
 // neighbourhood by identity; for a raw query vector the single nearest
 // candidate is excluded iff its distance is < `CSLS_SELF_EPSILON`.
 template <typename ImplT, typename LayerT>
-std::vector<CslsScoredEntity> searchCslsBytes(
-    ImplT& impl, LayerT& layer, const char* queryBytes,
-    const char* coarseQueryBytes, std::optional<size_t> selfRow,
-    const CslsCut& cut, size_t neighbors,
-    std::optional<ql::span<const Id>> candidates,
-    std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored) {
+CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
+                        const char* coarseQueryBytes,
+                        std::optional<size_t> selfRow, const CslsCut& cut,
+                        size_t neighbors,
+                        std::optional<ql::span<const Id>> candidates,
+                        const CheckInterruptCallback& checkInterrupt) {
   // For Threshold this is the tau, for Knee the floor (identical machinery);
   // unused by Softmax.
   const float threshold = cut.threshold_;
+  const bool hasCsls = impl.meta_.config_.csls_;
   // 1. The scoring set: a scoring index `i` in [0, n) maps to a store `row`
   //    and its entity `id`. For the common WHOLE-INDEX case with no tombstones
   //    the store is addressed DIRECTLY (row i, id = keys_[i]) and the
@@ -2425,9 +2610,6 @@ std::vector<CslsScoredEntity> searchCslsBytes(
                     });
     n = matched.size();
   }
-  if (numScored != nullptr) {
-    *numScored = n;
-  }
   if (n == 0) {
     return {};
   }
@@ -2440,19 +2622,14 @@ std::vector<CslsScoredEntity> searchCslsBytes(
   auto idAt = [&](size_t i) -> uint64_t {
     return directWhole ? impl.keys_[i] : matched[i].second;
   };
-
-  // Survivors are returned ascending by cosine DISTANCE (CSLS is the cut, the
-  // cosine distance stays the score); ties break by entity id.
-  auto byDistanceThenId = [](const CslsScoredEntity& a,
-                             const CslsScoredEntity& b) {
-    return a.distance_ != b.distance_
-               ? a.distance_ < b.distance_
-               : a.entity_.getBits() < b.entity_.getBits();
-  };
+  CslsReranked result;
+  result.scored_ = n;
+  result.hasCsls_ = hasCsls;
 
   if (!impl.rerank_.has_value()) {
     // SINGLE-LAYER: the coarse and fine layers coincide, so a coarse
     // preselection would buy nothing -- one full sweep of the only matrix.
+    // Every candidate is reranked, so the depth policy is moot.
     //
     // 2. The full fine-layer distance sweep (CSLS needs EVERY cosine, so
     //    there is no top-k shortcut). Rows come out of step 1
@@ -2464,23 +2641,8 @@ std::vector<CslsScoredEntity> searchCslsBytes(
           layer, queryBytes, n, [&](size_t i) { return rowAt(i); },
           dists.data(), checkInterrupt);
     }
-
-    if (cut.mode_ == CslsCut::Mode::Softmax) {
-      // The softmax cut needs neither r(q) nor r(d): it selects the standouts
-      // of the top-`softmaxN` fine cosines directly (already ascending by
-      // distance, so the caller-visible sort below is a no-op).
-      auto out = applyCslsSoftmaxCut(
-          n, [&](size_t i) { return dists[i]; },
-          [&](size_t i) { return idAt(i); }, cut, maxDistance,
-          impl.meta_.config_.name_);
-      ql::ranges::sort(out, byDistanceThenId);
-      return out;
-    }
-
     // 3. r(q): the mean cosine similarity of the query to its top-`neighbors`
-    //    nearest SCORED candidates, the exact self-match excluded. Computed
-    //    BEFORE any `maxDistance` filter (it describes the retrieval
-    //    geometry).
+    //    nearest SCORED candidates, the exact self-match excluded.
     size_t excluded = n;  // scoring index; `n` = none
     if (selfRow.has_value()) {
       for (size_t i = 0; i < n; ++i) {
@@ -2506,32 +2668,17 @@ std::vector<CslsScoredEntity> searchCslsBytes(
         neighborhood.offer(dists[i]);
       }
     }
-    const float rq = neighborhood.meanCosSim();
-
-    // 4. The cut: keep candidate d iff `2 * cos_sim(q, d) - r(q) - r(d) >=
-    //    threshold` -- the fixed tau, or the Knee mode's floor -- (and its
-    //    cosine distance passes `maxDistance`, if set). ALL survivors are
-    //    returned; the caller applies any top-k cap.
-    std::vector<CslsScoredEntity> out;
+    result.rq_ = neighborhood.meanCosSim();
+    // The reranked set is ALL candidates (scoring-index order).
+    result.entityBits_.resize(n);
+    result.storeRows_.resize(n);
+    result.fineDist_.assign(dists.begin(), dists.end());
     for (size_t i = 0; i < n; ++i) {
-      const float d = dists[i];
-      if (maxDistance.has_value() && d > maxDistance.value()) {
-        continue;
-      }
-      const float csls = static_cast<float>(
-          2.0 * (1.0 - static_cast<double>(d)) - static_cast<double>(rq) -
-          static_cast<double>(impl.cslsR_[rowAt(i)]));
-      if (csls >= threshold) {
-        out.push_back(CslsScoredEntity{Id::fromBits(idAt(i)), d, csls});
-      }
+      result.entityBits_[i] = idAt(i);
+      result.storeRows_[i] = rowAt(i);
     }
-    if (cut.mode_ == CslsCut::Mode::Knee) {
-      // The knee runs on the floor-survivors of the whole (single-layer)
-      // scored set -- `n` doubles as the "reranked" count of the log line.
-      out = applyCslsKneeCut(std::move(out), cut, n, impl.meta_.config_.name_);
-    }
-    ql::ranges::sort(out, byDistanceThenId);
-    return out;
+    result.plateauFound_ = true;
+    return result;
   }
 
   // TWO-LAYER: coarse scan of everything, fine rerank of a bounded chunk.
@@ -2663,6 +2810,18 @@ std::vector<CslsScoredEntity> searchCslsBytes(
         static_cast<double>(rqNow) -
         static_cast<double>(impl.cslsR_[rowAt(orderIdx(j))]));
   };
+  // ZCut widen state: the previous batch's noise-floor median (NaN before the
+  // first estimate) and the rerank cap (0 = the whole scored set).
+  const bool plateauMode = cut.mode_ == CslsCut::Mode::ZCut;
+  const size_t rerankCap =
+      cut.rerankCap_ == 0 ? n : std::min<size_t>(cut.rerankCap_, n);
+  float prevFloorMu = std::numeric_limits<float>::quiet_NaN();
+  // The highest floor median seen so far -- the level the low tail sits at
+  // while the window is still all matches. The floor must DROP from this peak
+  // (background must actually enter the window) before a "stable floor" counts
+  // as a plateau, so a tight match cluster does not stop the widening early.
+  float peakFloorMu = -std::numeric_limits<float>::infinity();
+  bool cappedOut = false;
 
   while (true) {
     const size_t batchStart = reranked;
@@ -2715,7 +2874,31 @@ std::vector<CslsScoredEntity> searchCslsBytes(
     //    batch is smaller than `softmaxN` (i.e. `cslsRerankFloor` was set
     //    below it) -- never toward a full fine scan.
     bool widen;
-    if (cut.mode_ == CslsCut::Mode::Softmax) {
+    if (plateauMode) {
+      // Widen until the estimated noise FLOOR plateaus (its median stops
+      // moving between batches, so the added batch is pure background), or the
+      // rerank cap is hit. The floor is over the reranked COSINE similarities
+      // (signal-agnostic, so ONE reranked set serves every mode/signal).
+      if (reranked >= rerankCap) {
+        cappedOut = reranked < n;  // capped short of the whole set
+        widen = false;
+      } else {
+        std::vector<float> cosWindow(reranked);
+        for (size_t j = 0; j < reranked; ++j) {
+          cosWindow[j] = 1.f - fineDists[j];
+        }
+        const NoiseFloor f = estimateNoiseFloor(cosWindow, cut.floorFraction_);
+        peakFloorMu = std::max(peakFloorMu, f.mu_);
+        // Background has entered iff the floor dropped meaningfully from its
+        // peak (an absolute cosine drop); the floor is stable iff it barely
+        // moved between the last two batches. Plateau requires BOTH.
+        const bool droppedFromPeak = peakFloorMu - f.mu_ > cut.plateauEps_;
+        const bool stable = !std::isnan(prevFloorMu) &&
+                            std::abs(f.mu_ - prevFloorMu) <= cut.plateauEps_;
+        widen = !(droppedFromPeak && stable);
+        prevFloorMu = f.mu_;
+      }
+    } else if (cut.mode_ == CslsCut::Mode::Softmax) {
       widen = reranked < std::min(cut.softmaxN_, n);
     } else if (batchStart == 0) {
       widen = cslsOf(batchEnd - 1, rq) >= threshold;
@@ -2734,46 +2917,53 @@ std::vector<CslsScoredEntity> searchCslsBytes(
     AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
                 << "\": csls rerank widened to "
                 << std::min(reranked + floorM, n) << " of " << n
-                << " candidates (cut reaches the coarse boundary)" << std::endl;
+                << (plateauMode
+                        ? " candidates (noise floor not yet plateaued)"
+                        : " candidates (cut reaches the coarse boundary)")
+                << std::endl;
+  }
+  if (cappedOut) {
+    AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
+                << "\": csls rerank hit the cap at " << reranked << " of " << n
+                << " candidates before the noise floor plateaued (not a silent "
+                   "truncation; raise cslsRerankFloor/the cap to go deeper)"
+                << std::endl;
   }
 
-  // 6. The final cut over every reranked candidate, with the final r(q) --
-  //    identical scoring to the single-layer path: the survivor score is the
-  //    fine COSINE distance, the csls value is the cut value. The Softmax
-  //    mode instead selects its standouts from the reranked prefix directly
-  //    (no r(q)/r(d), csls value NaN).
-  std::vector<CslsScoredEntity> out;
-  if (cut.mode_ == CslsCut::Mode::Softmax) {
-    out = applyCslsSoftmaxCut(
-        reranked, [&](size_t j) { return fineDists[j]; },
-        [&](size_t j) { return idAt(orderIdx(j)); }, cut, maxDistance,
-        impl.meta_.config_.name_);
-  } else {
-    for (size_t j = 0; j < reranked; ++j) {
-      const float d = fineDists[j];
-      if (maxDistance.has_value() && d > maxDistance.value()) {
-        continue;
-      }
-      const float csls = cslsOf(j, rq);
-      if (csls >= threshold) {
-        out.push_back(
-            CslsScoredEntity{Id::fromBits(idAt(orderIdx(j))), d, csls});
-      }
-    }
-    if (cut.mode_ == CslsCut::Mode::Knee) {
-      out = applyCslsKneeCut(std::move(out), cut, reranked,
-                             impl.meta_.config_.name_);
-    }
+  // Package the reranked prefix (coarse-rank order) into the mode-independent
+  // `CslsReranked`. The cut is applied separately.
+  result.rq_ = rq;
+  result.plateauFound_ = !cappedOut;
+  result.entityBits_.resize(reranked);
+  result.storeRows_.resize(reranked);
+  result.fineDist_.resize(reranked);
+  for (size_t j = 0; j < reranked; ++j) {
+    const size_t idx = orderIdx(j);
+    result.entityBits_[j] = idAt(idx);
+    result.storeRows_[j] = rowAt(idx);
+    result.fineDist_[j] = fineDists[j];
   }
-  // 8. One INFO line with all three counts (`numScored` stays the matched
-  //    count, exactly like the single-layer path).
   AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
               << "\": csls coarse+rerank: " << n << " candidates -> "
-              << reranked << " reranked -> " << out.size() << " kept"
-              << std::endl;
-  ql::ranges::sort(out, byDistanceThenId);
-  return out;
+              << reranked << " reranked" << std::endl;
+  return result;
 }
+
+namespace {
+// A cut carries the csls sidecar requirement iff it derives a CSLS value: the
+// fixed Threshold, the Knee, and the ZCut on the `csls` signal. The Softmax
+// and the ZCut on the `cosine` signal are csls-independent (a plain cosine
+// index suffices).
+bool cutNeedsCslsSidecar(const CslsCut& cut) {
+  if (cut.mode_ == CslsCut::Mode::Softmax) {
+    return false;
+  }
+  if (cut.mode_ == CslsCut::Mode::ZCut) {
+    return cut.signal_ == CslsCut::Signal::Csls;
+  }
+  return true;  // Threshold, Knee
+}
+}  // namespace
 
 // ____________________________________________________________________________
 std::vector<CslsScoredEntity> VectorIndex::searchCsls(
@@ -2781,17 +2971,11 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
-  // Non-const so the sweep can toggle the flat store's (advisory) access-
-  // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
-  // The softmax cut is csls-independent (top-N cosine standouts, no r(d)/r(q)),
-  // so it may run on a plain cosine index; every other cut needs the sidecar.
-  AD_CONTRACT_CHECK(impl.meta_.config_.csls_ ||
-                        cut.mode_ == CslsCut::Mode::Softmax,
-                    "searchCsls called on an index without csls data.");
-  // Guaranteed by the build (`csls` is rejected for non-cosine metrics).
+  AD_CONTRACT_CHECK(impl.meta_.config_.csls_ || !cutNeedsCslsSidecar(cut),
+                    "searchCsls called with a CSLS cut on an index without "
+                    "csls data.");
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
-  // Guaranteed by `resolveCslsCut` (an empty softmax is meaningless).
   AD_CONTRACT_CHECK(cut.mode_ != CslsCut::Mode::Softmax || cut.softmaxN_ >= 1,
                     "The softmax autoCut requires softmaxN >= 1.");
   auto& layer = impl.fine();
@@ -2802,17 +2986,17 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
   }
   std::vector<char> buffer;
   const char* queryBytes = layer.encodeQuery(query, buffer);
-  // The two-layer coarse sweep reads the SCAN matrix, so the query is
-  // additionally encoded into ITS scalar (exactly like `searchExactCoarse`);
-  // on a single-layer index the layers coincide and the fine bytes are reused
-  // (the coarse bytes go unused there anyway).
   std::vector<char> coarseBuffer;
   const char* coarseQueryBytes =
       impl.rerank_.has_value() ? impl.scan_.encodeQuery(query, coarseBuffer)
                                : queryBytes;
-  return searchCslsBytes(impl, layer, queryBytes, coarseQueryBytes,
-                         std::nullopt, cut, neighbors, candidates, maxDistance,
-                         checkInterrupt, numScored);
+  CslsReranked reranked =
+      rerankCsls(impl, layer, queryBytes, coarseQueryBytes, std::nullopt, cut,
+                 neighbors, candidates, checkInterrupt);
+  if (numScored != nullptr) {
+    *numScored = reranked.scored_;
+  }
+  return applyCslsCutImpl(impl, reranked, cut, maxDistance);
 }
 
 // ____________________________________________________________________________
@@ -2821,13 +3005,10 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
-  // Non-const so the sweep can toggle the flat store's (advisory) access-
-  // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
-  // See `searchCsls`: softmax is csls-independent, the rest need the sidecar.
-  AD_CONTRACT_CHECK(impl.meta_.config_.csls_ ||
-                        cut.mode_ == CslsCut::Mode::Softmax,
-                    "searchCslsByEntity called on an index without csls data.");
+  AD_CONTRACT_CHECK(impl.meta_.config_.csls_ || !cutNeedsCslsSidecar(cut),
+                    "searchCslsByEntity called with a CSLS cut on an index "
+                    "without csls data.");
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
   AD_CONTRACT_CHECK(cut.mode_ != CslsCut::Mode::Softmax || cut.softmaxN_ >= 1,
                     "The softmax autoCut requires softmaxN >= 1.");
@@ -2839,12 +3020,81 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
     }
     return {};
   }
-  // The query point per layer is the entity's STORED bytes of that layer (no
-  // f32 round trip): the fine row for the fine distances, the scan row for
-  // the coarse sweep (exactly like `searchExactCoarseByEntity`).
-  return searchCslsBytes(impl, layer, layer.rowPtr(row.value()),
-                         impl.scan_.rowPtr(row.value()), row, cut, neighbors,
-                         candidates, maxDistance, checkInterrupt, numScored);
+  CslsReranked reranked = rerankCsls(impl, layer, layer.rowPtr(row.value()),
+                                     impl.scan_.rowPtr(row.value()), row, cut,
+                                     neighbors, candidates, checkInterrupt);
+  if (numScored != nullptr) {
+    *numScored = reranked.scored_;
+  }
+  return applyCslsCutImpl(impl, reranked, cut, maxDistance);
+}
+
+// ____________________________________________________________________________
+// The MODE-INDEPENDENT plateau cut that drives `rerankCsls`'s widen policy.
+static CslsCut plateauRerankCut(float floorFraction, float plateauEps,
+                                size_t rerankCap) {
+  CslsCut cut;
+  cut.mode_ = CslsCut::Mode::ZCut;
+  cut.floorFraction_ = floorFraction;
+  cut.plateauEps_ = plateauEps;
+  cut.rerankCap_ = rerankCap;
+  return cut;
+}
+
+// ____________________________________________________________________________
+CslsReranked VectorIndex::computeCslsReranked(
+    ql::span<const float> query, size_t neighbors, float floorFraction,
+    float plateauEps, size_t rerankCap,
+    std::optional<ql::span<const Id>> candidates,
+    const CheckInterruptCallback& checkInterrupt) const {
+  auto& impl = *impl_;
+  AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
+  auto& layer = impl.fine();
+  if (query.size() != impl.dim()) {
+    AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
+             ", but vector index \"" + impl.meta_.config_.name_ +
+             "\" has dimension " + std::to_string(impl.dim()) + ".");
+  }
+  std::vector<char> buffer;
+  const char* queryBytes = layer.encodeQuery(query, buffer);
+  std::vector<char> coarseBuffer;
+  const char* coarseQueryBytes =
+      impl.rerank_.has_value() ? impl.scan_.encodeQuery(query, coarseBuffer)
+                               : queryBytes;
+  return rerankCsls(impl, layer, queryBytes, coarseQueryBytes, std::nullopt,
+                    plateauRerankCut(floorFraction, plateauEps, rerankCap),
+                    neighbors, candidates, checkInterrupt);
+}
+
+// ____________________________________________________________________________
+CslsReranked VectorIndex::computeCslsRerankedByEntity(
+    Id entity, size_t neighbors, float floorFraction, float plateauEps,
+    size_t rerankCap, std::optional<ql::span<const Id>> candidates,
+    const CheckInterruptCallback& checkInterrupt) const {
+  auto& impl = *impl_;
+  AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
+  auto& layer = impl.fine();
+  auto row = impl.rowOf(entity);
+  if (!row.has_value()) {
+    return {};
+  }
+  return rerankCsls(impl, layer, layer.rowPtr(row.value()),
+                    impl.scan_.rowPtr(row.value()), row,
+                    plateauRerankCut(floorFraction, plateauEps, rerankCap),
+                    neighbors, candidates, checkInterrupt);
+}
+
+// ____________________________________________________________________________
+std::vector<CslsScoredEntity> VectorIndex::applyCslsCut(
+    const CslsReranked& reranked, const CslsCut& cut,
+    std::optional<float> maxDistance) const {
+  auto& impl = *impl_;
+  AD_CONTRACT_CHECK(
+      impl.meta_.config_.csls_ || !cutNeedsCslsSidecar(cut),
+      "applyCslsCut called with a CSLS cut on an index without csls data.");
+  AD_CONTRACT_CHECK(cut.mode_ != CslsCut::Mode::Softmax || cut.softmaxN_ >= 1,
+                    "The softmax autoCut requires softmaxN >= 1.");
+  return applyCslsCutImpl(impl, reranked, cut, maxDistance);
 }
 
 }  // namespace qlever::vector
