@@ -63,6 +63,11 @@ class TempFile {
     }
   }
   int fd() const { return readFile_.fd(); }
+  void seek(off_t offset) { ASSERT_TRUE(readFile_.seek(offset, SEEK_SET)); }
+  off_t tell() const { return readFile_.tell(); }
+  size_t read(void* target, size_t numBytes) {
+    return readFile_.read(target, numBytes);
+  }
 
  private:
   std::string path_;
@@ -377,9 +382,15 @@ TYPED_TEST(IoUringManagerTest, ReadPastEofThrows) {
 // offset.
 TEST(ReadFullyOrThrow, FullReadSucceeds) {
   auto [tmp, fd] = makeTempFile("AAAABBBB");
+  tmp.seek(2);
   std::vector<char> targetBuffer(4);
-  ad_utility::SyncIoPolicy::readFullyOrThrow(fd, targetBuffer.data(), 4, 4);
+  ad_utility::SyncIoPolicy policy;
+  policy.readFullyOrThrow(fd, targetBuffer.data(), 4, 4);
   EXPECT_EQ(std::string(targetBuffer.data(), 4), "BBBB");
+  char byteAtOriginalPosition = '\0';
+  ASSERT_EQ(tmp.read(&byteAtOriginalPosition, 1), 1);
+  EXPECT_EQ(byteAtOriginalPosition, 'A');
+  EXPECT_EQ(tmp.tell(), 3);
 }
 
 // An invalid file descriptor makes the underlying `pread` call fail (return
@@ -387,9 +398,10 @@ TEST(ReadFullyOrThrow, FullReadSucceeds) {
 TEST(ReadFullyOrThrow, PreadFailureThrows) {
   std::vector<char> targetBuffer(4);
   constexpr int invalidFd = -1;
-  AD_EXPECT_THROW_WITH_MESSAGE(ad_utility::SyncIoPolicy::readFullyOrThrow(
-                                   invalidFd, targetBuffer.data(), 4, 0),
-                               HasSubstr("pread failed"));
+  ad_utility::SyncIoPolicy policy;
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      policy.readFullyOrThrow(invalidFd, targetBuffer.data(), 4, 0),
+      HasSubstr("pread failed"));
 }
 
 // Requesting more bytes than the file contains (read past EOF) is a short read
@@ -397,9 +409,10 @@ TEST(ReadFullyOrThrow, PreadFailureThrows) {
 TEST(ReadFullyOrThrow, ShortReadThrows) {
   auto [tmp, fd] = makeTempFile("AAAABBBB");  // 8 bytes
   std::vector<char> targetBuffer(16);
-  AD_EXPECT_THROW_WITH_MESSAGE(ad_utility::SyncIoPolicy::readFullyOrThrow(
-                                   fd, targetBuffer.data(), 16, 0),
-                               HasSubstr("read fewer bytes than requested"));
+  ad_utility::SyncIoPolicy policy;
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      policy.readFullyOrThrow(fd, targetBuffer.data(), 16, 0),
+      HasSubstr("read fewer bytes than requested"));
 }
 
 // Two reads, each larger than a memory page (4 KiB on Linux), exercise

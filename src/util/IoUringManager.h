@@ -27,6 +27,10 @@
 
 #include "backports/span.h"
 
+#ifdef _WIN32
+#include "util/sys/windows/WindowsPositionedReader.h"
+#endif
+
 namespace ad_utility {
 
 template <typename T>
@@ -125,6 +129,17 @@ class BatchManager final : public BatchManagerBase {
 struct SyncIoPolicy {
   using BatchHandle = uint64_t;
 
+#ifdef _WIN32
+ private:
+  // A batch manager is single-threaded, but it alternates between the
+  // vocabulary and offsets descriptors. Cache a native positioned-read handle
+  // pool for each descriptor so Windows never reads through or changes the
+  // original CRT handle's file position.
+  mutable std::unordered_map<int, windows::PositionedReadHandle> readHandles_;
+
+ public:
+#endif
+
   // `ringSize` is ignored; it exists only so the policy is constructible the
   // same way as `IoUringPolicy`.
   //
@@ -155,8 +170,8 @@ struct SyncIoPolicy {
   // (from the start of the file) into `targetBuffer`. Throws exception if the
   // read fails or returns fewer bytes than requested (a partial read or end of
   // file), since every read must be fully satisfied.
-  static void readFullyOrThrow(int fd, char* targetBuffer, size_t numBytes,
-                               uint64_t fileOffset);
+  void readFullyOrThrow(int fd, char* targetBuffer, size_t numBytes,
+                        uint64_t fileOffset) const;
 };
 
 // Persistent io_uring manager that accepts multiple named batches of indices to

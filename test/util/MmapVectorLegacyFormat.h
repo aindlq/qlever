@@ -10,9 +10,8 @@
 #ifndef QLEVER_TEST_UTIL_MMAPVECTORLEGACYFORMAT_H
 #define QLEVER_TEST_UTIL_MMAPVECTORLEGACYFORMAT_H
 
-#include <unistd.h>
-
 #include <algorithm>
+#include <boost/interprocess/mapped_region.hpp>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -35,7 +34,7 @@ void writeLegacyMmapVectorFile(const std::string& filename,
   // and rounded the byte size up to a multiple of the page size, leaving a
   // region of unused capacity between the elements and the trailer.
   static constexpr size_t minCapacity = 100;
-  const size_t pageSize = getpagesize();
+  const size_t pageSize = boost::interprocess::mapped_region::get_page_size();
   const size_t dataBytes = elements.size() * sizeof(T);
   size_t byteSize = std::max(elements.size(), minCapacity) * sizeof(T);
   byteSize = (byteSize / pageSize + 1) * pageSize;
