@@ -17,6 +17,7 @@
 #include "util/Forward.h"
 #include "util/OnDestructionDontThrowDuringStackUnwinding.h"
 #include "util/ResetWhenMoved.h"
+#include "util/sys/DefaultSharedMutex.h"
 
 namespace ad_utility {
 
@@ -75,7 +76,7 @@ class LockPtr;
  * @tparam Mutex A Mutex like type (e.g. std::mutex or std::shared_mutex).
  * Defaults to std::shared_mutex
  */
-template <typename T, typename Mutex = std::shared_mutex,
+template <typename T, typename Mutex = DefaultSharedMutex,
           typename = std::enable_if_t<AllowsLocking<Mutex>::value>>
 class Synchronized {
  public:
