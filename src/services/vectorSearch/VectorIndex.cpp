@@ -224,6 +224,11 @@ struct VectorIndex::Impl {
   std::optional<float> softmaxTemperatureDefault_;
   std::optional<size_t> softmaxNDefault_;
   std::optional<float> breadthDefault_;
+  // Top-anchored z-cut serving defaults: band widths [precise, balanced,
+  // broad], the exact no-match gate, and the floor-estimator fraction.
+  std::array<std::optional<float>, 3> zcutDeltaDefault_;
+  std::optional<float> zcutGateZDefault_;
+  std::optional<float> zcutFloorFractionDefault_;
   std::optional<GraphIndex> graph_;  // present iff meta_.hasHnsw_
   std::unique_ptr<SearchSlotPool> searchSlots_;
   // Sticky safety net for the sequential-read hint of the merge-join gather.
@@ -700,6 +705,42 @@ void VectorIndex::setBreadthDefault(std::optional<float> breadth) {
     breadth = std::clamp(breadth.value(), 0.f, 1.f);
   }
   impl_->breadthDefault_ = breadth;
+}
+std::optional<float> VectorIndex::zcutDeltaDefault(int mode) const {
+  return (mode >= 0 && mode < 3) ? impl_->zcutDeltaDefault_[mode]
+                                 : std::nullopt;
+}
+void VectorIndex::setZcutDeltaDefault(int mode, std::optional<float> delta) {
+  if (mode < 0 || mode >= 3) {
+    return;
+  }
+  if (delta.has_value() &&
+      !(std::isfinite(delta.value()) && delta.value() > 0.f)) {
+    return;  // A non-positive band width is meaningless.
+  }
+  impl_->zcutDeltaDefault_[mode] = delta;
+}
+std::optional<float> VectorIndex::zcutGateZDefault() const {
+  return impl_->zcutGateZDefault_;
+}
+void VectorIndex::setZcutGateZDefault(std::optional<float> gateZ) {
+  if (gateZ.has_value() &&
+      !(std::isfinite(gateZ.value()) && gateZ.value() >= 0.f)) {
+    return;
+  }
+  impl_->zcutGateZDefault_ = gateZ;
+}
+std::optional<float> VectorIndex::zcutFloorFractionDefault() const {
+  return impl_->zcutFloorFractionDefault_;
+}
+void VectorIndex::setZcutFloorFractionDefault(std::optional<float> fraction) {
+  if (fraction.has_value()) {
+    if (!std::isfinite(fraction.value()) || fraction.value() <= 0.f ||
+        fraction.value() > 1.f) {
+      return;  // The background fraction must be in (0, 1].
+    }
+  }
+  impl_->zcutFloorFractionDefault_ = fraction;
 }
 std::optional<float> VectorIndex::calibratedSoftmaxTemperature() const {
   return impl_->meta_.calibratedSoftmaxT_;
@@ -2372,13 +2413,16 @@ inline NoiseFloor estimateNoiseFloor(std::vector<float>& sig,
   return f;
 }
 
-// Apply the noise-floor Z-CUT to a reranked set: z-score each candidate's
-// `signal` against the background floor and keep, from the top, everyone at
-// least `cut.z_` spreads above it. Scale-INVARIANT (a common scale factor
-// cancels in z). `entityBits`/`fineDist` are the reranked candidates (any
-// order); `signal[j]` is candidate j's signal (cosine similarity or CSLS).
-// `csls[j]` is its CSLS value for `vec:bindCsls` (NaN for the cosine signal).
-// Non-`exact` modes keep at least the single best; `exact` may keep zero.
+// Apply the TOP-ANCHORED Z-CUT to a reranked set: keep the candidates whose
+// `signal` is within `cut.delta_` spreads of the BEST -- `score >= s_max -
+// delta*sigma` -- where `sigma` is the noise-floor spread. Anchoring to the
+// top (not the floor) keeps a tight band below the best even on a SMOOTH
+// cross-modal gradient (where a floor-anchored cut over-returns). Scale-
+// INVARIANT (s_max and sigma scale together). `exact` (keepAtLeastOne_ false)
+// additionally GATES on the best clearing the floor (`s_max >= mu +
+// gateZ*sigma`), returning nothing otherwise; the other modes always keep at
+// least the single best. `csls[j]` is candidate j's CSLS value for
+// `vec:bindCsls` (NaN for the cosine signal).
 inline std::vector<CslsScoredEntity> applyZCut(
     const std::vector<uint64_t>& entityBits, const std::vector<float>& fineDist,
     const std::vector<float>& signal, const std::vector<float>& csls,
@@ -2398,23 +2442,26 @@ inline std::vector<CslsScoredEntity> applyZCut(
                                   : entityBits[a] < entityBits[b];
   };
   std::sort(order.begin(), order.end(), bySignalDesc);
+  const float sMax = signal[order[0]];
   // The noise floor from the low tail (a copy, since the estimator reorders).
   std::vector<float> scratch(signal);
   const NoiseFloor floor = estimateNoiseFloor(scratch, cut.floorFraction_);
-  // A degenerate (zero-spread) floor cannot z-score: keep only the top-1 for a
-  // non-exact mode, nothing for exact.
-  const float bar = cut.z_;
+  const float sigma = floor.sigma_;
   size_t keep = 0;
-  if (floor.sigma_ > 0.f) {
-    for (; keep < m; ++keep) {
-      const float z = (signal[order[keep]] - floor.mu_) / floor.sigma_;
-      if (z < bar) {
-        break;  // sorted descending, so the first below-bar ends the keep set
+  const bool gated = !cut.keepAtLeastOne_;  // `exact`
+  // The best must clear the floor gate for `exact`; the others always answer.
+  const bool topClears = sigma > 0.f && sMax >= floor.mu_ + cut.gateZ_ * sigma;
+  if (!gated || topClears) {
+    keep = 1;  // the best is always kept once we answer at all
+    if (sigma > 0.f) {
+      const float band = sMax - cut.delta_ * sigma;
+      for (; keep < m; ++keep) {
+        // `order` is signal-descending, so the first below-band ends the set.
+        if (signal[order[keep]] < band) {
+          break;
+        }
       }
     }
-  }
-  if (keep == 0 && cut.keepAtLeastOne_) {
-    keep = 1;  // precise/balanced/broad always answer with the single best
   }
   out.reserve(keep);
   for (size_t r = 0; r < keep; ++r) {
@@ -2427,9 +2474,10 @@ inline std::vector<CslsScoredEntity> applyZCut(
   }
   AD_LOG_INFO << "Vector index \"" << indexName << "\": csls zcut ("
               << (cut.signal_ == CslsCut::Signal::Csls ? "csls" : "cosine")
-              << " signal): floor mu " << floor.mu_ << " sigma " << floor.sigma_
-              << ", Z " << bar << " -> " << keep << " above bar, kept "
-              << out.size() << std::endl;
+              << " signal): s_max " << sMax << " floor mu " << floor.mu_
+              << " sigma " << sigma << ", Delta " << cut.delta_ << " -> keep "
+              << keep << (gated && !topClears ? " (gated: no match)" : "")
+              << ", kept " << out.size() << std::endl;
   return out;
 }
 
@@ -2530,11 +2578,11 @@ std::vector<CslsScoredEntity> applyCslsCutImpl(
 //    (a candidate the fixed/floor cut could keep may lie past it).
 //  * Softmax: one batch bounds it (>= `softmaxN`); the coarse layer ranks the
 //    very top well.
-//  * ZCut: widen until the noise FLOOR PLATEAUS -- the median of the low
-//    `cut.floorFraction_` of the reranked cosines stabilizes to within
-//    `cut.plateauEps_` spreads between batches (the window flattened into
-//    background) -- or `cut.rerankCap_` candidates are reranked (then
-//    `plateauFound_ = false`, logged: no silent truncation).
+//  * ZCut: TOP-ANCHORED depth -- widen until the reranked window's MINIMUM
+//    cosine falls below the broadest cut's boundary `s_max -
+//    cut.widenDelta_ * sigma` (so the cached set already holds everything any
+//    coverage mode could keep), or `cut.rerankCap_` candidates are reranked
+//    (then `plateauFound_ = false`, logged: no silent truncation).
 //
 // SINGLE-LAYER index: one FULL sweep on the (only) fine layer -- every
 // candidate is reranked, so the depth policy is moot. TWO-LAYER index: the
@@ -2810,17 +2858,15 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
         static_cast<double>(rqNow) -
         static_cast<double>(impl.cslsR_[rowAt(orderIdx(j))]));
   };
-  // ZCut widen state: the previous batch's noise-floor median (NaN before the
-  // first estimate) and the rerank cap (0 = the whole scored set).
+  // ZCut (top-anchored) widen state: the running best cosine `s_max`, the
+  // largest floor spread seen so far (a tight top cluster has near-zero spread
+  // until real background enters -- anchoring the band to the MAX sigma keeps
+  // the widen going through such a cluster instead of stopping inside it), and
+  // the rerank cap (0 = the whole scored set).
   const bool plateauMode = cut.mode_ == CslsCut::Mode::ZCut;
   const size_t rerankCap =
       cut.rerankCap_ == 0 ? n : std::min<size_t>(cut.rerankCap_, n);
-  float prevFloorMu = std::numeric_limits<float>::quiet_NaN();
-  // The highest floor median seen so far -- the level the low tail sits at
-  // while the window is still all matches. The floor must DROP from this peak
-  // (background must actually enter the window) before a "stable floor" counts
-  // as a plateau, so a tight match cluster does not stop the widening early.
-  float peakFloorMu = -std::numeric_limits<float>::infinity();
+  float sigmaMax = 0.f;
   bool cappedOut = false;
 
   while (true) {
@@ -2875,28 +2921,35 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
     //    below it) -- never toward a full fine scan.
     bool widen;
     if (plateauMode) {
-      // Widen until the estimated noise FLOOR plateaus (its median stops
-      // moving between batches, so the added batch is pure background), or the
-      // rerank cap is hit. The floor is over the reranked COSINE similarities
-      // (signal-agnostic, so ONE reranked set serves every mode/signal).
+      // TOP-ANCHORED widen: rerank until the window's MINIMUM cosine falls
+      // below the broadest cut's boundary `s_max - widenDelta*sigma`, so the
+      // reranked (cached) set already contains everything any coverage mode
+      // could keep; then stop. On a smooth cross-modal gradient the window min
+      // drops below the band after ~the first batch (no cap-chasing); a genuine
+      // no-match (window never separates) stops at the cap. The window is over
+      // the reranked COSINE similarities (signal-agnostic -> one set serves
+      // every mode/signal).
       if (reranked >= rerankCap) {
         cappedOut = reranked < n;  // capped short of the whole set
         widen = false;
       } else {
         std::vector<float> cosWindow(reranked);
+        float sMax = -std::numeric_limits<float>::infinity();
+        float windowMin = std::numeric_limits<float>::infinity();
         for (size_t j = 0; j < reranked; ++j) {
-          cosWindow[j] = 1.f - fineDists[j];
+          const float c = 1.f - fineDists[j];
+          cosWindow[j] = c;
+          sMax = std::max(sMax, c);
+          windowMin = std::min(windowMin, c);
         }
         const NoiseFloor f = estimateNoiseFloor(cosWindow, cut.floorFraction_);
-        peakFloorMu = std::max(peakFloorMu, f.mu_);
-        // Background has entered iff the floor dropped meaningfully from its
-        // peak (an absolute cosine drop); the floor is stable iff it barely
-        // moved between the last two batches. Plateau requires BOTH.
-        const bool droppedFromPeak = peakFloorMu - f.mu_ > cut.plateauEps_;
-        const bool stable = !std::isnan(prevFloorMu) &&
-                            std::abs(f.mu_ - prevFloorMu) <= cut.plateauEps_;
-        widen = !(droppedFromPeak && stable);
-        prevFloorMu = f.mu_;
+        sigmaMax = std::max(sigmaMax, f.sigma_);
+        // Widen while the window has not yet reached below the broadest band
+        // `s_max - widenDelta*sigmaMax`. Using the MAX sigma (not this batch's)
+        // means a tight top cluster (sigma ~ 0) keeps widening until genuine
+        // background raises sigma; a truly flat field never separates and stops
+        // at the cap (the gate / top-1 then answers).
+        widen = windowMin >= sMax - cut.widenDelta_ * sigmaMax;
       }
     } else if (cut.mode_ == CslsCut::Mode::Softmax) {
       widen = reranked < std::min(cut.softmaxN_, n);
@@ -2918,15 +2971,16 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
                 << "\": csls rerank widened to "
                 << std::min(reranked + floorM, n) << " of " << n
                 << (plateauMode
-                        ? " candidates (noise floor not yet plateaued)"
+                        ? " candidates (window not yet below the broadest band)"
                         : " candidates (cut reaches the coarse boundary)")
                 << std::endl;
   }
   if (cappedOut) {
     AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
                 << "\": csls rerank hit the cap at " << reranked << " of " << n
-                << " candidates before the noise floor plateaued (not a silent "
-                   "truncation; raise cslsRerankFloor/the cap to go deeper)"
+                << " candidates before the window separated from the best (not "
+                   "a silent truncation; raise cslsRerankFloor/the cap to go "
+                   "deeper)"
                 << std::endl;
   }
 
@@ -3030,13 +3084,13 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
 }
 
 // ____________________________________________________________________________
-// The MODE-INDEPENDENT plateau cut that drives `rerankCsls`'s widen policy.
-static CslsCut plateauRerankCut(float floorFraction, float plateauEps,
+// The MODE-INDEPENDENT cut that drives `rerankCsls`'s top-anchored widen depth.
+static CslsCut plateauRerankCut(float floorFraction, float widenDelta,
                                 size_t rerankCap) {
   CslsCut cut;
   cut.mode_ = CslsCut::Mode::ZCut;
   cut.floorFraction_ = floorFraction;
-  cut.plateauEps_ = plateauEps;
+  cut.widenDelta_ = widenDelta;
   cut.rerankCap_ = rerankCap;
   return cut;
 }
@@ -3044,7 +3098,7 @@ static CslsCut plateauRerankCut(float floorFraction, float plateauEps,
 // ____________________________________________________________________________
 CslsReranked VectorIndex::computeCslsReranked(
     ql::span<const float> query, size_t neighbors, float floorFraction,
-    float plateauEps, size_t rerankCap,
+    float widenDelta, size_t rerankCap,
     std::optional<ql::span<const Id>> candidates,
     const CheckInterruptCallback& checkInterrupt) const {
   auto& impl = *impl_;
@@ -3062,13 +3116,13 @@ CslsReranked VectorIndex::computeCslsReranked(
       impl.rerank_.has_value() ? impl.scan_.encodeQuery(query, coarseBuffer)
                                : queryBytes;
   return rerankCsls(impl, layer, queryBytes, coarseQueryBytes, std::nullopt,
-                    plateauRerankCut(floorFraction, plateauEps, rerankCap),
+                    plateauRerankCut(floorFraction, widenDelta, rerankCap),
                     neighbors, candidates, checkInterrupt);
 }
 
 // ____________________________________________________________________________
 CslsReranked VectorIndex::computeCslsRerankedByEntity(
-    Id entity, size_t neighbors, float floorFraction, float plateauEps,
+    Id entity, size_t neighbors, float floorFraction, float widenDelta,
     size_t rerankCap, std::optional<ql::span<const Id>> candidates,
     const CheckInterruptCallback& checkInterrupt) const {
   auto& impl = *impl_;
@@ -3080,7 +3134,7 @@ CslsReranked VectorIndex::computeCslsRerankedByEntity(
   }
   return rerankCsls(impl, layer, layer.rowPtr(row.value()),
                     impl.scan_.rowPtr(row.value()), row,
-                    plateauRerankCut(floorFraction, plateauEps, rerankCap),
+                    plateauRerankCut(floorFraction, widenDelta, rerankCap),
                     neighbors, candidates, checkInterrupt);
 }
 

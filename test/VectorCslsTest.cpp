@@ -1742,34 +1742,37 @@ TEST(VectorCsls, resolveCutCoverageModeMappingAndDefaults) {
   using CoverageMode = VectorSearchConfiguration::CoverageMode;
   using CutSignal = VectorSearchConfiguration::CutSignal;
 
-  // Cosine signal (the default): a ZCut whose z-threshold is the mode's Z, and
-  // which (except in exact) keeps at least the single best.
+  // Cosine signal (the default): a top-anchored ZCut whose band width is the
+  // mode's Delta, keeping (except in exact) at least the single best.
   config.cutSignal_ = CutSignal::Cosine;
   struct Case {
     CoverageMode mode_;
-    float z_;
+    float delta_;
     bool keepOne_;
   };
   for (const Case& c :
-       {Case{CoverageMode::Precise, DEFAULT_ZCUT_Z_PRECISE, true},
-        Case{CoverageMode::Balanced, DEFAULT_ZCUT_Z_BALANCED, true},
-        Case{CoverageMode::Broad, DEFAULT_ZCUT_Z_BROAD, true},
-        Case{CoverageMode::Exact, DEFAULT_ZCUT_Z_PRECISE, false}}) {
+       {Case{CoverageMode::Precise, DEFAULT_ZCUT_DELTA_PRECISE, true},
+        Case{CoverageMode::Balanced, DEFAULT_ZCUT_DELTA_BALANCED, true},
+        Case{CoverageMode::Broad, DEFAULT_ZCUT_DELTA_BROAD, true},
+        Case{CoverageMode::Exact, DEFAULT_ZCUT_DELTA_PRECISE, false}}) {
     config.autoCut_ = c.mode_;
     auto cut = resolveCslsCut(config, idx);
     EXPECT_EQ(cut.mode_, CslsCut::Mode::ZCut);
     EXPECT_EQ(cut.signal_, CslsCut::Signal::Cosine);
-    EXPECT_FLOAT_EQ(cut.z_, c.z_);
+    EXPECT_FLOAT_EQ(cut.delta_, c.delta_);
     EXPECT_EQ(cut.keepAtLeastOne_, c.keepOne_);
+    // The widen depth uses the broadest band + a margin (mode-independent).
+    EXPECT_FLOAT_EQ(cut.widenDelta_,
+                    DEFAULT_ZCUT_DELTA_BROAD + DEFAULT_ZCUT_WIDEN_MARGIN);
   }
 
-  // Csls signal: the same z-thresholds, but the csls signal.
+  // Csls signal: the same band widths, but the csls signal.
   config.cutSignal_ = CutSignal::Csls;
   config.autoCut_ = CoverageMode::Broad;
   auto csls = resolveCslsCut(config, idx);
   EXPECT_EQ(csls.mode_, CslsCut::Mode::ZCut);
   EXPECT_EQ(csls.signal_, CslsCut::Signal::Csls);
-  EXPECT_FLOAT_EQ(csls.z_, DEFAULT_ZCUT_Z_BROAD);
+  EXPECT_FLOAT_EQ(csls.delta_, DEFAULT_ZCUT_DELTA_BROAD);
 
   // Softmax signal: alpha per mode, N = 5 * cslsNeighbors (2 here), the
   // calibrated/default T.
@@ -1807,6 +1810,25 @@ TEST(VectorCsls, resolveCutCoverageModeMappingAndDefaults) {
   auto overridden = resolveCslsCut(config, idx);
   EXPECT_FLOAT_EQ(overridden.temperature_, 0.05f);
   EXPECT_EQ(overridden.softmaxN_, 3u);
+
+  // Per-index z-cut serving defaults (the `zcut*` env keys) thread into the
+  // resolved band width, gate, floor fraction, and widen depth.
+  config.cutSignal_ = CutSignal::Cosine;
+  config.autoCut_ = CoverageMode::Precise;
+  idx.setZcutDeltaDefault(0, 0.5f);
+  idx.setZcutDeltaDefault(2, 4.f);
+  idx.setZcutGateZDefault(5.f);
+  idx.setZcutFloorFractionDefault(0.25f);
+  auto zserved = resolveCslsCut(config, idx);
+  EXPECT_FLOAT_EQ(zserved.delta_, 0.5f);
+  EXPECT_FLOAT_EQ(zserved.gateZ_, 5.f);
+  EXPECT_FLOAT_EQ(zserved.floorFraction_, 0.25f);
+  // The widen depth follows the (overridden) BROADEST band.
+  EXPECT_FLOAT_EQ(zserved.widenDelta_, 4.f + DEFAULT_ZCUT_WIDEN_MARGIN);
+  // An unset band width stays at the constant.
+  config.autoCut_ = CoverageMode::Balanced;
+  EXPECT_FLOAT_EQ(resolveCslsCut(config, idx).delta_,
+                  DEFAULT_ZCUT_DELTA_BALANCED);
 
   cleanupTmp(basename, "acres");
 }
@@ -2021,22 +2043,23 @@ qlever::vector::CslsCut cosineZCut(CoverageMode mode) {
   qlever::vector::CslsCut cut;
   cut.mode_ = qlever::vector::CslsCut::Mode::ZCut;
   cut.signal_ = qlever::vector::CslsCut::Signal::Cosine;
+  cut.gateZ_ = DEFAULT_ZCUT_GATE_Z;
   switch (mode) {
     case CoverageMode::Precise:
-      cut.z_ = DEFAULT_ZCUT_Z_PRECISE;
+      cut.delta_ = DEFAULT_ZCUT_DELTA_PRECISE;
       cut.keepAtLeastOne_ = true;
       break;
     case CoverageMode::Broad:
-      cut.z_ = DEFAULT_ZCUT_Z_BROAD;
+      cut.delta_ = DEFAULT_ZCUT_DELTA_BROAD;
       cut.keepAtLeastOne_ = true;
       break;
     case CoverageMode::Exact:
-      cut.z_ = DEFAULT_ZCUT_Z_PRECISE;
+      cut.delta_ = DEFAULT_ZCUT_DELTA_PRECISE;
       cut.keepAtLeastOne_ = false;
       break;
     case CoverageMode::Balanced:
     default:
-      cut.z_ = DEFAULT_ZCUT_Z_BALANCED;
+      cut.delta_ = DEFAULT_ZCUT_DELTA_BALANCED;
       cut.keepAtLeastOne_ = true;
       break;
   }
@@ -2081,17 +2104,20 @@ TEST(VectorCsls, zCutStandoutAndScaleInvariance) {
   cleanupTmp(base, "zstand");
 }
 
-// A graded tail: precise's keep set is a subset of balanced's, which is a
-// subset of broad's (a wider net keeps strictly more).
+// A graded head (dense steps near the best) above a background: a wider band
+// (larger Delta) keeps strictly more, and precise's keep set is a subset of
+// balanced's, of broad's -- the top-anchored monotonicity.
 TEST(VectorCsls, zCutGradedTailMonotone) {
   std::string base = buildAngleFixtureIndex("zgrade", {0.f, 45.f, 90.f},
                                             /*cslsNeighbors=*/3,
                                             /*csls=*/false);
   VectorIndex idx;
   idx.open(base, "zgrade");
-  // A graded head above a flat background (~0.30, spread ~0.02).
-  std::vector<float> cos{0.62f, 0.52f, 0.42f, 0.34f, 0.32f,
-                         0.30f, 0.28f, 0.26f, 0.32f, 0.30f};
+  // A head stepping down in ~1-sigma increments from the best (0.90) above a
+  // background near 0.50 (spread -> sigma ~ 0.03): Delta 1 keeps the top ~2,
+  // Delta 2 ~4, Delta 3 all 5 head members.
+  std::vector<float> cos{0.90f, 0.88f, 0.86f, 0.84f, 0.82f, 0.46f,
+                         0.48f, 0.50f, 0.50f, 0.52f, 0.54f};
   std::vector<uint64_t> ids;
   for (uint64_t i = 0; i < cos.size(); ++i) ids.push_back(20 + i);
   auto r = makeReranked(cos, ids);
@@ -2102,11 +2128,48 @@ TEST(VectorCsls, zCutGradedTailMonotone) {
   auto broad = keptIds(idx.applyCslsCut(r, cosineZCut(CoverageMode::Broad)));
   EXPECT_LE(precise.size(), balanced.size());
   EXPECT_LE(balanced.size(), broad.size());
+  EXPECT_LT(precise.size(), broad.size());  // the bands actually differentiate
   EXPECT_TRUE(std::includes(balanced.begin(), balanced.end(), precise.begin(),
                             precise.end()));
   EXPECT_TRUE(std::includes(broad.begin(), broad.end(), balanced.begin(),
                             balanced.end()));
   cleanupTmp(base, "zgrade");
+}
+
+// THE REGRESSION this round fixes: a SMOOTH cross-modal relevance gradient
+// (one clear best + a long, dense, monotone tail of mildly-related, with NO
+// flat background -- the text->image "mona lisa" shape). The old floor-anchored
+// `floor + Z*sigma` cut swept up a huge fraction of the tail; the top-anchored
+// `s_max - Delta*sigma` cut keeps only a small BOUNDED band below the best.
+TEST(VectorCsls, zCutSmoothGradientBoundedKeep) {
+  std::string base = buildAngleFixtureIndex("zsmooth", {0.f, 45.f, 90.f},
+                                            /*cslsNeighbors=*/3,
+                                            /*csls=*/false);
+  VectorIndex idx;
+  idx.open(base, "zsmooth");
+  // One clear best (0.30), then a dense smooth gradient 0.22 -> 0.06 with no
+  // gap/plateau (250 points).
+  constexpr size_t N = 250;
+  std::vector<float> cos;
+  std::vector<uint64_t> ids;
+  cos.push_back(0.30f);
+  ids.push_back(500);
+  for (size_t i = 0; i < N; ++i) {
+    cos.push_back(0.22f -
+                  0.16f * static_cast<float>(i) / static_cast<float>(N));
+    ids.push_back(501 + i);
+  }
+  auto r = makeReranked(cos, ids);
+  auto broad = idx.applyCslsCut(r, cosineZCut(CoverageMode::Broad));
+  auto precise = idx.applyCslsCut(r, cosineZCut(CoverageMode::Precise));
+  // The best is on top, and even the widest mode keeps only a small band --
+  // NOT the whole smooth tail (the over-return the old floor cut produced).
+  ASSERT_GE(precise.size(), 1u);
+  EXPECT_EQ(precise[0].entity_, mkId(500));
+  EXPECT_EQ(broad[0].entity_, mkId(500));
+  EXPECT_LT(broad.size(), cos.size() / 4);  // bounded, not the whole gradient
+  EXPECT_LE(precise.size(), broad.size());
+  cleanupTmp(base, "zsmooth");
 }
 
 // A flat / no-standout field: `exact` returns NOTHING (the no-match answer);
@@ -2132,15 +2195,14 @@ TEST(VectorCsls, zCutFlatFieldNoMatch) {
   cleanupTmp(base, "zflat");
 }
 
-// Adaptive rerank: with a small initial batch (`cslsRerankFloor`) the widen
-// loop must extend the reranked set until the noise floor plateaus, and the
-// cut over that shallow-floor run must equal a full-depth reference.
+// Adaptive rerank: a WIDE top cluster (matches beyond the initial batch)
+// forces the top-anchored widen loop to extend past it and recover the cluster
+// (the "statues" shape); a SMOOTH gradient does NOT chase to the cap.
 TEST(VectorCsls, zCutAdaptiveRerankPlateau) {
-  // A two-layer (binary + bf16) index with a near cluster + spread background
-  // (like `twoLayerCoarseRerankMatchesFullFineSweep`, smaller).
-  constexpr size_t N = 400;
+  // A two-layer (i8 + bf16) index with a near cluster + random background.
+  constexpr size_t N = 800;
   constexpr size_t NEAR = 20;
-  constexpr size_t D = 128;
+  constexpr size_t D = 512;
   std::mt19937 rng{20260710};
   std::normal_distribution<float> g{0.f, 1.f};
   auto randomUnit = [&] {
@@ -2178,11 +2240,15 @@ TEST(VectorCsls, zCutAdaptiveRerankPlateau) {
   cfg.metric_ = VectorMetric::Cosine;
   cfg.buildHnsw_ = false;
   cfg.csls_ = false;
-  cfg.scalar_ = VectorScalar::Binary;
+  // i8 coarse (a clean quantized-cosine ranking, unlike the noisier 1-bit
+  // binary at this small dimension) so the near cluster is coarse-best.
+  cfg.scalar_ = VectorScalar::I8;
   cfg.rerankScalar_ = VectorScalar::Bf16;
   VectorIndexBuilder builder{basename, cfg};
+  std::uniform_real_distribution<float> clusterAngle{2.f, 7.f};
   for (size_t i = 0; i < N; ++i) {
-    std::vector<float> v = i < NEAR ? nearCenter(8.f) : randomUnit();
+    std::vector<float> v =
+        i < NEAR ? nearCenter(clusterAngle(rng)) : randomUnit();
     builder.add(mkId(2000 + i), "<http://ex/z" + std::to_string(i) + ">", v);
   }
   builder.build();
@@ -2190,20 +2256,18 @@ TEST(VectorCsls, zCutAdaptiveRerankPlateau) {
   idx.open(basename, "zadapt");
 
   const float ff = DEFAULT_ZCUT_FLOOR_FRACTION;
-  const float eps = DEFAULT_ZCUT_PLATEAU_EPS;
-  // Shallow initial batch (4): the plateau must widen well past it (the near
-  // cluster of 20 lies beyond the first batch), and it must find it.
-  idx.setCslsRerankFloor(4);
-  auto shallow = idx.computeCslsReranked(center, 10, ff, eps, /*rerankCap=*/0);
-  EXPECT_GT(shallow.rerankDepth(), 4u);
-  EXPECT_TRUE(shallow.plateauFound_);
-  // Full-depth reference: rerank everything.
+  const float wd = DEFAULT_ZCUT_DELTA_BROAD + DEFAULT_ZCUT_WIDEN_MARGIN;
+  // A batch smaller than the cluster (the cluster of 20 lies beyond it) forces
+  // the widen loop to extend past the first batch.
+  idx.setCslsRerankFloor(8);
+  auto shallow = idx.computeCslsReranked(center, 10, ff, wd, /*rerankCap=*/0);
+  EXPECT_GT(shallow.rerankDepth(), 8u);  // widened past the initial batch
+  EXPECT_TRUE(shallow.plateauFound_);    // stopped, did not chase the cap
+  EXPECT_LT(shallow.rerankDepth(), N);
+  // Full-depth reference recovers the whole near cluster (the real matches).
   idx.setCslsRerankFloor(N);
-  auto full = idx.computeCslsReranked(center, 10, ff, eps, /*rerankCap=*/0);
+  auto full = idx.computeCslsReranked(center, 10, ff, wd, /*rerankCap=*/0);
   ASSERT_EQ(full.rerankDepth(), N);
-  // Whether the floor was found by widening from a tiny batch or by reranking
-  // the whole set, the cosine z-cut recovers the near cluster (a clear
-  // standout above the random background) and nothing else.
   std::set<uint64_t> nearBits;
   for (uint64_t i = 0; i < NEAR; ++i) nearBits.insert(mkId(2000 + i).getBits());
   auto nearRecovered = [&](const std::set<uint64_t>& s) {
@@ -2214,10 +2278,46 @@ TEST(VectorCsls, zCutAdaptiveRerankPlateau) {
   for (CoverageMode m : {CoverageMode::Balanced, CoverageMode::Broad}) {
     auto a = keptIds(idx.applyCslsCut(shallow, cosineZCut(m)));
     auto b = keptIds(idx.applyCslsCut(full, cosineZCut(m)));
-    // The adaptive rerank recovered the near cluster (the real matches),
-    // whether from the tiny widening batch or the full rerank.
-    EXPECT_GE(nearRecovered(a), NEAR - 2) << "mode " << static_cast<int>(m);
-    EXPECT_GE(nearRecovered(b), NEAR - 2);
+    EXPECT_GE(nearRecovered(b), NEAR - 3) << "mode " << static_cast<int>(m);
+    // The adaptive (shallow) cut keeps only cluster members and never anything
+    // the full-depth cut would not keep. (With the production-sized initial
+    // batch the first window already holds real background, so shallow == full
+    // there; the tiny batch here only narrows the window's sigma estimate.)
+    EXPECT_TRUE(std::includes(b.begin(), b.end(), a.begin(), a.end()))
+        << "mode " << static_cast<int>(m);
+    EXPECT_EQ(nearRecovered(a), a.size());  // nothing but cluster members
+  }
+
+  // A SMOOTH gradient (angles 1..90 degrees around a fresh center, no cluster)
+  // must NOT chase the rerank cap: the window separates from the best after a
+  // few batches, so it stops well short of the cap.
+  {
+    std::string gname = uniqueTmpBasename();
+    VectorIndexConfig gcfg;
+    gcfg.name_ = "zgrad";
+    gcfg.dimensions_ = D;
+    gcfg.metric_ = VectorMetric::Cosine;
+    gcfg.buildHnsw_ = false;
+    gcfg.scalar_ = VectorScalar::I8;
+    gcfg.rerankScalar_ = VectorScalar::Bf16;
+    const std::vector<float> gcenter = randomUnit();
+    VectorIndexBuilder gb{gname, gcfg};
+    constexpr size_t GN = 600;
+    for (size_t i = 0; i < GN; ++i) {
+      // A dense smooth spread of angles 1..80 degrees -- one best, no plateau.
+      gb.add(mkId(9000 + i), "<http://ex/g" + std::to_string(i) + ">",
+             nearCenter(1.f +
+                        79.f * static_cast<float>(i) / static_cast<float>(GN)));
+    }
+    gb.build();
+    VectorIndex gidx;
+    gidx.open(gname, "zgrad");
+    gidx.setCslsRerankFloor(8);
+    const size_t cap = 8 * 8;  // resolveCslsCut's cslsRerankFloor * 8
+    auto gr = gidx.computeCslsReranked(gcenter, 10, ff, wd, cap);
+    EXPECT_TRUE(gr.plateauFound_);     // stopped, did NOT hit the cap
+    EXPECT_LT(gr.rerankDepth(), cap);  // well short of the cap
+    cleanupTmp(gname, "zgrad");
   }
   cleanupTmp(basename, "zadapt");
 }

@@ -681,17 +681,20 @@ TEST(VectorPerf, DISABLED_autoCutModeSwitchBenchmark) {
   idx.open(s.basename, "perf", VectorIndex::Residency::AlignedCopy,
            VectorIndex::Residency::AlignedCopy);
   const float ff = DEFAULT_ZCUT_FLOOR_FRACTION;
-  const float eps = DEFAULT_ZCUT_PLATEAU_EPS;
-  // The production rerank cap (`resolveCslsCut` = cslsRerankFloor * 8); a
-  // random synthetic index never plateaus, so the cap bounds the depth.
+  const float wd = DEFAULT_ZCUT_DELTA_BROAD + DEFAULT_ZCUT_WIDEN_MARGIN;
+  // The production rerank cap (`resolveCslsCut` = cslsRerankFloor * 8). Under
+  // the TOP-ANCHORED widen a random index (the smooth/no-structure shape)
+  // separates from the best within the FIRST batch, so the depth is
+  // `cslsRerankFloor`, far below the cap (the old floor-plateau chased the cap
+  // here).
   const size_t cap = idx.cslsRerankFloor() * 8;
   setThreads(maxT);
-  (void)idx.computeCslsReranked(s.query, 10, ff, eps, cap);  // warm
-  auto mkCut = [](float z) {
+  (void)idx.computeCslsReranked(s.query, 10, ff, wd, cap);  // warm
+  auto mkCut = [](float delta) {
     CslsCut c;
     c.mode_ = CslsCut::Mode::ZCut;
     c.signal_ = CslsCut::Signal::Cosine;
-    c.z_ = z;
+    c.delta_ = delta;
     c.keepAtLeastOne_ = true;
     return c;
   };
@@ -700,11 +703,11 @@ TEST(VectorPerf, DISABLED_autoCutModeSwitchBenchmark) {
     setThreads(t);
     // Cold: the whole reranked-to-plateau compute (a cache MISS).
     auto [cMn, cMd] = timeReps(s.reps, [&] {
-      auto r = idx.computeCslsReranked(s.query, 10, ff, eps, cap);
+      auto r = idx.computeCslsReranked(s.query, 10, ff, wd, cap);
       (void)r;
     });
     // Cached: re-apply a (different-mode) cut over an already-computed set.
-    auto reranked = idx.computeCslsReranked(s.query, 10, ff, eps, cap);
+    auto reranked = idx.computeCslsReranked(s.query, 10, ff, wd, cap);
     auto [aMn, aMd] = timeReps(s.reps, [&] {
       auto hits = idx.applyCslsCut(reranked, mkCut(2.0f));
       (void)hits;

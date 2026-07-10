@@ -279,6 +279,75 @@ TEST(VectorIndexEndpointOverride, autoCutDefaultsAreInMemoryOnly) {
 }
 
 // _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, parseZcutDefaultOverrides) {
+  // The top-anchored z-cut knobs parse: the per-mode band widths, the exact
+  // no-match gate, and the floor-estimator fraction.
+  auto overrides = parseEmbeddingEndpointOverrides(
+      R"({"images": {"zcutDeltaPrecise": 0.5, "zcutDeltaBalanced": 1.5,)"
+      R"( "zcutDeltaBroad": 4, "zcutGateZ": 2.5, "zcutFloorFraction": 0.25}})");
+  ASSERT_EQ(overrides.size(), 1u);
+  const auto& o = overrides.at("images");
+  EXPECT_FLOAT_EQ(o.zcutDeltaPrecise_.value(), 0.5f);
+  EXPECT_FLOAT_EQ(o.zcutDeltaBalanced_.value(), 1.5f);
+  EXPECT_FLOAT_EQ(o.zcutDeltaBroad_.value(), 4.f);
+  EXPECT_FLOAT_EQ(o.zcutGateZ_.value(), 2.5f);
+  EXPECT_FLOAT_EQ(o.zcutFloorFraction_.value(), 0.25f);
+  // Malformed values poison the ENTIRE entry: a non-positive band width or
+  // gate, a fraction outside (0, 1], a non-numeric value.
+  auto invalid = parseEmbeddingEndpointOverrides(
+      R"({"dZero": {"zcutDeltaPrecise": 0},)"
+      R"( "dNeg": {"zcutDeltaBroad": -1},)"
+      R"( "gNeg": {"zcutGateZ": -3},)"
+      R"( "fZero": {"zcutFloorFraction": 0},)"
+      R"( "fHigh": {"zcutFloorFraction": 1.5},)"
+      R"( "dString": {"zcutDeltaBalanced": "wide"},)"
+      R"( "good": {"zcutDeltaBalanced": 2.5}})");
+  ASSERT_EQ(invalid.size(), 1u);
+  EXPECT_FLOAT_EQ(invalid.at("good").zcutDeltaBalanced_.value(), 2.5f);
+}
+
+// _____________________________________________________________________________
+TEST(VectorIndexEndpointOverride, zcutDefaultsAreInMemoryOnly) {
+  auto b = buildTmpIndex();
+  VectorIndex idx;
+  idx.open(b.basename, b.name);
+  // Fresh index: no serving defaults (the constants apply).
+  for (int m : {0, 1, 2}) EXPECT_FALSE(idx.zcutDeltaDefault(m).has_value());
+  EXPECT_FALSE(idx.zcutGateZDefault().has_value());
+  EXPECT_FALSE(idx.zcutFloorFractionDefault().has_value());
+  // Apply the overrides exactly as the load hook does.
+  EndpointsEnvGuard guard{
+      R"({"images": {"zcutDeltaPrecise": 0.5, "zcutDeltaBroad": 4,)"
+      R"( "zcutGateZ": 2.5, "zcutFloorFraction": 0.25}})"};
+  auto overrides = embeddingEndpointOverridesFromEnv();
+  auto it = overrides.find(b.name);
+  ASSERT_NE(it, overrides.end());
+  idx.setZcutDeltaDefault(0, it->second.zcutDeltaPrecise_);
+  idx.setZcutDeltaDefault(1, it->second.zcutDeltaBalanced_);
+  idx.setZcutDeltaDefault(2, it->second.zcutDeltaBroad_);
+  idx.setZcutGateZDefault(it->second.zcutGateZ_);
+  idx.setZcutFloorFractionDefault(it->second.zcutFloorFraction_);
+  EXPECT_FLOAT_EQ(idx.zcutDeltaDefault(0).value(), 0.5f);
+  EXPECT_FALSE(idx.zcutDeltaDefault(1).has_value());  // not in the env entry
+  EXPECT_FLOAT_EQ(idx.zcutDeltaDefault(2).value(), 4.f);
+  EXPECT_FLOAT_EQ(idx.zcutGateZDefault().value(), 2.5f);
+  EXPECT_FLOAT_EQ(idx.zcutFloorFractionDefault().value(), 0.25f);
+  // The setters ignore invalid values defensively.
+  idx.setZcutDeltaDefault(0, -1.f);  // ignored, keeps 0.5
+  EXPECT_FLOAT_EQ(idx.zcutDeltaDefault(0).value(), 0.5f);
+  idx.setZcutFloorFractionDefault(2.f);  // ignored, keeps 0.25
+  EXPECT_FLOAT_EQ(idx.zcutFloorFractionDefault().value(), 0.25f);
+  // `nullopt` resets to "use the constants".
+  idx.setZcutGateZDefault(std::nullopt);
+  EXPECT_FALSE(idx.zcutGateZDefault().has_value());
+  // Never persisted: a fresh open has no defaults again.
+  VectorIndex reopened;
+  reopened.open(b.basename, b.name);
+  EXPECT_FALSE(reopened.zcutDeltaDefault(2).has_value());
+  cleanup(b);
+}
+
+// _____________________________________________________________________________
 TEST(VectorIndexEndpointOverride, parseMalformedNeverThrowsAndYieldsNothing) {
   // Whole value malformed or of the wrong shape -> empty map, no exception.
   EXPECT_TRUE(parseEmbeddingEndpointOverrides("").empty());

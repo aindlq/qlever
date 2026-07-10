@@ -116,7 +116,7 @@ void validateCslsIsAvailable(const VectorSearchConfiguration& config,
 namespace {
 // The z-threshold, softmax bar, and no-match behaviour of each coverage mode.
 struct CoverageParams {
-  float z_;
+  int deltaMode_;  // 0=precise,1=balanced,2=broad -- indexes the per-mode Delta
   float softmaxAlpha_;
   bool keepAtLeastOne_;
 };
@@ -124,18 +124,23 @@ CoverageParams coverageParams(VectorSearchConfiguration::CoverageMode mode) {
   using M = VectorSearchConfiguration::CoverageMode;
   switch (mode) {
     case M::Precise:
-      return {DEFAULT_ZCUT_Z_PRECISE, DEFAULT_ZCUT_SOFTMAX_ALPHA_PRECISE, true};
+      return {0, DEFAULT_ZCUT_SOFTMAX_ALPHA_PRECISE, true};
     case M::Broad:
-      return {DEFAULT_ZCUT_Z_BROAD, DEFAULT_ZCUT_SOFTMAX_ALPHA_BROAD, true};
+      return {2, DEFAULT_ZCUT_SOFTMAX_ALPHA_BROAD, true};
     case M::Exact:
-      // Exact = precise's bar, but the no-match answer is zero, not the best.
-      return {DEFAULT_ZCUT_Z_PRECISE, DEFAULT_ZCUT_SOFTMAX_ALPHA_PRECISE,
-              false};
+      // Exact = precise's band, but the no-match gate answers zero, not best.
+      return {0, DEFAULT_ZCUT_SOFTMAX_ALPHA_PRECISE, false};
     case M::Balanced:
     default:
-      return {DEFAULT_ZCUT_Z_BALANCED, DEFAULT_ZCUT_SOFTMAX_ALPHA_BALANCED,
-              true};
+      return {1, DEFAULT_ZCUT_SOFTMAX_ALPHA_BALANCED, true};
   }
+}
+// The per-mode band width Delta: per-index override -> constant.
+float resolveDelta(const VectorIndex& vidx, int deltaMode) {
+  constexpr float kConst[3] = {DEFAULT_ZCUT_DELTA_PRECISE,
+                               DEFAULT_ZCUT_DELTA_BALANCED,
+                               DEFAULT_ZCUT_DELTA_BROAD};
+  return vidx.zcutDeltaDefault(deltaMode).value_or(kConst[deltaMode]);
 }
 }  // namespace
 
@@ -152,14 +157,17 @@ CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
   }
   using CutSignal = VectorSearchConfiguration::CutSignal;
   const CoverageParams cov = coverageParams(config.autoCut_.value());
-  // The plateau + floor-estimator knobs are (for now) the constants; the
-  // adaptive rerank widens to the whole scored set if the floor never
-  // plateaus (rerankCap_ 0 = no cap, logged if it ever bites).
-  cut.floorFraction_ = DEFAULT_ZCUT_FLOOR_FRACTION;
-  cut.plateauEps_ = DEFAULT_ZCUT_PLATEAU_EPS;
-  // Bound the widening so a NO-MATCH query (whose floor never separates from
-  // the head, so the plateau never fires) reranks at most a few rerank floors
-  // rather than the whole index; hitting it is logged, never silent.
+  // The floor-estimator fraction, the exact no-match gate, and the top-anchored
+  // widen depth (broad's band + a safety margin). Each: per-index `zcut*`
+  // serving default -> constant. The widen depth uses the BROADEST band so the
+  // cached reranked set holds everything any coverage mode could keep.
+  cut.floorFraction_ =
+      vidx.zcutFloorFractionDefault().value_or(DEFAULT_ZCUT_FLOOR_FRACTION);
+  cut.gateZ_ = vidx.zcutGateZDefault().value_or(DEFAULT_ZCUT_GATE_Z);
+  cut.widenDelta_ = resolveDelta(vidx, 2) + DEFAULT_ZCUT_WIDEN_MARGIN;
+  // Bound the widening so a NO-MATCH query (whose window never separates from
+  // the best) reranks at most a few rerank floors, not the whole index; hitting
+  // it is logged, never silent.
   cut.rerankCap_ = std::max<size_t>(vidx.cslsRerankFloor() * 8, 10'000);
   cut.keepAtLeastOne_ = cov.keepAtLeastOne_;
   if (config.cutSignal_ == CutSignal::Softmax) {
@@ -177,12 +185,12 @@ CslsCut resolveCslsCut(const VectorSearchConfiguration& config,
         std::max<size_t>(DEFAULT_CSLS_SOFTMAX_N_FACTOR * neighbors, 1)));
     cut.alpha_ = cov.softmaxAlpha_;
   } else {
-    // The noise-floor z-cut over the cosine or CSLS signal.
+    // The top-anchored z-cut over the cosine or CSLS signal.
     cut.mode_ = CslsCut::Mode::ZCut;
     cut.signal_ = config.cutSignal_ == CutSignal::Csls
                       ? CslsCut::Signal::Csls
                       : CslsCut::Signal::Cosine;
-    cut.z_ = cov.z_;
+    cut.delta_ = resolveDelta(vidx, cov.deltaMode_);
   }
   return cut;
 }
@@ -241,7 +249,7 @@ std::vector<CslsScoredEntity> runCslsCut(
   std::string key = absl::StrCat(
       "CSLS_RERANK idx=", config.indexName_, " nb=", neighbors,
       " ff=", absl::Hex(absl::bit_cast<uint32_t>(cut.floorFraction_)),
-      " eps=", absl::Hex(absl::bit_cast<uint32_t>(cut.plateauEps_)),
+      " wd=", absl::Hex(absl::bit_cast<uint32_t>(cut.widenDelta_)),
       " cap=", cut.rerankCap_);
   appendQueryPointToCacheKey(&key, config);
   absl::StrAppend(&key, " cand={", candidateIdentity, "}");
@@ -249,10 +257,10 @@ std::vector<CslsScoredEntity> runCslsCut(
     return queryEntity.has_value()
                ? vidx.computeCslsRerankedByEntity(
                      queryEntity.value(), neighbors, cut.floorFraction_,
-                     cut.plateauEps_, cut.rerankCap_, candidates,
+                     cut.widenDelta_, cut.rerankCap_, candidates,
                      checkInterrupt)
                : vidx.computeCslsReranked(query, neighbors, cut.floorFraction_,
-                                          cut.plateauEps_, cut.rerankCap_,
+                                          cut.widenDelta_, cut.rerankCap_,
                                           candidates, checkInterrupt);
   };
   auto res =

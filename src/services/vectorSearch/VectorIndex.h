@@ -85,32 +85,41 @@ inline constexpr size_t DEFAULT_CSLS_SOFTMAX_N_FACTOR = 5;
 inline constexpr float DEFAULT_CSLS_SOFTMAX_ALPHA = 2.0f;
 inline constexpr float DEFAULT_CSLS_AUTOCUT_BREADTH = 0.5f;
 
-// The NOISE-FLOOR Z-CUT (`vec:autoCut` coverage modes with the `cosine`/`csls`
-// signal): the reranked candidates' signal scores are z-scored against a
-// robust estimate of the background NOISE FLOOR (its median + MAD-derived
-// spread from the low tail of the reranked window), and everything with
-// `z >= Z(mode)` from the top is kept -- a scale-INVARIANT, coverage-oriented
-// cut (multiplying every score by a constant leaves z unchanged). These are
-// the USER-TUNABLE knobs (also per-index overridable via the
-// `QLEVER_VECTOR_SEARCH_ENDPOINTS` `zcut*` keys):
-//   Z(mode): how many spreads above the floor a candidate must stand to be
-//   kept. precise ~3 (only clear standouts), balanced ~2, broad ~1 (a wide
-//   net); `exact` reuses the precise Z but, unlike the others, keeps NOTHING
-//   when no candidate clears it (the no-match answer) instead of the single
-//   best.
-inline constexpr float DEFAULT_ZCUT_Z_PRECISE = 3.0f;
-inline constexpr float DEFAULT_ZCUT_Z_BALANCED = 2.0f;
-inline constexpr float DEFAULT_ZCUT_Z_BROAD = 1.0f;
+// The TOP-ANCHORED Z-CUT (`vec:autoCut` coverage modes with the `cosine`/`csls`
+// signal): the reranked candidates are kept when their signal score is within
+// `Delta(mode)` spreads of the BEST score -- `score >= s_max - Delta*sigma` --
+// where `sigma` is the robust noise-floor spread (1.4826 * MAD of the low
+// `floorFraction` of the window). Anchoring to the TOP (not the floor) is what
+// tames a SMOOTH cross-modal relevance gradient (text->image): a text vector
+// is broadly close to a huge swath of the corpus, so a floor-anchored
+// `floor + Z*sigma` cut swept up thousands of mildly-related images; the
+// top-anchored cut instead keeps the tight band right below the best. Still
+// scale-INVARIANT (s_max and sigma scale together). USER-TUNABLE knobs (also
+// per-index overridable via the `QLEVER_VECTOR_SEARCH_ENDPOINTS` `zcut*` keys):
+//   Delta(mode): the band width below the best, in spreads. precise ~1 (tight
+//   to the best), balanced ~2, broad ~3 (a wider net) -- so precise's keep set
+//   is always a subset of balanced's, of broad's.
+inline constexpr float DEFAULT_ZCUT_DELTA_PRECISE = 1.0f;
+inline constexpr float DEFAULT_ZCUT_DELTA_BALANCED = 2.0f;
+inline constexpr float DEFAULT_ZCUT_DELTA_BROAD = 3.0f;
+// The NO-MATCH gate (only `exact` uses it): the answer is empty unless the
+// BEST score itself stands `gateZ` spreads above the noise floor
+// (`s_max >= mu_floor + gateZ*sigma`). Robust even on a smooth curve -- a real
+// match's best is far above the floor, a no-match's is not. precise/balanced/
+// broad skip the gate (they always keep at least the single best).
+inline constexpr float DEFAULT_ZCUT_GATE_Z = 3.0f;
 // The background is the LOW `floorFraction` of the reranked window (sorted by
 // signal): its median is the floor mu, and 1.4826 * MAD is the spread sigma
 // (a std-equivalent robust to the standout head).
 inline constexpr float DEFAULT_ZCUT_FLOOR_FRACTION = 0.5f;
 inline constexpr float ZCUT_MAD_TO_SIGMA = 1.4826f;
-// The ADAPTIVE rerank widens in `cslsRerankFloor`-sized batches until the
-// estimated floor PLATEAUS (its median moves less than `plateauEps` * sigma
-// between batches -- the window has flattened into background), or the cap is
-// hit. Smaller eps = deeper (more conservative) plateau.
-inline constexpr float DEFAULT_ZCUT_PLATEAU_EPS = 0.15f;
+// The adaptive rerank widens in `cslsRerankFloor`-sized batches until the
+// window's MINIMUM score falls below the broadest cut's boundary --
+// `s_max - widenDelta*sigma` (`widenDelta = Delta_broad + WIDEN_MARGIN`, a
+// safety margin for the still-settling sigma) -- so the cached set already
+// contains everything ANY mode could keep; then it stops (no cap-chasing on a
+// smooth gradient). The cap still bounds a genuine no-match.
+inline constexpr float DEFAULT_ZCUT_WIDEN_MARGIN = 1.0f;
 // The softmax bar alpha per coverage mode (stricter = fewer standouts). These
 // reproduce the former `vec:breadth` preset mapping (balanced == the old
 // default), so a `cutSignal "softmax"` z-cut is bit-identical to today's
@@ -159,18 +168,21 @@ struct CslsCut {
 
   // ZCut (and the shared coverage-mode floor for Softmax):
   Signal signal_ = Signal::Cosine;
-  // The z-threshold Z(mode): keep candidates whose signal is at least `z_`
-  // spreads above the noise floor.
-  float z_ = DEFAULT_ZCUT_Z_BALANCED;
+  // The top-anchored band width Delta(mode): keep candidates whose signal is
+  // within `delta_` spreads of the best (`score >= s_max - delta_*sigma`).
+  float delta_ = DEFAULT_ZCUT_DELTA_BALANCED;
+  // The no-match gate (only when `keepAtLeastOne_` is false, i.e. `exact`):
+  // keep nothing unless `s_max >= mu_floor + gateZ_*sigma`.
+  float gateZ_ = DEFAULT_ZCUT_GATE_Z;
   // Background = the low `floorFraction_` of the reranked window.
   float floorFraction_ = DEFAULT_ZCUT_FLOOR_FRACTION;
-  // The adaptive-rerank plateau tolerance (see DEFAULT_ZCUT_PLATEAU_EPS).
-  float plateauEps_ = DEFAULT_ZCUT_PLATEAU_EPS;
+  // The adaptive-rerank widen depth: rerank until the window's min score falls
+  // below `s_max - widenDelta_*sigma` (see `DEFAULT_ZCUT_WIDEN_MARGIN`).
+  float widenDelta_ = DEFAULT_ZCUT_DELTA_BROAD + DEFAULT_ZCUT_WIDEN_MARGIN;
   // Non-`exact` coverage modes keep at least one result (the single best when
-  // nothing clears the bar); `exact` keeps zero -- the no-match answer.
-  // Defaults to false so a bare `CslsCut` (the direct engine API) keeps the
-  // strict "nothing stands out => nothing" behaviour; `resolveCslsCut` sets it
-  // per coverage mode.
+  // nothing clears the band); `exact` keeps zero when the gate fails -- the
+  // no-match answer. Defaults to false so a bare `CslsCut` (the direct engine
+  // API) applies the gate; `resolveCslsCut` sets it per coverage mode.
   bool keepAtLeastOne_ = false;
   // Adaptive rerank cap: the widening never reranks more than this many
   // candidates (0 = the whole scored set). The initial batch is
@@ -352,6 +364,19 @@ class VectorIndex {
   void setSoftmaxNDefault(std::optional<size_t> n);
   std::optional<float> breadthDefault() const;
   void setBreadthDefault(std::optional<float> breadth);
+  // Per-index serving defaults of the TOP-ANCHORED z-cut knobs (the `zcut*`
+  // keys of `QLEVER_VECTOR_SEARCH_ENDPOINTS`): the per-mode band widths
+  // Delta(precise/balanced/broad), the exact no-match gate, and the
+  // floor-estimator fraction. `nullopt` = the `DEFAULT_ZCUT_*` constant. The
+  // setters ignore non-positive/non-finite deltas and clamp the fraction to
+  // (0, 1].
+  std::optional<float> zcutDeltaDefault(
+      int mode) const;  // 0=prec,1=bal,2=broad
+  void setZcutDeltaDefault(int mode, std::optional<float> delta);
+  std::optional<float> zcutGateZDefault() const;
+  void setZcutGateZDefault(std::optional<float> gateZ);
+  std::optional<float> zcutFloorFractionDefault() const;
+  void setZcutFloorFractionDefault(std::optional<float> fraction);
   // The softmax temperature calibrated from the corpus at BUILD time (read from
   // the `.meta`; see `VectorIndexMetadata::calibratedSoftmaxT_`). Ranks below a
   // runtime-config default and a per-query override, above the constant
@@ -494,23 +519,23 @@ class VectorIndex {
       size_t* numScored = nullptr) const;
 
   // Stage (a) of the coverage-mode `vec:autoCut` (the `cosine`/`csls`/`softmax`
-  // signals): rerank the candidates to the noise-floor PLATEAU -- widen in
-  // `cslsRerankFloor`-sized batches until the estimated floor (median of the
-  // low `floorFraction` of the reranked cosines) stabilizes to within
-  // `plateauEps` spreads, or `rerankCap` (0 = whole scored set) is hit -- and
-  // return the reranked set + r(q). This is MODE-INDEPENDENT (the cut, its
-  // z-threshold, and its signal are applied by `applyCslsCut`), so the engine
-  // caches it and re-applies the cut for free on a mode switch. `candidates`,
-  // `maxDistance` semantics as `searchCsls`. `neighbors` is the r(q) count.
+  // signals): rerank the candidates to the TOP-ANCHORED depth -- widen in
+  // `cslsRerankFloor`-sized batches until the window's minimum cosine falls
+  // below `s_max - widenDelta * sigma` (so the reranked set already contains
+  // everything any coverage mode could keep), or `rerankCap` (0 = whole scored
+  // set) is hit -- and return the reranked set + r(q). MODE-INDEPENDENT (the
+  // cut band `Delta(mode)`, gate, and signal are applied by `applyCslsCut`),
+  // so the engine caches it and re-applies the cut for free on a mode switch.
+  // `candidates`/`maxDistance` as `searchCsls`; `neighbors` is the r(q) count.
   CslsReranked computeCslsReranked(
       ql::span<const float> query, size_t neighbors, float floorFraction,
-      float plateauEps, size_t rerankCap,
+      float widenDelta, size_t rerankCap,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
 
   // The same with a STORED entity's vector as the query point.
   CslsReranked computeCslsRerankedByEntity(
-      Id entity, size_t neighbors, float floorFraction, float plateauEps,
+      Id entity, size_t neighbors, float floorFraction, float widenDelta,
       size_t rerankCap,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;

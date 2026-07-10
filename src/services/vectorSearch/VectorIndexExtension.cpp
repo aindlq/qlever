@@ -839,6 +839,28 @@ void loadHook(IndexImpl& impl, const std::string& basename) {
                     << fmt(o.softmaxN_) << ", breadth " << fmt(o.breadth_)
                     << std::endl;
       }
+      // The top-anchored z-cut serving defaults.
+      if (o.zcutDeltaPrecise_.has_value() || o.zcutDeltaBalanced_.has_value() ||
+          o.zcutDeltaBroad_.has_value() || o.zcutGateZ_.has_value() ||
+          o.zcutFloorFraction_.has_value()) {
+        idx.setZcutDeltaDefault(0, o.zcutDeltaPrecise_);
+        idx.setZcutDeltaDefault(1, o.zcutDeltaBalanced_);
+        idx.setZcutDeltaDefault(2, o.zcutDeltaBroad_);
+        idx.setZcutGateZDefault(o.zcutGateZ_);
+        idx.setZcutFloorFractionDefault(o.zcutFloorFraction_);
+        auto fmt = [](const auto& opt) {
+          return opt.has_value() ? std::to_string(opt.value())
+                                 : std::string{"-"};
+        };
+        AD_LOG_INFO << "Vector index '" << name
+                    << "': z-cut defaults set at startup ("
+                    << VECTOR_SEARCH_ENDPOINTS_ENV_VAR
+                    << "): zcutDelta [precise " << fmt(o.zcutDeltaPrecise_)
+                    << ", balanced " << fmt(o.zcutDeltaBalanced_) << ", broad "
+                    << fmt(o.zcutDeltaBroad_) << "], zcutGateZ "
+                    << fmt(o.zcutGateZ_) << ", zcutFloorFraction "
+                    << fmt(o.zcutFloorFraction_) << std::endl;
+      }
       endpointOverrides.erase(it);
     }
     const VectorIndexConfig& config = idx.metadata().config_;
