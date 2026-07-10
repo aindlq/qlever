@@ -18,11 +18,14 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "util/Exception.h"
 #include "util/Forward.h"
 #include "util/Log.h"
+#include "util/sys/PortableFileOpen.h"
+#include "util/sys/PositionedReader.h"
 
 namespace ad_utility {
 //! Wrapper class for file access. Is supposed to provide
@@ -37,6 +40,10 @@ class File {
 
   string name_;
   FILE* file_;
+
+  // Strategy for positioned reads (`read` at an explicit offset), platform-
+  // selected in `util/sys/PositionedReader.h`.
+  PositionedReader positionedReader_;
 
  public:
   //! Default constructor
@@ -66,11 +73,14 @@ class File {
 
     file_ = std::exchange(rhs.file_, nullptr);
     name_ = std::move(rhs.name_);
+    positionedReader_ = std::move(rhs.positionedReader_);
     return *this;
   }
 
   File(File&& rhs) noexcept
-      : name_{std::move(rhs.name_)}, file_{std::exchange(rhs.file_, nullptr)} {}
+      : name_{std::move(rhs.name_)}, file_{std::exchange(rhs.file_, nullptr)} {
+    positionedReader_ = std::move(rhs.positionedReader_);
+  }
 
   //! Destructor closes file if still open
   ~File() {
@@ -79,7 +89,10 @@ class File {
 
   //! OPEN FILE (exit with error if fails, returns true otherwise)
   bool open(const char* filename, const char* mode) {
-    file_ = fopen(filename, mode);
+    // Reset the positioned reader so a reused `File` doesn't serve reads from
+    // the previous file.
+    positionedReader_.close();
+    file_ = detail::openFilePortable(filename, mode);
     if (file_ == NULL) {
       std::stringstream err;
       err << "! ERROR opening file \"" << filename << "\" with mode \"" << mode
@@ -109,6 +122,7 @@ class File {
     if (not isOpen()) {
       return true;
     }
+    positionedReader_.close();
     if (fclose(file_) != 0) {
       std::cout << "! ERROR closing file \"" << name_ << "\" ("
                 << strerror(errno) << ")" << std::endl;
@@ -160,8 +174,8 @@ class File {
     auto* to = static_cast<uint8_t*>(targetBuffer);
     while (bytesRead < nofBytesToRead) {
       size_t toRead = nofBytesToRead - bytesRead;
-
-      const ssize_t ret = pread(fd, to + bytesRead, toRead, offset + bytesRead);
+      const ssize_t ret = positionedReader_.readAtOffset(
+          fd, name_, to + bytesRead, toRead, offset + bytesRead);
 
       if (ret < 0) {
         return ret;
@@ -221,6 +235,11 @@ inline void deleteFile(const std::filesystem::path& path,
 namespace detail {
 template <typename Stream, bool forWriting>
 Stream makeFilestream(const std::filesystem::path& path, auto&&... args) {
+  // Let the platform prepare `path` for a truncating rewrite (a no-op on
+  // POSIX). See `PortableFileOpen.h`.
+  if constexpr (forWriting) {
+    prepareTruncatingRewrite(path, args...);
+  }
   Stream stream{path.string(), AD_FWD(args)...};
   std::string_view mode = forWriting ? "for writing" : "for reading";
   if (!stream.is_open()) {

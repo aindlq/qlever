@@ -15,6 +15,7 @@
 #include "util/Forward.h"
 #include "util/Iterators.h"
 #include "util/ResetWhenMoved.h"
+#include "util/sys/FileMapping.h"
 
 namespace ad_utility {
 // _________________________________________________________________________
@@ -113,9 +114,6 @@ struct MmapVectorMetaData {
 // setup / construction variants of Mmap Vector which only take a filename
 class CreateTag {};
 class ReuseTag {};
-
-// Enum that specifies access patterns to this array
-enum class AccessPattern { None, Random, Sequential };
 
 // STL-like class which implements a dynamic array (similar to std::vector)
 // whose contents are stored persistently in a file on memory and are accessed
@@ -326,6 +324,7 @@ class MmapVector {
   ResetWhenMoved<size_t, 0> _bytesize;
   std::string _filename = "";
   AccessPattern _pattern = AccessPattern::None;
+  FileMapping fileMapping_;
   static constexpr float ResizeFactor = 1.5;
 };
 
