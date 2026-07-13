@@ -163,6 +163,20 @@ enum class VectorMetric : uint8_t { Cosine, L2Sq, InnerProduct };
 // stable.)
 enum class VectorScalar : uint8_t { F32, F16, I8, Bf16, Binary };
 
+// Which per-row/block kernel to use for the exact bf16 COSINE distance of the
+// fine layer (the `vec:bf16Kernel` query knob). Purely a performance A/B dial:
+// every value computes the SAME cosine distance (to the documented ~1e-6
+// tolerance across kernels), so it never changes the result set for distinct
+// distances. `Auto` (the default) picks the fastest kernel the running CPU
+// supports; the explicit values force one, and are silently downgraded to a
+// supported one (never a hard error) when the CPU lacks the ISA:
+//   - `Amx`    the fixed width-1 AMX-BF16 tile GEMM (Sapphire Rapids+).
+//   - `Simd`   the multi-row AVX-512-BF16 `vdpbf16ps` kernel (Genoa/SPR+).
+//   - `Punned` usearch's per-pair NumKong metric (the portable fallback).
+// A no-op on any non-bf16 / non-cosine layer (those always use the punned
+// metric). NOT persisted -- a per-query serving choice only.
+enum class Bf16Kernel : uint8_t { Auto, Amx, Simd, Punned };
+
 // Bytes per stored scalar value. UNDEFINED for `Binary` (a scalar is a single
 // bit, 8 packed per byte) -- every row/byte-length computation must go through
 // `rowBytesFor` below, which handles the packed-bit case; calling this with
