@@ -50,6 +50,12 @@ namespace {
 // for sub-second cancellation latency, rare enough to not show up in profiles.
 constexpr size_t CHECK_INTERRUPT_PERIOD = 65536;
 
+// TEMPORARY DIAGNOSTIC (normally true): when false, the per-row cancellation
+// polling is compiled OUT of the hot PARALLEL scan loops (the `&&` short-circuits
+// at compile time, so even the modulo is gone) to measure its cost. Queries can
+// then NOT be interrupted mid-scan. Flip back to true before merging.
+constexpr bool VEC_SEARCH_CHECK_CANCELLATION = false;
+
 // Hard upper bound on the number of results a single search returns, regardless
 // of the user's `k` and the index size. `k` is remote and unbounded; without
 // this cap a query like `vec:k 100000000` on a 100M-vector index would drive
@@ -1293,7 +1299,8 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
         if (cancelled.load(std::memory_order_relaxed)) {
           continue;
         }
-        if (checkInterrupt && i % VEC_SEARCH_PARALLEL_CHUNK == 0) {
+        if (VEC_SEARCH_CHECK_CANCELLATION && checkInterrupt &&
+            i % VEC_SEARCH_PARALLEL_CHUNK == 0) {
           try {
             checkInterrupt();
           } catch (...) {
@@ -1382,7 +1389,8 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
         // (throwing) interrupt once per chunk, latch a flag on cancellation
         // (also noticing another worker's latch), and re-raise once AFTER the
         // region.
-        if ((row - first) % VEC_SEARCH_PARALLEL_CHUNK == 0) {
+        if (VEC_SEARCH_CHECK_CANCELLATION &&
+            (row - first) % VEC_SEARCH_PARALLEL_CHUNK == 0) {
           if (cancelled.load(std::memory_order_relaxed)) {
             break;
           }
@@ -1538,12 +1546,31 @@ struct SeqScanHint {
 // exact baseline), the coarse SCAN layer for `searchExactCoarse*` (the
 // SERVICE's candidate pass). (A template so that it can take the private
 // `VectorIndex::Impl` without naming it.)
+// Forward declaration (defined further below, in the SAME anonymous namespace
+// -- anonymous namespaces merge across blocks in a TU): the O(n)
+// counting/histogram select for an INTEGER coarse metric (the binary layer's
+// Hamming distance). `searchExactBytes` reuses it so the plain top-k coarse
+// path matches the CSLS path (both avoid the O(n log k) heap for a large k like
+// the binary rerankK).
+namespace {
+template <typename LayerT, typename RowFn>
+std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
+    const LayerT& layer, const char* queryBytes, size_t n, const RowFn& rowOf,
+    bool contiguous, float* coarseDists, size_t topM, size_t distMax,
+    const CheckInterruptCallback& checkInterrupt);
+}  // namespace
+
+// `integerDistMax`, when set, means THIS layer's metric returns an integer
+// distance in [0, integerDistMax] (the binary layer's Hamming count) -- so the
+// top-k selection uses the branchless histogram instead of the bounded heap.
+// `nullopt` (a float metric: i8/bf16/f32) keeps the heap.
 template <typename ImplT, typename LayerT>
 std::vector<ScoredEntity> searchExactBytes(
     ImplT& impl, LayerT& layer, const char* queryBytes, size_t k,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored = nullptr) {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored = nullptr,
+    std::optional<size_t> integerDistMax = std::nullopt) {
   // `numScored` (optional out-param) reports how many vectors actually had a
   // distance computed -- the WHOLE live set for a whole-index search, or just
   // the candidates that are members for a restricted one. It is NOT the raw
@@ -1564,6 +1591,33 @@ std::vector<ScoredEntity> searchExactBytes(
   }
   TopK top{k};
 
+  // Integer-metric (binary Hamming) top-k via the O(n) histogram: map its
+  // (distance, scoring-index) pairs to `ScoredEntity`. `rowOf(i)` -> store row,
+  // `idOf(i)` -> entity id bits. Ascending by (distance, index) already.
+  auto histSelect = [&](size_t n, auto&& rowOf, auto&& idOf,
+                        bool contiguous) -> std::vector<ScoredEntity> {
+    SeqScanHint hint{layer, contiguous && !layer.alignedBuf_};
+    std::unique_ptr<float[]> dists(new float[n]);
+    auto sel = coarseSweepSelectHistogram(layer, queryBytes, n, rowOf,
+                                          contiguous, dists.get(), k,
+                                          integerDistMax.value(), checkInterrupt);
+    const float maxDist =
+        maxDistance.value_or(std::numeric_limits<float>::infinity());
+    std::vector<ScoredEntity> out;
+    out.reserve(sel.size());
+    for (const auto& [dist, i] : sel) {
+      if (dist <= maxDist) {
+        out.push_back(ScoredEntity{Id::fromBits(idOf(i)), dist});
+      }
+    }
+    return out;
+  };
+  // The whole-index histogram scans every row 0..numVectors with no per-row
+  // tombstone check, so it is only correct on a tombstone-free store; the gather
+  // variant runs over `matched` (already tombstone-free) so it has no such gate.
+  const bool histWholeIndex =
+      integerDistMax.has_value() && impl.meta_.numTombstones_ == 0;
+
   if (!candidates.has_value()) {
     // Whole-index brute force: rows are visited in order, so it is sequential.
     // The distance sweep runs in parallel (per-thread heaps) above the
@@ -1577,10 +1631,15 @@ std::vector<ScoredEntity> searchExactBytes(
     AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
                 << "\": whole-index scan (" << impl.numLive() << " vectors, "
                 << numThreads << " threads)" << std::endl;
+    reportScored(impl.numLive());
+    if (histWholeIndex) {
+      return histSelect(
+          impl.meta_.numVectors_, [](size_t i) { return i; },
+          [&](size_t i) { return impl.keys_[i]; }, /*contiguous=*/true);
+    }
     SeqScanHint hint{layer, !layer.alignedBuf_};
     scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
                            checkInterrupt, numThreads);
-    reportScored(impl.numLive());
     return top.sorted();
   }
 
@@ -1610,10 +1669,15 @@ std::vector<ScoredEntity> searchExactBytes(
                   << " candidates cover all " << live
                   << " live vectors -> whole-index sweep (" << live
                   << " vectors, " << checkThreads << " threads)" << std::endl;
+      reportScored(live);
+      if (histWholeIndex) {
+        return histSelect(
+            impl.meta_.numVectors_, [](size_t i) { return i; },
+            [&](size_t i) { return impl.keys_[i]; }, /*contiguous=*/true);
+      }
       SeqScanHint hint{layer, !layer.alignedBuf_};
       scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
                              checkInterrupt, checkThreads);
-      reportScored(live);
       return top.sorted();
     }
   }
@@ -1685,10 +1749,15 @@ std::vector<ScoredEntity> searchExactBytes(
                 << " candidates cover all " << live
                 << " live vectors -> whole-index sweep (" << live
                 << " vectors, " << numThreads << " threads)" << std::endl;
+    reportScored(live);
+    if (histWholeIndex) {
+      return histSelect(
+          impl.meta_.numVectors_, [](size_t i) { return i; },
+          [&](size_t i) { return impl.keys_[i]; }, /*contiguous=*/true);
+    }
     SeqScanHint hint{layer, !layer.alignedBuf_};
     scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
                            checkInterrupt, numThreads);
-    reportScored(live);
     return top.sorted();
   }
   int gatherThreads = 1;
@@ -1702,6 +1771,13 @@ std::vector<ScoredEntity> searchExactBytes(
               << matched.size() << " of " << live
               << " live members (scattered gather, " << gatherThreads
               << " threads)" << std::endl;
+  // The members among the candidates -- the rows that actually got a distance.
+  reportScored(matched.size());
+  if (integerDistMax.has_value()) {
+    return histSelect(
+        matched.size(), [&](size_t i) { return matched[i].first; },
+        [&](size_t i) { return matched[i].second; }, /*contiguous=*/false);
+  }
   {
     SeqScanHint hint{layer, seqHint && monotonic};
     scanIntoTopK(
@@ -1711,8 +1787,6 @@ std::vector<ScoredEntity> searchExactBytes(
         },
         checkInterrupt);
   }
-  // The members among the candidates -- the rows that actually got a distance.
-  reportScored(matched.size());
   return top.sorted();
 }
 
@@ -1733,8 +1807,15 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
   }
   std::vector<char> buffer;
   const char* queryBytes = layer.encodeQuery(query, buffer);
+  // The FINE layer is binary only for a single-layer binary index (no rerank);
+  // then its Hamming distances are integers -> the histogram select applies.
+  const VectorScalar fineScalar =
+      impl.meta_.config_.rerankScalar_.value_or(impl.meta_.config_.scalar_);
+  const std::optional<size_t> integerDistMax =
+      fineScalar == VectorScalar::Binary ? std::optional<size_t>{impl.dim()}
+                                         : std::nullopt;
   return searchExactBytes(impl, layer, queryBytes, k, candidates, maxDistance,
-                          checkInterrupt, numScored);
+                          checkInterrupt, numScored, integerDistMax);
 }
 
 // ____________________________________________________________________________
@@ -1753,8 +1834,15 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarse(
   }
   std::vector<char> buffer;
   const char* queryBytes = impl.scan_.encodeQuery(query, buffer);
+  // The coarse SCAN layer's binary Hamming distances are integers -> the
+  // O(n) histogram select (matches the CSLS coarse pass; avoids the O(n log k)
+  // heap that dominated the plain top-k coarse pass at the binary rerankK=50*k).
+  const std::optional<size_t> integerDistMax =
+      impl.meta_.config_.scalar_ == VectorScalar::Binary
+          ? std::optional<size_t>{impl.dim()}
+          : std::nullopt;
   return searchExactBytes(impl, impl.scan_, queryBytes, k, candidates,
-                          maxDistance, checkInterrupt, numScored);
+                          maxDistance, checkInterrupt, numScored, integerDistMax);
 }
 
 // ____________________________________________________________________________
@@ -1947,7 +2035,8 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
       if (cancelled.load(std::memory_order_relaxed)) {
         continue;
       }
-      if (checkInterrupt && i % VEC_SEARCH_PARALLEL_CHUNK == 0) {
+      if (VEC_SEARCH_CHECK_CANCELLATION && checkInterrupt &&
+          i % VEC_SEARCH_PARALLEL_CHUNK == 0) {
         try {
           checkInterrupt();
         } catch (...) {
@@ -2008,7 +2097,8 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelect(
       const size_t first = n * tid / team;
       const size_t last = n * (tid + 1) / team;
       for (size_t i = first; i < last; ++i) {
-        if ((i - first) % VEC_SEARCH_PARALLEL_CHUNK == 0) {
+        if (VEC_SEARCH_CHECK_CANCELLATION &&
+            (i - first) % VEC_SEARCH_PARALLEL_CHUNK == 0) {
           if (cancelled.load(std::memory_order_relaxed)) {
             break;
           }
@@ -2103,7 +2193,8 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
       const size_t stride = layer.stride_;
       const char* p = layer.base() + first * stride;
       for (size_t i = first; i < last; ++i, p += stride) {
-        if ((i - first) % VEC_SEARCH_PARALLEL_CHUNK == 0 && chunkBreak(i)) {
+        if (VEC_SEARCH_CHECK_CANCELLATION &&
+            (i - first) % VEC_SEARCH_PARALLEL_CHUNK == 0 && chunkBreak(i)) {
           break;
         }
         if (compact) {
@@ -2118,7 +2209,8 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
       }
     } else {
       for (size_t i = first; i < last; ++i) {
-        if ((i - first) % VEC_SEARCH_PARALLEL_CHUNK == 0 && chunkBreak(i)) {
+        if (VEC_SEARCH_CHECK_CANCELLATION &&
+            (i - first) % VEC_SEARCH_PARALLEL_CHUNK == 0 && chunkBreak(i)) {
           break;
         }
         prefetchSweepRow(layer, rowOf, i, n, pfAhead, compact);
