@@ -50,11 +50,14 @@ namespace {
 // for sub-second cancellation latency, rare enough to not show up in profiles.
 constexpr size_t CHECK_INTERRUPT_PERIOD = 65536;
 
-// TEMPORARY DIAGNOSTIC (normally true): when false, the per-row cancellation
-// polling is compiled OUT of the hot PARALLEL scan loops (the `&&` short-circuits
-// at compile time, so even the modulo is gone) to measure its cost. Queries can
-// then NOT be interrupted mid-scan. Flip back to true before merging.
-constexpr bool VEC_SEARCH_CHECK_CANCELLATION = false;
+// Whether the hot PARALLEL scan loops poll the cancellation callback so a
+// query timeout / client abort can interrupt a scan mid-flight. Setting this to
+// `false` compiles the poll OUT (the `&&` short-circuits at compile time, so
+// even the per-row modulo is gone) -- it was measured to cost essentially
+// nothing on a whole-index sweep, so it stays enabled; the toggle only exists
+// to re-measure that. Keep `true` for any real deployment (else `-s <timeout>`
+// cannot cancel a running scan).
+constexpr bool VEC_SEARCH_CHECK_CANCELLATION = true;
 
 // Hard upper bound on the number of results a single search returns, regardless
 // of the user's `k` and the index size. `k` is remote and unbounded; without
