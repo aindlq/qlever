@@ -39,6 +39,15 @@ inline uint64_t totalPhysicalMemoryBytes() {
 // prefer for their vector loads.
 inline constexpr size_t SIMD_ALIGNMENT = 64;
 
+// Alignment for the RAM-resident (`Residency::AlignedCopy`) buffer: a 2 MiB
+// transparent-huge-page boundary. `MADV_HUGEPAGE` in THP `madvise` mode only
+// backs a region with a 2 MiB page when the faulted address is 2 MiB-aligned; a
+// 64-byte start leaves promotion to khugepaged, which in many container setups
+// never runs -- so `AnonHugePages` stays 0 and the sweep pays 4 KiB-page TLB
+// misses. Aligning the buffer start to 2 MiB makes THP map it directly at the
+// copy's fault time. (Still a multiple of `SIMD_ALIGNMENT`.)
+inline constexpr size_t HUGEPAGE_ALIGNMENT = size_t{2} * 1024 * 1024;
+
 // Smallest multiple of `alignment` that is >= `n` (alignment must be a power of
 // two). Used to pad a row's byte length up to a SIMD-friendly stride.
 inline constexpr size_t alignUp(size_t n, size_t alignment = SIMD_ALIGNMENT) {

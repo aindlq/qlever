@@ -559,18 +559,20 @@ void makeLayerResident(LayerT& layer, VectorIndex::Residency residency,
       }
       break;
     case Residency::AlignedCopy: {
-      // Copy the matrix into a 64-byte aligned RAM buffer with the NATURAL
-      // (unpadded) row stride. The buffer start is SIMD-aligned, but rows are
-      // deliberately NOT padded to 64 bytes: the NumKong kernels use
-      // unaligned loads, while padding inflates the bytes streamed by the
-      // memory-bandwidth-bound whole-index sweep (e.g. +33% for a binary
+      // Copy the matrix into a 2 MiB-aligned RAM buffer with the NATURAL
+      // (unpadded) row stride. Rows are deliberately NOT padded: the NumKong
+      // kernels use unaligned loads, while padding inflates the bytes streamed
+      // by the memory-bandwidth-bound whole-index sweep (e.g. +33% for a binary
       // 1152-dim layer, 144 -> 192 B/row -- measurably slower than even the
-      // unpadded mmap). The anonymous buffer also gets `MADV_HUGEPAGE`,
-      // which cuts the TLB-miss cost that a 4-KiB-paged file mapping pays.
+      // unpadded mmap). The anonymous buffer also gets `MADV_HUGEPAGE`; the
+      // 2 MiB start alignment (`HUGEPAGE_ALIGNMENT`) is what lets THP actually
+      // back it at fault time (a 64-byte start left `AnonHugePages` at 0 in
+      // containers where khugepaged never collapsed the interior), cutting the
+      // 4 KiB-page TLB-miss cost that throttles the sweep.
       const size_t rowBytes = layer.rowBytes_;
       const size_t n = numRows;
       void* buf = nullptr;
-      if (posix_memalign(&buf, SIMD_ALIGNMENT, n * rowBytes) != 0 ||
+      if (posix_memalign(&buf, HUGEPAGE_ALIGNMENT, n * rowBytes) != 0 ||
           buf == nullptr) {
         AD_LOG_WARN << "Vector index \"" << indexName
                     << "\": could not allocate the aligned RAM copy of the "
