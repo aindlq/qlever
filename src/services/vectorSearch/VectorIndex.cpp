@@ -172,7 +172,8 @@ struct VectorIndex::Impl {
     // fall back to the punned `metric_`.
     //
     // Signature is the NumKong dense-metric ABI `(a, b, n, &result)`; the
-    // result scalar width is u32 for the (integer) Hamming kernel.
+    // result scalar width depends on the kernel (u32 for Hamming, f32 for
+    // angular/bf16), so it is stored per-typed-invoker below.
     using RawU32Kernel = void (*)(const void*, const void*, nk_size_t,
                                   nk_u32_t*);
     RawU32Kernel rawHammingKernel_ = nullptr;
@@ -181,6 +182,21 @@ struct VectorIndex::Impl {
     // passes (`index_plugins.hpp`: `metric_third_arg_ = dimensions_` for
     // b1x8). Only meaningful when `rawHammingKernel_ != nullptr`.
     nk_size_t rawKernelThirdArg_ = 0;
+
+    // P2: batched bf16 cosine path. Present iff this is a bf16 layer with a
+    // Cosine metric AND the running CPU has the AMX (sapphireamx) batched
+    // GEMM -- the ONLY batched backend measured faster than the per-row kernel
+    // at the width=1 query shape (the AVX-512-BF16 GEMM regresses; verified).
+    // When set, the fine sweeps compute a whole BLOCK of cosine distances with
+    // one `nk_dots_packed_bf16` (query x contiguous rows) plus a per-row norm
+    // finalize, instead of one `nk_angular_bf16` call per row. `nullptr`
+    // packed buffer -> not eligible -> callers use the per-row path.
+    bool batchedCosineBf16_ = false;
+    // One `1 / sqrt(sumsq(row))` per row (`numVectors` entries), computed in
+    // one parallel pass at open (~2 B/dim, e.g. 8.6 MB at 2.14M rows). Lets
+    // the batched finalize turn a raw dot product into a cosine distance
+    // without re-reading the (bf16) row. Empty unless `batchedCosineBf16_`.
+    std::vector<float> invNorms_;
 #endif
 
     // Base pointer of the active matrix: the aligned RAM copy if present,
@@ -214,9 +230,25 @@ struct VectorIndex::Impl {
       return raw;
     }
 
-    // Distance between two (encoded, `rowBytes_`-sized) vectors, using the
-    // (punned) layer metric so that exact and HNSW distances are identical.
+    // Distance between two (encoded, `rowBytes_`-sized) vectors.
+    //
+    // For the bf16 cosine fine layer with the batched path enabled (P2), this
+    // uses the SAME dot-product-plus-norm-sidecar cosine as the batched block
+    // sweep, so every exact bf16 distance -- whole-index sweep, CSLS sweep,
+    // rerank batch, and the single-pair `vec:distance` API -- agrees on any
+    // given pair to the bit. It differs from usearch's internal (HNSW) metric
+    // by at most ~1e-6 (the batched kernel rounds the norm terms differently);
+    // that tolerance is accepted (`vec:distance` is the exact baseline, the
+    // HNSW graph only pre-selects candidates that are then re-scored exactly).
+    // Every other layer/metric uses the (punned) usearch metric directly, so
+    // exact and HNSW distances stay identical there.
     float distanceBetweenBytes(const char* a, const char* b) const {
+#if USEARCH_USE_NUMKONG
+      if (batchedCosineBf16_) {
+        return cosineBf16(a, b, queryInvNormBf16(a, dim_),
+                          queryInvNormBf16(b, dim_));
+      }
+#endif
       return static_cast<float>(
           metric_.value()(reinterpret_cast<const uu::byte_t*>(a),
                           reinterpret_cast<const uu::byte_t*>(b)));
@@ -224,6 +256,11 @@ struct VectorIndex::Impl {
 
     // Distance between an (encoded) query and row `i`.
     float distanceToRow(const char* queryBytes, size_t i) const {
+#if USEARCH_USE_NUMKONG
+      if (batchedCosineBf16_) {
+        return cosineToRowBf16(queryBytes, i, queryInvNormBf16(queryBytes, dim_));
+      }
+#endif
       return distanceBetweenBytes(queryBytes, rowPtr(i));
     }
 
@@ -236,6 +273,94 @@ struct VectorIndex::Impl {
       nk_u32_t r;
       rawHammingKernel_(queryBytes, b, rawKernelThirdArg_, &r);
       return static_cast<uint32_t>(r);
+    }
+
+    // P2: `sumsq(row)` over a bf16-encoded vector -- each bf16 is the high 16
+    // bits of an f32, so decode by `<< 16` and accumulate the squares in f32.
+    // Used to build the norm sidecar and the per-query reciprocal norm; kept
+    // dependency-free (no NumKong internal helper) and deterministic.
+    static float sumsqBf16(const char* bf16, size_t dim) {
+      const auto* h = reinterpret_cast<const uint16_t*>(bf16);
+      float sumsq = 0.0f;
+      for (size_t d = 0; d < dim; ++d) {
+        const uint32_t bits = static_cast<uint32_t>(h[d]) << 16;
+        float v;
+        std::memcpy(&v, &bits, sizeof(v));
+        sumsq += v * v;
+      }
+      return sumsq;
+    }
+
+    // P2: the reciprocal query norm `1 / sqrt(sumsq(query))` for the batched
+    // bf16 cosine finalize. `queryBf16` is the query already encoded to this
+    // layer's bf16 storage (`encodeQuery`).
+    static float queryInvNormBf16(const char* queryBf16, size_t dim) {
+      const float sumsq = sumsqBf16(queryBf16, dim);
+      // rsqrt(0) would be +inf; a zero query yields cosine distance 1 for all
+      // rows (dot is 0), matching `1 - 0` -- clamp the norm term to 0 instead
+      // of propagating inf * 0 = NaN.
+      return sumsq > 0.0f ? 1.0f / std::sqrt(sumsq) : 0.0f;
+    }
+
+    // P2: pack the bf16 query ONCE per search into the opaque NumKong GEMM
+    // layout (width=1). The caller keeps the returned buffer alive and passes
+    // `.data()` to every `cosineBlockBf16` call. Only valid when
+    // `batchedCosineBf16_` is true.
+    std::vector<char> packQueryBf16(const char* queryBf16) const {
+      std::vector<char> buf(nk_dots_packed_size_bf16(1, dim_));
+      nk_dots_pack_bf16(reinterpret_cast<const nk_bf16_t*>(queryBf16),
+                        /*width=*/1, dim_, rowBytes_, buf.data());
+      return buf;
+    }
+
+    // P2: the shared cosine-from-dot finalize -- the ONE formula every exact
+    // bf16 path uses, matching the sapphireamx angular kernel:
+    //   d = max(0, 1 - dot * invNormA * invNormB).
+    static float cosineFromDot(float dot, float invNormA, float invNormB) {
+      const float d = 1.0f - dot * invNormA * invNormB;
+      return d > 0.0f ? d : 0.0f;
+    }
+
+    // P2: cosine distance between two bf16-encoded vectors, computing both
+    // norms live (the single-pair `vec:distance` slow path -- no sidecar row).
+    float cosineBf16(const char* a, const char* b, float invNormA,
+                     float invNormB) const {
+      nk_f32_t dot;
+      nk_dot_bf16(reinterpret_cast<const nk_bf16_t*>(a),
+                  reinterpret_cast<const nk_bf16_t*>(b), dim_, &dot);
+      return cosineFromDot(static_cast<float>(dot), invNormA, invNormB);
+    }
+
+    // P2: cosine distance between a bf16 query (reciprocal norm `queryInvNorm`
+    // pre-computed once) and store row `i`, reading the row's reciprocal norm
+    // from the sidecar. The per-row fallback used by the SCATTERED (rerank
+    // gather) and non-AMX fine sweeps; bit-identical to the batched block for
+    // the same pair (same dot kernel family, same finalize).
+    float cosineToRowBf16(const char* queryBf16, size_t i,
+                          float queryInvNorm) const {
+      nk_f32_t dot;
+      nk_dot_bf16(reinterpret_cast<const nk_bf16_t*>(queryBf16),
+                  reinterpret_cast<const nk_bf16_t*>(rowPtr(i)), dim_, &dot);
+      return cosineFromDot(static_cast<float>(dot), queryInvNorm, invNorms_[i]);
+    }
+
+    // P2: cosine distances for a CONTIGUOUS block of `count` rows starting at
+    // store row `rowStart`, via one AMX batched dot product (`packedQuery`
+    // from `packQueryBf16`) plus a per-row norm finalize. `queryInvNorm` is
+    // the query's reciprocal norm (`queryInvNormBf16`), `dots` a
+    // caller-provided scratch buffer of >= `count` floats, `out[j]` receives
+    // the cosine distance of row `rowStart + j`. Only valid when
+    // `batchedCosineBf16_` is true.
+    void cosineBlockBf16(size_t rowStart, size_t count, const void* packedQuery,
+                         float queryInvNorm, float* dots, float* out) const {
+      const char* rows = base() + rowStart * stride_;
+      nk_dots_packed_bf16(reinterpret_cast<const nk_bf16_t*>(rows), packedQuery,
+                          dots, count, /*width=*/1, dim_, stride_,
+                          /*c_stride=*/sizeof(float));
+      const float* invN = invNorms_.data() + rowStart;
+      for (size_t j = 0; j < count; ++j) {
+        out[j] = cosineFromDot(dots[j], invN[j], queryInvNorm);
+      }
     }
 #endif
   };
@@ -332,16 +457,21 @@ void makeLayerResident(LayerT& layer, VectorIndex::Residency residency,
                        size_t numRows, const std::string& indexName,
                        const char* layerLabel);
 
-// Resolve the NumKong fast paths of one matrix layer at open.
+// Resolve the NumKong fast paths of one matrix layer at open (P2/P3):
 //
-//  - P3 (a layer with an integer Hamming metric, i.e. the binary SCAN layer):
-//    resolve the RAW per-pair Hamming kernel once so the hot coarse sweep can
-//    call it directly instead of through `metric_punned_t`. It is the same
-//    kernel usearch baked into the punned metric.
+//  - P3 (any layer with an integer Hamming metric, i.e. the binary SCAN
+//    layer): resolve the RAW per-pair Hamming kernel once so the hot coarse
+//    sweep can call it directly instead of through `metric_punned_t`. It is
+//    the same kernel usearch baked into the punned metric.
+//  - P2 (a bf16 fine layer with a Cosine metric, ONLY when the CPU has the
+//    AMX batched GEMM): enable the batched cosine sweep and build the per-row
+//    `1/sqrt(sumsq)` norm sidecar in one parallel pass. On a non-AMX CPU the
+//    batched GEMM at width=1 is a measured regression, so the layer keeps the
+//    per-row kernel (and the exact bf16 distance stays the usearch metric).
 //
 // A no-op without NumKong. `scalar`/`metric` are the layer's storage scalar
-// and metric; `numRows` the store row count; `numThreads` a build fan-out
-// (unused here, reserved for later fast paths).
+// and metric; `numRows` the store row count; `numThreads` the sidecar-build
+// fan-out.
 template <typename LayerT>
 void configureLayerFastPaths([[maybe_unused]] LayerT& layer,
                              [[maybe_unused]] VectorScalar scalar,
@@ -365,6 +495,22 @@ void configureLayerFastPaths([[maybe_unused]] LayerT& layer,
     // The u1 kernel's third argument is the number of BITS (== dim), not
     // bytes -- exactly what usearch passes for a b1x8 metric.
     layer.rawKernelThirdArg_ = static_cast<nk_size_t>(layer.dim_);
+  }
+
+  // P2: batched cosine for the bf16 fine layer, only with AMX.
+  if (scalar == VectorScalar::Bf16 && metric == VectorMetric::Cosine &&
+      (caps & nk_cap_sapphireamx_k) != 0) {
+    layer.batchedCosineBf16_ = true;
+    layer.invNorms_.assign(numRows, 0.0f);
+    float* invN = layer.invNorms_.data();
+    const size_t dim = layer.dim_;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(numThreads)
+#endif
+    for (size_t i = 0; i < numRows; ++i) {
+      const float sumsq = LayerT::sumsqBf16(layer.rowPtr(i), dim);
+      invN[i] = sumsq > 0.0f ? 1.0f / std::sqrt(sumsq) : 0.0f;
+    }
   }
 #endif
 }
@@ -581,14 +727,19 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
                       "rerank");
   }
 
-  // 6. Resolve the NumKong fast paths (P3 raw Hamming kernel). Done AFTER
-  //    residency so any future sidecar is built over the FINAL layer
-  //    base/stride. The scan layer of a two-layer binary index is Hamming
-  //    (`toUsearchScanMetric`); the fine layer carries the index metric.
+  // 6. Resolve the NumKong fast paths (P2 batched bf16 cosine + its norm
+  //    sidecar, P3 raw Hamming kernel). Done AFTER residency so the sidecar is
+  //    built over the FINAL layer base/stride (the aligned RAM copy when
+  //    present). The fine (rerank) layer carries the index metric; the scan
+  //    layer of a two-layer binary index is Hamming (`toUsearchScanMetric`).
   int fastPathThreads = 1;
 #ifdef _OPENMP
   fastPathThreads = std::max(1, omp_get_max_threads());
 #endif
+  // The scan layer carries the index metric UNLESS it is a binary index,
+  // whose scan layer is Hamming; but the P2 bf16-cosine branch only fires for
+  // a bf16 scalar (never binary), so passing the index metric is safe for the
+  // metric check and the P3 branch keys on the scalar alone.
   configureLayerFastPaths(impl.scan_, impl.meta_.config_.scalar_,
                           impl.meta_.config_.metric_, impl.meta_.numVectors_,
                           fastPathThreads);
@@ -1422,6 +1573,91 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
   }
 }
 
+#if USEARCH_USE_NUMKONG
+// P2: rows per AMX batched-cosine GEMM block. Sized so the block's dot output
+// (`blk` floats) plus its bf16 rows stay comfortably in L2; 512 rows at
+// 1152-dim bf16 is ~1.1 MiB of A per block, and the measured sweet spot on
+// Sapphire/Emerald Rapids was 512-2048 (all within ~5% of each other).
+constexpr size_t VEC_BF16_BATCH_ROWS = 1024;
+
+// P2: the whole-index bf16 cosine sweep via the AMX batched GEMM. Same static
+// per-thread partition, tombstone filter, and per-thread `TopK` merge as the
+// per-row `scanWholeIndexIntoTopK`, but distances come a block at a time from
+// `cosineBlockBf16`. Only called when `layer.batchedCosineBf16_` is true. The
+// query is packed ONCE into `packed` (read-only, shared across threads).
+template <typename ImplT, typename LayerT>
+void scanWholeIndexBatchedBf16(TopK& top, size_t k, ImplT& impl, LayerT& layer,
+                               const char* queryBytes, float maxDist,
+                               const CheckInterruptCallback& checkInterrupt,
+                               [[maybe_unused]] int numThreads) {
+  const size_t n = impl.meta_.numVectors_;
+  const std::vector<char> packed = layer.packQueryBf16(queryBytes);
+  const void* pq = packed.data();
+  const float qInv = LayerT::queryInvNormBf16(queryBytes, layer.dim_);
+  // Score a contiguous block [blockStart, blockStart+count) into `localTop`
+  // via one GEMM, honouring tombstones and the max-distance filter.
+  auto scoreBlock = [&](TopK& localTop, size_t blockStart, size_t count,
+                        float* dots, float* dists) {
+    layer.cosineBlockBf16(blockStart, count, pq, qInv, dots, dists);
+    for (size_t j = 0; j < count; ++j) {
+      const uint64_t id = impl.keys_[blockStart + j];
+      if (id != TOMBSTONE_KEY && dists[j] <= maxDist) {
+        localTop.offer(dists[j], id);
+      }
+    }
+  };
+#ifdef _OPENMP
+  if (numThreads > 1) {
+    std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
+    std::atomic<bool> cancelled{false};
+#pragma omp parallel num_threads(numThreads)
+    {
+      const size_t tid = static_cast<size_t>(omp_get_thread_num());
+      const size_t team = static_cast<size_t>(omp_get_num_threads());
+      TopK& localTop = locals[tid];
+      const size_t first = n * tid / team;
+      const size_t last = n * (tid + 1) / team;
+      std::vector<float> dots(VEC_BF16_BATCH_ROWS);
+      std::vector<float> dists(VEC_BF16_BATCH_ROWS);
+      for (size_t s = first; s < last; s += VEC_BF16_BATCH_ROWS) {
+        if (VEC_SEARCH_CHECK_CANCELLATION) {
+          if (cancelled.load(std::memory_order_relaxed)) {
+            break;
+          }
+          if (checkInterrupt) {
+            try {
+              checkInterrupt();
+            } catch (...) {
+              cancelled.store(true, std::memory_order_relaxed);
+              break;
+            }
+          }
+        }
+        const size_t count = std::min(VEC_BF16_BATCH_ROWS, last - s);
+        scoreBlock(localTop, s, count, dots.data(), dists.data());
+      }
+    }
+    if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+      checkInterrupt();  // re-raise outside the parallel region
+    }
+    top.mergeLocals(locals);
+    return;
+  }
+#endif
+  std::vector<float> dots(VEC_BF16_BATCH_ROWS);
+  std::vector<float> dists(VEC_BF16_BATCH_ROWS);
+  size_t sinceCheck = 0;
+  for (size_t s = 0; s < n; s += VEC_BF16_BATCH_ROWS) {
+    if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+      sinceCheck = 0;
+      checkInterrupt();
+    }
+    const size_t count = std::min(VEC_BF16_BATCH_ROWS, n - s);
+    scoreBlock(top, s, count, dots.data(), dists.data());
+  }
+}
+#endif
+
 // The dedicated WHOLE-INDEX top-k sweep (the filtered search keeps the
 // generic `scanIntoTopK` above, whose gather callback it genuinely needs).
 // Visiting ALL rows 0..numVectors in physical order lets every worker carry a
@@ -1447,6 +1683,17 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
   // Bit-identical (`dist <= +inf` keeps every row).
   const float maxDist =
       maxDistance.value_or(std::numeric_limits<float>::infinity());
+#if USEARCH_USE_NUMKONG
+  // P2: batched bf16 cosine whole-index sweep. One AMX GEMM per block of
+  // contiguous rows (query x block) instead of one angular kernel per row --
+  // keeps memory saturated at the width=1 query shape on AMX. The query is
+  // packed ONCE (shared, read-only) before the parallel region.
+  if (layer.batchedCosineBf16_) {
+    scanWholeIndexBatchedBf16(top, k, impl, layer, queryBytes, maxDist,
+                              checkInterrupt, numThreads);
+    return;
+  }
+#endif
 #ifdef _OPENMP
   if (numThreads > 1) {
     std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
@@ -2104,16 +2351,94 @@ inline void prefetchSweepRow(const LayerT& layer, const RowFn& rowOf, size_t i,
   }
 }
 
+// `contiguous`: the scoring indices map to store rows one-to-one in order
+// (`rowOf(i) == i`, the whole-index full fine sweep) -- then P2's batched bf16
+// cosine block path applies. A scattered sweep (`rowOf` is a gather, e.g. the
+// CSLS rerank batch of coarse-ranked rows) keeps the per-row path.
 template <typename LayerT, typename RowFn>
 void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
                        const RowFn& rowOf, float* dists,
-                       const CheckInterruptCallback& checkInterrupt) {
+                       const CheckInterruptCallback& checkInterrupt,
+                       [[maybe_unused]] bool contiguous = false) {
   // Prefetch tuning (see `prefetchSweepRow`): ~4 KiB lookahead for compact
   // rows, a few rows for large ones.
   const bool compact = layer.stride_ <= 256;
   const size_t pfAhead = compact ? 32 : 4;
 #ifdef _OPENMP
   const int numThreads = vectorSearchThreadCap();
+#endif
+#if USEARCH_USE_NUMKONG
+  // P2: batched bf16 cosine, only when the scoring indices ARE store rows in
+  // order. Query packed once (read-only, shared). Blocks of contiguous rows go
+  // through the AMX GEMM; `dists[s+j]` is the cosine distance of row `s + j`.
+  if (contiguous && layer.batchedCosineBf16_) {
+    const std::vector<char> packed = layer.packQueryBf16(queryBytes);
+    const void* pq = packed.data();
+    const float qInv = LayerT::queryInvNormBf16(queryBytes, layer.dim_);
+    auto block = [&](size_t s, size_t count, float* scratch) {
+      layer.cosineBlockBf16(s, count, pq, qInv, scratch, dists + s);
+    };
+#ifdef _OPENMP
+    if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+      std::atomic<bool> cancelled{false};
+#pragma omp parallel num_threads(numThreads)
+      {
+        const size_t tid = static_cast<size_t>(omp_get_thread_num());
+        const size_t team = static_cast<size_t>(omp_get_num_threads());
+        const size_t first = n * tid / team;
+        const size_t last = n * (tid + 1) / team;
+        std::vector<float> scratch(VEC_BF16_BATCH_ROWS);
+        for (size_t s = first; s < last; s += VEC_BF16_BATCH_ROWS) {
+          if (VEC_SEARCH_CHECK_CANCELLATION) {
+            if (cancelled.load(std::memory_order_relaxed)) break;
+            if (checkInterrupt) {
+              try {
+                checkInterrupt();
+              } catch (...) {
+                cancelled.store(true, std::memory_order_relaxed);
+                break;
+              }
+            }
+          }
+          block(s, std::min(VEC_BF16_BATCH_ROWS, last - s), scratch.data());
+        }
+      }
+      if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+        checkInterrupt();
+      }
+      return;
+    }
+#endif
+    std::vector<float> scratch(VEC_BF16_BATCH_ROWS);
+    size_t sinceCheck = 0;
+    for (size_t s = 0; s < n; s += VEC_BF16_BATCH_ROWS) {
+      if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+        sinceCheck = 0;
+        checkInterrupt();
+      }
+      block(s, std::min(VEC_BF16_BATCH_ROWS, n - s), scratch.data());
+    }
+    return;
+  }
+  // P2: per-row bf16 cosine (SCATTERED gather or non-AMX). Hoist the query's
+  // reciprocal norm ONCE (else `distanceToRow` recomputes it O(dim) per row)
+  // and use the sidecar per-row helper, which is bit-identical to the batched
+  // block for the same pair.
+  const bool perRowCosineBf16 = layer.batchedCosineBf16_;
+  const float qInvCosine =
+      perRowCosineBf16 ? LayerT::queryInvNormBf16(queryBytes, layer.dim_) : 0.f;
+  auto distAt = [&](size_t i) -> float {
+    if (perRowCosineBf16) {
+      return layer.cosineToRowBf16(queryBytes, rowOf(i), qInvCosine);
+    }
+    return layer.distanceToRow(queryBytes, rowOf(i));
+  };
+#else
+  auto distAt = [&](size_t i) -> float {
+    return layer.distanceToRow(queryBytes, rowOf(i));
+  };
+#endif
+#ifdef _OPENMP
   if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
     std::atomic<bool> cancelled{false};
     // schedule(static): each thread streams one contiguous block, so the
@@ -2138,7 +2463,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
         }
       }
       prefetchSweepRow(layer, rowOf, i, n, pfAhead, compact);
-      dists[i] = layer.distanceToRow(queryBytes, rowOf(i));
+      dists[i] = distAt(i);
     }
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
       checkInterrupt();  // re-raise outside the parallel region
@@ -2153,7 +2478,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
       checkInterrupt();
     }
     prefetchSweepRow(layer, rowOf, i, n, pfAhead, compact);
-    dists[i] = layer.distanceToRow(queryBytes, rowOf(i));
+    dists[i] = distAt(i);
   }
 }
 
@@ -2963,9 +3288,10 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
     std::vector<float> dists(n);
     {
       SeqScanHint hint{layer, !layer.alignedBuf_};
+      // `directWhole` -> `rowAt` is identity -> the batched bf16 path (P2).
       cslsDistanceSweep(
           layer, queryBytes, n, [&](size_t i) { return rowAt(i); },
-          dists.data(), checkInterrupt);
+          dists.data(), checkInterrupt, /*contiguous=*/directWhole);
     }
     // 3. r(q): the mean cosine similarity of the query to its top-`neighbors`
     //    nearest SCORED candidates, the exact self-match excluded.
@@ -3064,7 +3390,7 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
       SeqScanHint hint{impl.scan_, !impl.scan_.alignedBuf_};
       cslsDistanceSweep(
           impl.scan_, coarseQueryBytes, n, [&](size_t i) { return rowAt(i); },
-          coarseDists.get(), checkInterrupt);
+          coarseDists.get(), checkInterrupt, /*contiguous=*/directWhole);
     }
     keyed.resize(n);
 #ifdef _OPENMP
