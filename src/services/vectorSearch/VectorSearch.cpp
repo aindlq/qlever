@@ -243,6 +243,7 @@ std::vector<CslsScoredEntity> runCslsCut(
     if (rerankCacheHit != nullptr) *rerankCacheHit = h;
   };
   const bool fullPrecision = effectiveFullPrecision(config);
+  const qlever::vector::Bf16Kernel bf16Kernel = config.bf16Kernel_;
   // The fixed threshold (and any non-coverage cut) stays on the direct,
   // uncached path -- it is not what mode-switching re-applies.
   if (cut.mode_ != CslsCut::Mode::ZCut && cut.mode_ != CslsCut::Mode::Softmax) {
@@ -251,21 +252,26 @@ std::vector<CslsScoredEntity> runCslsCut(
                ? vidx.searchCslsByEntity(queryEntity.value(), cut, neighbors,
                                          candidates, config.maxDistance_,
                                          checkInterrupt, numScored,
-                                         fullPrecision)
+                                         fullPrecision, bf16Kernel)
                : vidx.searchCsls(query, cut, neighbors, candidates,
                                  config.maxDistance_, checkInterrupt, numScored,
-                                 fullPrecision);
+                                 fullPrecision, bf16Kernel);
   }
   // Cache key: the mode-independent rerank drivers. NOT the coverage mode,
   // signal, softmax params, cslsKCap, or maxDistance (all applied at cut time).
   // `fp=` IS part of the key: full precision changes WHICH candidates are
   // reranked (the whole fine layer vs. the coarse-preselected batch), so the
   // two modes must never share a cached reranked set.
+  // `bf16k=` IS part of the key: the kernels agree only to ~1e-6, so a cached
+  // reranked set from one kernel must not silently answer a query pinned to
+  // another -- and it keeps an A/B benchmark's timings from being polluted by
+  // cross-kernel cache hits.
   std::string key = absl::StrCat(
       "CSLS_RERANK idx=", config.indexName_, " nb=", neighbors,
       " ff=", absl::Hex(absl::bit_cast<uint32_t>(cut.floorFraction_)),
       " wf=", absl::Hex(absl::bit_cast<uint32_t>(cut.widenFraction_)),
-      " cap=", cut.rerankCap_, " fp=", fullPrecision);
+      " cap=", cut.rerankCap_, " fp=", fullPrecision,
+      " bf16k=", static_cast<int>(bf16Kernel));
   appendQueryPointToCacheKey(&key, config);
   absl::StrAppend(&key, " cand={", candidateIdentity, "}");
   auto compute = [&]() -> CslsReranked {
@@ -273,11 +279,11 @@ std::vector<CslsScoredEntity> runCslsCut(
                ? vidx.computeCslsRerankedByEntity(
                      queryEntity.value(), neighbors, cut.floorFraction_,
                      cut.widenFraction_, cut.rerankCap_, candidates,
-                     checkInterrupt, fullPrecision)
+                     checkInterrupt, fullPrecision, bf16Kernel)
                : vidx.computeCslsReranked(query, neighbors, cut.floorFraction_,
                                           cut.widenFraction_, cut.rerankCap_,
                                           candidates, checkInterrupt,
-                                          fullPrecision);
+                                          fullPrecision, bf16Kernel);
   };
   auto res =
       cslsRerankedCache().computeOnce(key, compute, /*onlyReadFromCache=*/false,
@@ -463,9 +469,12 @@ IdTable computeWholeIndexSearch(
     results = queryEntity.has_value()
                   ? vidx->searchExactByEntity(queryEntity.value(), config.k_,
                                               candidates, config.maxDistance_,
-                                              checkInterrupt)
+                                              checkInterrupt,
+                                              /*numScored=*/nullptr,
+                                              config.bf16Kernel_)
                   : vidx->searchExact(query, config.k_, candidates,
-                                      config.maxDistance_, checkInterrupt);
+                                      config.maxDistance_, checkInterrupt,
+                                      /*numScored=*/nullptr, config.bf16Kernel_);
     logVectorSearchPhase(config.indexName_, "rerank (fine layer)",
                          rerankTimer.value().count() / 1000.0,
                          candidates.size());
@@ -478,13 +487,16 @@ IdTable computeWholeIndexSearch(
                                          config.maxDistance_, checkInterrupt)
               : vidx->searchExactByEntity(queryEntity.value(), config.k_,
                                           std::nullopt, config.maxDistance_,
-                                          checkInterrupt);
+                                          checkInterrupt, /*numScored=*/nullptr,
+                                          config.bf16Kernel_);
     } else {
       results = useHnsw
                     ? vidx->searchHnsw(query, config.k_, config.maxDistance_,
                                        checkInterrupt)
                     : vidx->searchExact(query, config.k_, std::nullopt,
-                                        config.maxDistance_, checkInterrupt);
+                                        config.maxDistance_, checkInterrupt,
+                                        /*numScored=*/nullptr,
+                                        config.bf16Kernel_);
     }
     logVectorSearchPhase(
         config.indexName_,

@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -977,4 +978,144 @@ TEST(VectorRerank, parseErrors) {
       planQuery(qec, query("_:c vec:index \"embrr\" ; vec:candidates ?x ; "
                            "vec:result ?x .")),
       HasSubstr("must be different"));
+}
+
+namespace {
+// A varied bf16 fixture for the `vec:bf16Kernel` cross-check: `KERNEL_ROWS`
+// rows of `KERNEL_DIM` (a multiple of 32, so both hand-rolled kernels apply),
+// each a distinct pseudo-random unit-ish vector so the cosine distances are
+// distinct and the top-k is unambiguous.
+constexpr size_t KERNEL_DIM = 128;
+constexpr size_t KERNEL_ROWS = 500;
+
+std::vector<float> kernelRow(uint64_t seed) {
+  // splitmix64 for deterministic, well-spread components.
+  auto next = [&seed]() {
+    uint64_t z = (seed += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+  };
+  std::vector<float> v(KERNEL_DIM);
+  for (float& x : v) {
+    x = static_cast<int32_t>(next()) * (1.0f / 2147483648.0f);
+  }
+  return v;
+}
+
+std::string buildKernelFixture(std::string name, VectorScalar scan,
+                               std::optional<VectorScalar> rerank) {
+  std::string basename = uniqueTmpBasename();
+  VectorIndexConfig cfg;
+  cfg.name_ = name;
+  cfg.dimensions_ = KERNEL_DIM;
+  cfg.metric_ = VectorMetric::Cosine;
+  cfg.scalar_ = scan;
+  cfg.rerankScalar_ = rerank;
+  cfg.buildHnsw_ = false;
+  VectorIndexBuilder builder{basename, cfg};
+  for (size_t i = 0; i < KERNEL_ROWS; ++i) {
+    builder.add(mkId(100 + i), "<http://ex/" + std::to_string(i) + ">",
+                kernelRow(0x1234'0000ULL + i));
+  }
+  builder.build();
+  return basename;
+}
+}  // namespace
+
+// The `vec:bf16Kernel` selector: on this CPU (which has AMX + AVX-512-BF16, so
+// both hand-rolled kernels run) the SIMD, AMX, punned/GEMM (Auto), and the
+// per-row Punned kernels must all return the SAME exact-bf16-cosine top-k, to
+// the documented ~1e-6 tolerance -- for the whole-index full sweep, the
+// two-layer coarse+rerank scattered pass, and the CSLS full fine sweep. A pure
+// performance dial: it never changes results. Bit-identity of DISTANCES is
+// required (the finalize is shared); the entity choice at the k-boundary can
+// legitimately differ only under an exact tie, which this well-spread fixture
+// avoids.
+TEST(VectorRerank, bf16KernelSelectorAgreesAcrossKernels) {
+  using qlever::vector::Bf16Kernel;
+  const std::vector<float> query = kernelRow(0xDEAD'BEEFULL);
+  const std::array<Bf16Kernel, 4> kernels = {
+      Bf16Kernel::Auto, Bf16Kernel::Amx, Bf16Kernel::Simd, Bf16Kernel::Punned};
+  const size_t k = 25;
+
+  auto expectSameTopK = [&](const auto& ref, const auto& other,
+                            const char* what, Bf16Kernel kern) {
+    ASSERT_EQ(ref.size(), other.size()) << what << " kernel=" << int(kern);
+    for (size_t i = 0; i < ref.size(); ++i) {
+      // Distance bit-identity (shared finalize) -- and equal entities (no ties
+      // in this fixture).
+      EXPECT_NEAR(ref[i].distance_, other[i].distance_, 1e-6f)
+          << what << " kernel=" << int(kern) << " i=" << i;
+      EXPECT_EQ(ref[i].entity_, other[i].entity_)
+          << what << " kernel=" << int(kern) << " i=" << i;
+    }
+  };
+
+  // --- Single-layer bf16 index: the whole-index full fine sweep. ---
+  {
+    std::string basename =
+        buildKernelFixture("k1", VectorScalar::Bf16, std::nullopt);
+    VectorIndex idx;
+    idx.open(basename, "k1");
+    // Reference: the punned per-row metric (kernel-independent baseline).
+    auto ref = idx.searchExact(query, k, std::nullopt, std::nullopt, {},
+                               nullptr, Bf16Kernel::Punned);
+    ASSERT_EQ(ref.size(), k);
+    for (Bf16Kernel kern : kernels) {
+      auto got = idx.searchExact(query, k, std::nullopt, std::nullopt, {},
+                                 nullptr, kern);
+      expectSameTopK(ref, got, "single-layer whole-index sweep", kern);
+    }
+    // CSLS full fine sweep (single-layer): `computeCslsReranked` runs one full
+    // CONTIGUOUS fine sweep (the block kernels) and returns the fine distances
+    // in coarse order; every kernel must produce the SAME distances. (No csls
+    // sidecar needed -- the raw rerank stage, before any cut.)
+    auto refR = idx.computeCslsReranked(query, /*neighbors=*/5, /*floorF=*/0.1f,
+                                        /*widenF=*/1.0f, /*rerankCap=*/0,
+                                        std::nullopt, {}, false,
+                                        Bf16Kernel::Punned);
+    ASSERT_EQ(refR.fineDist_.size(), KERNEL_ROWS);
+    for (Bf16Kernel kern : kernels) {
+      auto gotR = idx.computeCslsReranked(query, 5, 0.1f, 1.0f, 0, std::nullopt,
+                                          {}, false, kern);
+      ASSERT_EQ(gotR.fineDist_.size(), refR.fineDist_.size())
+          << "CSLS sweep kernel=" << int(kern);
+      ASSERT_EQ(gotR.entityBits_.size(), refR.entityBits_.size());
+      for (size_t i = 0; i < refR.fineDist_.size(); ++i) {
+        EXPECT_EQ(gotR.entityBits_[i], refR.entityBits_[i])
+            << "CSLS sweep kernel=" << int(kern) << " i=" << i;
+        EXPECT_NEAR(gotR.fineDist_[i], refR.fineDist_[i], 1e-6f)
+            << "CSLS sweep kernel=" << int(kern) << " i=" << i;
+      }
+    }
+    cleanupTmp(basename, "k1");
+  }
+
+  // --- Two-layer binary+bf16 index: coarse scan + SCATTERED fine rerank. ---
+  // The coarse pass ranks the binary layer; the fine rerank scores those
+  // coarse-ranked (i.e. scattered) rows on the bf16 layer -- the SIMD-gather
+  // path. `searchExactByRows` takes the kernel and must agree across all.
+  {
+    std::string basename =
+        buildKernelFixture("k2", VectorScalar::Binary, VectorScalar::Bf16);
+    VectorIndex idx;
+    idx.open(basename, "k2");
+    // Coarse-rank a wide margin, then rerank exactly those rows on the fine
+    // layer (the production coarse+rerank shape).
+    const size_t rerankK = 200;
+    auto coarseRows =
+        idx.searchExactCoarseWithRows(query, rerankK, std::nullopt);
+    ASSERT_FALSE(coarseRows.empty());
+    ql::span<const ScoredRow> rowsSpan{coarseRows};
+    auto ref = idx.searchExactByRows(query, k, rowsSpan, std::nullopt, {},
+                                     Bf16Kernel::Punned);
+    ASSERT_EQ(ref.size(), k);
+    for (Bf16Kernel kern : kernels) {
+      auto got =
+          idx.searchExactByRows(query, k, rowsSpan, std::nullopt, {}, kern);
+      expectSameTopK(ref, got, "two-layer scattered rerank", kern);
+    }
+    cleanupTmp(basename, "k2");
+  }
 }

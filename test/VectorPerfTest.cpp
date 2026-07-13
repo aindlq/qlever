@@ -445,6 +445,98 @@ TEST(VectorPerf, DISABLED_profileLoop) {
 }
 
 // ___________________________________________________________________________
+// A/B benchmark of the `vec:bf16Kernel` selector: full-precision WHOLE-INDEX
+// fine sweep (`searchExact`) and the two-layer SCATTERED rerank of the
+// coarse-best rows (`searchExactByRows`), each measured for the SIMD, the
+// fixed-AMX, and the current (Auto = NumKong GEMM) kernels.
+//   VECTOR_PERF_THREADS  thread count (default: all physical cores)
+//   VECTOR_PERF_K        top-k (default 1000)
+//   VECTOR_PERF_RERANKK  rerank batch size for the scattered pass (default 4096)
+//   VECTOR_PERF_RESIDENCY none (default) | aligned
+TEST(VectorPerf, DISABLED_bf16KernelAbBenchmark) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  BenchSetup s = setupIndex();
+  const size_t k = envSize("VECTOR_PERF_K", 1000);
+  const size_t rerankK = envSize("VECTOR_PERF_RERANKK", 4096);
+  const bool aligned = envStr("VECTOR_PERF_RESIDENCY", "none") == "aligned";
+  const int threads = static_cast<int>(
+      envSize("VECTOR_PERF_THREADS", static_cast<size_t>(maxHwThreads())));
+  auto residency = aligned ? VectorIndex::Residency::AlignedCopy
+                           : VectorIndex::Residency::None;
+  VectorIndex idx;
+  idx.open(s.basename, "perf", residency, residency);
+  setThreads(threads);
+
+  using qlever::vector::Bf16Kernel;
+  struct KernSpec {
+    const char* name;
+    Bf16Kernel kern;
+  };
+  // `Auto` now resolves to the fixed-AMX block on this CPU (the new default),
+  // so it and `Amx` coincide here; `Punned` is the pre-change per-row baseline.
+  // (The NumKong GEMM -- the OLD `Auto` -- is no longer selectable by a flag;
+  // compare against a git-HEAD binary for that number.)
+  const KernSpec specs[] = {{"auto (=amx here)", Bf16Kernel::Auto},
+                            {"amx (fixed)", Bf16Kernel::Amx},
+                            {"simd", Bf16Kernel::Simd},
+                            {"punned (per-row)", Bf16Kernel::Punned}};
+
+  printf("\n=== vec:bf16Kernel A/B: n=%zu dim=%zu fineRow=%zuB threads=%d "
+         "k=%zu rerankK=%zu residency=%s ===\n",
+         s.n, s.dim, s.fineRowBytes(), threads, k, rerankK,
+         aligned ? "aligned" : "none");
+
+  // Cross-kernel result agreement (top-10 distances) before timing.
+  auto ref = idx.searchExact(s.query, 10, std::nullopt, std::nullopt, {},
+                             nullptr, Bf16Kernel::Punned);
+  for (const KernSpec& sp : specs) {
+    auto got = idx.searchExact(s.query, 10, std::nullopt, std::nullopt, {},
+                               nullptr, sp.kern);
+    ASSERT_EQ(got.size(), ref.size());
+    for (size_t i = 0; i < ref.size(); ++i) {
+      EXPECT_NEAR(got[i].distance_, ref[i].distance_, 1e-6f)
+          << sp.name << " i=" << i;
+    }
+  }
+  printf("[agreement] all kernels match the punned top-10 to 1e-6\n");
+
+  // (1) FULL-PRECISION whole-index fine sweep.
+  printf("\n--- full-precision whole-index fine sweep (searchExact) ---\n");
+  for (const KernSpec& sp : specs) {
+    // Warm up.
+    (void)idx.searchExact(s.query, k, std::nullopt, std::nullopt, {}, nullptr,
+                          sp.kern);
+    auto [mn, md] = timeReps(s.reps, [&] {
+      (void)idx.searchExact(s.query, k, std::nullopt, std::nullopt, {}, nullptr,
+                            sp.kern);
+    });
+    char label[80];
+    snprintf(label, sizeof label, "full-scan  %-20s", sp.name);
+    report(label, s.n, s.fineRowBytes(), mn, md);
+  }
+
+  // (2) SCATTERED rerank: coarse-rank rerankK rows, then rerank them on the
+  //     fine bf16 layer via each kernel (the multi-row SIMD gather).
+  printf("\n--- scattered rerank of %zu coarse-best rows (searchExactByRows) "
+         "---\n",
+         rerankK);
+  auto coarseRows = idx.searchExactCoarseWithRows(s.query, rerankK);
+  ql::span<const qlever::vector::ScoredRow> rowsSpan{coarseRows};
+  for (const KernSpec& sp : specs) {
+    (void)idx.searchExactByRows(s.query, k, rowsSpan, std::nullopt, {},
+                                sp.kern);
+    auto [mn, md] = timeReps(s.reps, [&] {
+      (void)idx.searchExactByRows(s.query, k, rowsSpan, std::nullopt, {},
+                                  sp.kern);
+    });
+    char label[80];
+    snprintf(label, sizeof label, "rerank     %-20s", sp.name);
+    // Report GB/s over the reranked bytes (rerankK rows, not the whole index).
+    report(label, coarseRows.size(), s.fineRowBytes(), mn, md);
+  }
+}
+
+// ___________________________________________________________________________
 // Round-2 benchmark: the CSLS coarse sweep, the softmax cut, the large-rerank
 // gather, and -- the key puzzle -- the covering fast path with a candidate
 // span that is a large SUPERSET of the live set (extras = non-members), which

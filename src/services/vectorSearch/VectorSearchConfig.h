@@ -176,6 +176,15 @@ struct VectorSearchConfiguration {
   // coarse-scan-then-rerank. A no-op on single-layer indices. The server-wide
   // env `QLEVER_VECTOR_SEARCH_FULL_PRECISION` forces it on for every query.
   bool fullPrecision_ = false;
+
+  // `vec:bf16Kernel "simd"|"amx"` (default `Auto`): which exact-bf16-cosine
+  // kernel the fine layer uses -- a pure performance A/B dial (identical
+  // results to ~1e-6 across kernels). `Auto` picks the CPU's fastest; an
+  // explicit value the CPU can't run is silently downgraded, never an error.
+  // Applies to BOTH the full-precision whole-index sweep and the
+  // coarse+rerank fine pass (and the single-pair `vec:distance`). A no-op on
+  // any non-bf16/non-cosine layer. Not persisted.
+  Bf16Kernel bf16Kernel_ = Bf16Kernel::Auto;
 };
 
 }  // namespace qlever::vector

@@ -299,6 +299,31 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
           "the full-precision fine layer (e.g. bf16) exhaustively -- no coarse "
           "preselection or rerank."};
     }
+  } else if (pred == "bf16Kernel") {
+    // Which exact-bf16-cosine kernel the fine layer uses -- a performance A/B
+    // dial (identical results to ~1e-6 across kernels). A string literal
+    // (`"simd"`/`"amx"`/`"auto"`/`"punned"`); unset = `Auto`.
+    if (!object.isLiteral()) {
+      throw VectorSearchException{
+          "The parameter `<bf16Kernel>` expects a string "
+          "(`\"simd\"`, `\"amx\"`, `\"auto\"`, or `\"punned\"`)."};
+    }
+    std::string v{asStringViewUnsafe(object.getLiteral().getContent())};
+    if (v == "auto") {
+      bf16Kernel_ = qlever::vector::Bf16Kernel::Auto;
+    } else if (v == "amx") {
+      bf16Kernel_ = qlever::vector::Bf16Kernel::Amx;
+    } else if (v == "simd") {
+      bf16Kernel_ = qlever::vector::Bf16Kernel::Simd;
+    } else if (v == "punned") {
+      bf16Kernel_ = qlever::vector::Bf16Kernel::Punned;
+    } else {
+      throw VectorSearchException{absl::StrCat(
+          "Unknown `<bf16Kernel>` value `", v,
+          "`; expected `\"simd\"`, `\"amx\"`, `\"auto\"`, or `\"punned\"`. "
+          "This is a performance A/B dial (identical results across kernels); "
+          "an explicit kernel the CPU cannot run is silently downgraded.")};
+    }
   } else {
     throw VectorSearchException{absl::StrCat(
         "Unsupported parameter `<", pred,
@@ -309,7 +334,7 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
         "`<numNearestNeighbors>`), `<rerankK>`, `<maxDistance>`, "
         "`<cslsThreshold>`, `<cslsNeighbors>`, `<autoCut>`, `<cutSignal>`, "
         "`<softmaxTemperature>`, `<softmaxN>`, `<algorithm>`, "
-        "`<fullPrecision>`.")};
+        "`<fullPrecision>`, `<bf16Kernel>`.")};
   }
 }
 
@@ -503,6 +528,7 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   config.cslsKCap_ = hasCslsCut && k_.has_value() ? k_ : std::nullopt;
   config.algorithm_ = algo_;
   config.fullPrecision_ = fullPrecision_;
+  config.bf16Kernel_ = bf16Kernel_;
   return config;
 }
 

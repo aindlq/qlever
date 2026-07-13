@@ -540,9 +540,10 @@ void VectorSearchJoin::computePreFilterRows(
         queryEntity.has_value()
             ? vidx.searchExactByRowsByEntity(queryEntity.value(), effectiveK,
                                              prunedRows, config_.maxDistance_,
-                                             checkInterrupt)
+                                             checkInterrupt, config_.bf16Kernel_)
             : vidx.searchExactByRows(query, effectiveK, prunedRows,
-                                     config_.maxDistance_, checkInterrupt);
+                                     config_.maxDistance_, checkInterrupt,
+                                     config_.bf16Kernel_);
     qlever::vector::logVectorSearchPhase(
         config_.indexName_, "rerank (fine layer)",
         rerankTimer.value().count() / 1000.0, coarse.size());
@@ -552,10 +553,11 @@ void VectorSearchJoin::computePreFilterRows(
     scored = queryEntity.has_value()
                  ? vidx.searchExactByEntity(queryEntity.value(), effectiveK,
                                             candidates, config_.maxDistance_,
-                                            checkInterrupt, &numScored)
+                                            checkInterrupt, &numScored,
+                                            config_.bf16Kernel_)
                  : vidx.searchExact(query, effectiveK, candidates,
                                     config_.maxDistance_, checkInterrupt,
-                                    &numScored);
+                                    &numScored, config_.bf16Kernel_);
     // Members actually scored, not the raw candidate count (see above).
     // When the index HAS a rerank layer but we reached this branch, it is
     // because `vec:fullPrecision` forced the coarse layer to be skipped.

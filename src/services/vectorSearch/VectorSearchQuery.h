@@ -116,6 +116,9 @@ struct VectorSearchQuery : MagicServiceQuery {
       qlever::vector::VectorSearchConfiguration::Algorithm::Automatic;
   // `vec:fullPrecision true` -> exhaustive fine-layer scan, no coarse/rerank.
   bool fullPrecision_ = false;
+  // `vec:bf16Kernel "simd"|"amx"` -> which exact-bf16-cosine kernel the fine
+  // layer uses (performance A/B dial; unset = auto-pick the CPU's fastest).
+  qlever::vector::Bf16Kernel bf16Kernel_ = qlever::vector::Bf16Kernel::Auto;
 
   // Inherited from `MagicServiceQuery`.
   void addParameter(const SparqlTriple& triple) override;
