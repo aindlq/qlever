@@ -1910,7 +1910,8 @@ std::vector<ScoredEntity> searchExactBytes(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored = nullptr,
-    std::optional<size_t> integerDistMax = std::nullopt) {
+    std::optional<size_t> integerDistMax = std::nullopt,
+    std::vector<uint64_t>* outRows = nullptr) {
   // `numScored` (optional out-param) reports how many vectors actually had a
   // distance computed -- the WHOLE live set for a whole-index search, or just
   // the candidates that are members for a restricted one. It is NOT the raw
@@ -1921,19 +1922,46 @@ std::vector<ScoredEntity> searchExactBytes(
       *numScored = n;
     }
   };
+  // `outRows` (optional out-param): when non-null, receives the STORE ROW of
+  // every returned survivor, in the SAME order as the returned `ScoredEntity`
+  // vector -- the coarse-with-rows path (`searchExactCoarseWithRows`) so the
+  // fine rerank can score exactly these rows without re-deriving them from ids.
+  auto emitRows = [outRows](std::vector<uint64_t>&& rows) {
+    if (outRows != nullptr) {
+      *outRows = std::move(rows);
+    }
+  };
+  // Fill `outRows` (if requested) from the entities of a heap-sweep result
+  // that did not carry rows itself (the non-integer coarse metric): one
+  // `rowOf` lookup PER SURVIVOR (k of them, O(k log numVectors)) -- NOT the
+  // O(numVectors) whole-`.rowmap` merge-join the caller is avoiding.
+  auto emitRowsFromEntities = [&](const std::vector<ScoredEntity>& out) {
+    if (outRows == nullptr) {
+      return;
+    }
+    std::vector<uint64_t> rows;
+    rows.reserve(out.size());
+    for (const ScoredEntity& e : out) {
+      rows.push_back(static_cast<uint64_t>(impl.rowOf(e.entity_).value_or(0)));
+    }
+    emitRows(std::move(rows));
+  };
   // Clamp `k` (user-supplied, unbounded) to the live vector count AND a hard
   // maximum: it bounds the `TopK` heap and would otherwise be a remote OOM
   // lever.
   k = std::min({k, impl.numLive(), MAX_SEARCH_RESULTS});
   if (k == 0) {
     reportScored(0);
+    emitRows({});
     return {};
   }
   TopK top{k};
 
   // Integer-metric (binary Hamming) top-k via the O(n) histogram: map its
   // (distance, scoring-index) pairs to `ScoredEntity`. `rowOf(i)` -> store row,
-  // `idOf(i)` -> entity id bits. Ascending by (distance, index) already.
+  // `idOf(i)` -> entity id bits. Ascending by (distance, index) already. When
+  // `outRows` was requested it is ALSO filled from `rowOf(i)` -- free here,
+  // the histogram already resolved the row.
   auto histSelect = [&](size_t n, auto&& rowOf, auto&& idOf,
                         bool contiguous) -> std::vector<ScoredEntity> {
     SeqScanHint hint{layer, contiguous && !layer.alignedBuf_};
@@ -1945,11 +1973,19 @@ std::vector<ScoredEntity> searchExactBytes(
         maxDistance.value_or(std::numeric_limits<float>::infinity());
     std::vector<ScoredEntity> out;
     out.reserve(sel.size());
+    std::vector<uint64_t> rows;
+    if (outRows != nullptr) {
+      rows.reserve(sel.size());
+    }
     for (const auto& [dist, i] : sel) {
       if (dist <= maxDist) {
         out.push_back(ScoredEntity{Id::fromBits(idOf(i)), dist});
+        if (outRows != nullptr) {
+          rows.push_back(static_cast<uint64_t>(rowOf(i)));
+        }
       }
     }
+    emitRows(std::move(rows));
     return out;
   };
   // The whole-index histogram scans every row 0..numVectors with no per-row
@@ -1980,7 +2016,9 @@ std::vector<ScoredEntity> searchExactBytes(
     SeqScanHint hint{layer, !layer.alignedBuf_};
     scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
                            checkInterrupt, numThreads);
-    return top.sorted();
+    auto out = top.sorted();
+    emitRowsFromEntities(out);
+    return out;
   }
 
   const size_t live = impl.numLive();
@@ -2018,7 +2056,9 @@ std::vector<ScoredEntity> searchExactBytes(
       SeqScanHint hint{layer, !layer.alignedBuf_};
       scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
                              checkInterrupt, checkThreads);
-      return top.sorted();
+      auto out = top.sorted();
+      emitRowsFromEntities(out);
+      return out;
     }
   }
 
@@ -2098,7 +2138,9 @@ std::vector<ScoredEntity> searchExactBytes(
     SeqScanHint hint{layer, !layer.alignedBuf_};
     scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
                            checkInterrupt, numThreads);
-    return top.sorted();
+    auto out = top.sorted();
+    emitRowsFromEntities(out);
+    return out;
   }
   int gatherThreads = 1;
 #ifdef _OPENMP
@@ -2127,7 +2169,9 @@ std::vector<ScoredEntity> searchExactBytes(
         },
         checkInterrupt);
   }
-  return top.sorted();
+  auto out = top.sorted();
+  emitRowsFromEntities(out);
+  return out;
 }
 
 // ____________________________________________________________________________
@@ -2186,6 +2230,120 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarse(
 }
 
 // ____________________________________________________________________________
+std::vector<ScoredRow> VectorIndex::searchExactCoarseWithRows(
+    ql::span<const float> query, size_t k,
+    std::optional<ql::span<const Id>> candidates,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+  auto& impl = *impl_;
+  if (query.size() != impl.dim()) {
+    AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
+             ", but vector index \"" + impl.meta_.config_.name_ +
+             "\" has dimension " + std::to_string(impl.dim()) + ".");
+  }
+  std::vector<char> buffer;
+  const char* queryBytes = impl.scan_.encodeQuery(query, buffer);
+  const std::optional<size_t> integerDistMax =
+      impl.meta_.config_.scalar_ == VectorScalar::Binary
+          ? std::optional<size_t>{impl.dim()}
+          : std::nullopt;
+  // Run the identical coarse pass as `searchExactCoarse`, but capture the
+  // survivors' store rows (`outRows`) so the fine rerank need not re-derive
+  // them (see `ScoredRow` / `searchExactByRows`).
+  std::vector<uint64_t> rows;
+  auto scored = searchExactBytes(impl, impl.scan_, queryBytes, k, candidates,
+                                 maxDistance, checkInterrupt, numScored,
+                                 integerDistMax, &rows);
+  // `outRows` is filled in lock-step with `scored`, so the two align 1:1.
+  AD_CORRECTNESS_CHECK(rows.size() == scored.size());
+  std::vector<ScoredRow> out;
+  out.reserve(scored.size());
+  for (size_t i = 0; i < scored.size(); ++i) {
+    out.push_back(ScoredRow{scored[i].entity_, rows[i], scored[i].distance_});
+  }
+  return out;
+}
+
+namespace {
+// Core of `searchExactByRows`: score the `rows` (store-row + id survivors of
+// the coarse pass) on `layer` against the encoded `queryBytes`, returning the
+// top-`k` ascending by distance. `k` is already clamped by the caller.
+template <typename LayerT>
+std::vector<ScoredEntity> searchExactByRowsBytes(
+    LayerT& layer, const char* queryBytes, size_t k,
+    ql::span<const ScoredRow> rows, std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt) {
+  // The rows already ARE the store rows of the coarse survivors (from
+  // `searchExactCoarseWithRows`) -- no candidate-id copy/sort and no
+  // O(numVectors) `.rowmap` merge-join. Sort a local copy of the (row, id)
+  // pairs by row so the scattered gather reads the fine store in ascending
+  // physical order (the sequential-scan hint; a no-op under aligned residency).
+  // Sorting a small (<= rerankK) set is negligible next to the join it avoids.
+  std::vector<std::pair<size_t, uint64_t>> rowIds;
+  rowIds.reserve(rows.size());
+  for (const ScoredRow& r : rows) {
+    rowIds.emplace_back(static_cast<size_t>(r.row_), r.entity_.getBits());
+  }
+  std::sort(rowIds.begin(), rowIds.end());
+  const bool seqHint = !layer.alignedBuf_;
+  TopK top{k};
+  {
+    SeqScanHint hint{layer, seqHint};
+    scanIntoTopK(
+        top, k, rowIds.size(), layer, queryBytes, maxDistance,
+        [&](size_t i) -> std::optional<std::pair<size_t, uint64_t>> {
+          return rowIds[i];
+        },
+        checkInterrupt);
+  }
+  return top.sorted();
+}
+}  // namespace
+
+// ____________________________________________________________________________
+std::vector<ScoredEntity> VectorIndex::searchExactByRows(
+    ql::span<const float> query, size_t k, ql::span<const ScoredRow> rows,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt) const {
+  auto& impl = *impl_;
+  auto& layer = impl.fine();
+  if (query.size() != impl.dim()) {
+    AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
+             ", but vector index \"" + impl.meta_.config_.name_ +
+             "\" has dimension " + std::to_string(impl.dim()) + ".");
+  }
+  k = std::min({k, rows.size(), MAX_SEARCH_RESULTS});
+  if (k == 0) {
+    return {};
+  }
+  std::vector<char> buffer;
+  const char* queryBytes = layer.encodeQuery(query, buffer);
+  return searchExactByRowsBytes(layer, queryBytes, k, rows, maxDistance,
+                                checkInterrupt);
+}
+
+// ____________________________________________________________________________
+std::vector<ScoredEntity> VectorIndex::searchExactByRowsByEntity(
+    Id entity, size_t k, ql::span<const ScoredRow> rows,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt) const {
+  auto& impl = *impl_;
+  auto& layer = impl.fine();
+  auto row = impl.rowOf(entity);
+  if (!row.has_value()) {
+    return {};
+  }
+  k = std::min({k, rows.size(), MAX_SEARCH_RESULTS});
+  if (k == 0) {
+    return {};
+  }
+  // The query point is the entity's own FINE-layer bytes (no f32 round trip),
+  // exactly as `searchExactByEntity` uses them.
+  return searchExactByRowsBytes(layer, layer.rowPtr(row.value()), k, rows,
+                                maxDistance, checkInterrupt);
+}
+
+// ____________________________________________________________________________
 std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
@@ -2216,6 +2374,31 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarseByEntity(
   }
   return searchExactBytes(impl, impl.scan_, impl.scan_.rowPtr(row.value()), k,
                           candidates, maxDistance, checkInterrupt, numScored);
+}
+
+// ____________________________________________________________________________
+std::vector<ScoredRow> VectorIndex::searchExactCoarseByEntityWithRows(
+    Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+  auto& impl = *impl_;
+  auto row = impl.rowOf(entity);
+  if (!row.has_value()) {
+    return {};
+  }
+  // Same coarse-by-entity pass as `searchExactCoarseByEntity`, capturing the
+  // survivors' store rows (`outRows`) for the fine rerank.
+  std::vector<uint64_t> rows;
+  auto scored = searchExactBytes(
+      impl, impl.scan_, impl.scan_.rowPtr(row.value()), k, candidates,
+      maxDistance, checkInterrupt, numScored, std::nullopt, &rows);
+  AD_CORRECTNESS_CHECK(rows.size() == scored.size());
+  std::vector<ScoredRow> out;
+  out.reserve(scored.size());
+  for (size_t i = 0; i < scored.size(); ++i) {
+    out.push_back(ScoredRow{scored[i].entity_, rows[i], scored[i].distance_});
+  }
+  return out;
 }
 
 // ____________________________________________________________________________

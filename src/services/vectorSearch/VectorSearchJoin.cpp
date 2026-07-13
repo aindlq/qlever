@@ -511,36 +511,41 @@ void VectorSearchJoin::computePreFilterRows(
                  effectiveK);
     ad_utility::Timer coarseTimer{ad_utility::Timer::Started};
     size_t coarseScored = 0;
+    // The coarse pass returns each survivor's STORE ROW (`ScoredRow`) so the
+    // fine rerank below can score exactly those rows without a second
+    // O(numVectors) `.rowmap` merge-join to recover them from the entity ids.
     auto coarse =
         queryEntity.has_value()
-            ? vidx.searchExactCoarseByEntity(queryEntity.value(), rerankK,
-                                             candidates, std::nullopt,
-                                             checkInterrupt, &coarseScored)
-            : vidx.searchExactCoarse(query, rerankK, candidates, std::nullopt,
-                                     checkInterrupt, &coarseScored);
+            ? vidx.searchExactCoarseByEntityWithRows(queryEntity.value(),
+                                                     rerankK, candidates,
+                                                     std::nullopt,
+                                                     checkInterrupt,
+                                                     &coarseScored)
+            : vidx.searchExactCoarseWithRows(query, rerankK, candidates,
+                                             std::nullopt, checkInterrupt,
+                                             &coarseScored);
     // `coarseScored` = candidates that HAVE a vector (were actually scored),
     // not the raw candidate count -- the merge-join skips the vectorless ones.
     qlever::vector::logVectorSearchPhase(
         config_.indexName_, "brute-force scan (coarse layer, index members)",
         coarseTimer.value().count() / 1000.0, coarseScored);
-    std::vector<Id> pruned;
-    pruned.reserve(coarse.size());
-    for (const auto& hit : coarse) {
-      pruned.push_back(hit.entity_);
-      if (withCoarseScore) {
+    if (withCoarseScore) {
+      for (const auto& hit : coarse) {
         coarseDistances[hit.entity_] = hit.distance_;
       }
     }
     ad_utility::Timer rerankTimer{ad_utility::Timer::Started};
+    ql::span<const qlever::vector::ScoredRow> prunedRows{coarse};
     scored =
         queryEntity.has_value()
-            ? vidx.searchExactByEntity(queryEntity.value(), effectiveK, pruned,
-                                       config_.maxDistance_, checkInterrupt)
-            : vidx.searchExact(query, effectiveK, pruned, config_.maxDistance_,
-                               checkInterrupt);
+            ? vidx.searchExactByRowsByEntity(queryEntity.value(), effectiveK,
+                                             prunedRows, config_.maxDistance_,
+                                             checkInterrupt)
+            : vidx.searchExactByRows(query, effectiveK, prunedRows,
+                                     config_.maxDistance_, checkInterrupt);
     qlever::vector::logVectorSearchPhase(
         config_.indexName_, "rerank (fine layer)",
-        rerankTimer.value().count() / 1000.0, pruned.size());
+        rerankTimer.value().count() / 1000.0, coarse.size());
   } else {
     ad_utility::Timer scanTimer{ad_utility::Timer::Started};
     size_t numScored = 0;

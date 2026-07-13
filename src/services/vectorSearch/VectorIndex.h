@@ -41,6 +41,18 @@ struct ScoredEntity {
   float distance_;
 };
 
+// A `ScoredEntity` that ALSO carries the survivor's store ROW. Returned by the
+// coarse pass (`searchExactCoarseWithRows`) so the SERVICE's fine rerank can
+// score exactly these rows (`searchExactByRows`) WITHOUT re-deriving them from
+// the entity ids -- the coarse pass already computed the rows, and recovering
+// them via a second merge-join against the whole `.rowmap` was the fixed
+// O(numVectors) cost that dominated the rerank.
+struct ScoredRow {
+  Id entity_;
+  uint64_t row_;
+  float distance_;
+};
+
 // One survivor of a CSLS-filtered search (`searchCsls*`): the entity, its
 // COSINE DISTANCE to the query (what `vec:bindScore` binds and what results
 // sort by -- CSLS is the cut, not the score), and its CSLS value
@@ -434,11 +446,37 @@ class VectorIndex {
       const CheckInterruptCallback& checkInterrupt = {},
       size_t* numScored = nullptr) const;
 
+  // The fine pass of the two-layer rerank over a set of survivors whose store
+  // ROWS are already known (from `searchExactCoarseWithRows`): score exactly
+  // those `rows` on the FINE layer and return the top-`k` ascending by
+  // distance. This skips the candidate-id copy/sort and the O(numVectors)
+  // `.rowmap` merge-join that `searchExact(query, k, <ids>)` pays to recover
+  // rows the coarse pass had already computed. `rows` need not be sorted (the
+  // top-k over a fixed set is order-independent for distinct distances);
+  // duplicate rows are scored once each but that never changes the top-k.
+  // `maxDistance`, if set, drops everything farther than it.
+  std::vector<ScoredEntity> searchExactByRows(
+      ql::span<const float> query, size_t k, ql::span<const ScoredRow> rows,
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {}) const;
+
   // The same exact brute-force search on the COARSE scan matrix (identical to
   // `searchExact` on a single-layer index). This is the SERVICE's coarse
   // candidate pass of a two-layer index: cheap quantized bytes, results to be
   // re-scored on the fine layer.
   std::vector<ScoredEntity> searchExactCoarse(
+      ql::span<const float> query, size_t k,
+      std::optional<ql::span<const Id>> candidates = std::nullopt,
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {},
+      size_t* numScored = nullptr) const;
+
+  // Exactly `searchExactCoarse`, but each survivor ALSO carries its store row
+  // (`ScoredRow`). This is the coarse half of the two-layer rerank: the
+  // SERVICE feeds the returned rows straight to `searchExactByRows` for the
+  // fine pass, so the row does not have to be re-derived from the entity id.
+  // Results are ascending by (coarse) distance; at most `k` entries.
+  std::vector<ScoredRow> searchExactCoarseWithRows(
       ql::span<const float> query, size_t k,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
@@ -472,6 +510,20 @@ class VectorIndex {
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
       size_t* numScored = nullptr) const;
+
+  // The by-entity coarse-with-rows / rerank-by-rows pair, mirroring
+  // `searchExactCoarseWithRows` / `searchExactByRows` for a STORED entity as
+  // the query point (the `vec:query <iri>` rerank flow).
+  std::vector<ScoredRow> searchExactCoarseByEntityWithRows(
+      Id entity, size_t k,
+      std::optional<ql::span<const Id>> candidates = std::nullopt,
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {},
+      size_t* numScored = nullptr) const;
+  std::vector<ScoredEntity> searchExactByRowsByEntity(
+      Id entity, size_t k, ql::span<const ScoredRow> rows,
+      std::optional<float> maxDistance = std::nullopt,
+      const CheckInterruptCallback& checkInterrupt = {}) const;
   std::vector<ScoredEntity> searchHnswByEntity(
       Id entity, size_t k, std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
