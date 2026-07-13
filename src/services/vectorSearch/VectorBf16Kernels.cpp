@@ -7,7 +7,10 @@
 
 #include "services/vectorSearch/VectorBf16Kernels.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -117,13 +120,41 @@ dotOneSimd_(const uint16_t* q, const uint16_t* r, size_t dim) {
   return _mm512_reduce_add_ps(acc);
 }
 
+// A/B off-switch for the contiguous-sweep software prefetch below. Default ON
+// (measured net win where memory bandwidth exceeds what the compute-laden loop
+// pulls on its own; neutral where it doesn't). Set QLEVER_VECTOR_SEARCH_PREFETCH
+// to 0/false/off/no to disable. Memoized -- one env read per process.
+namespace {
+bool simdPrefetchEnabled_() {
+  static const bool on = [] {
+    const char* v = std::getenv("QLEVER_VECTOR_SEARCH_PREFETCH");
+    if (v == nullptr) return true;
+    std::string s{v};
+    for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
+    return !(s == "0" || s == "false" || s == "off" || s == "no");
+  }();
+  return on;
+}
+}  // namespace
+
 // 8 rows per iteration, 8 independent `vdpbf16ps` accumulator chains, query
 // reloaded from L1 each 64 B chunk -- the `dot8` prototype. `rowPtr(j)` yields
 // the bf16 element pointer of output row j (contiguous or gathered).
-template <typename RowPtrFn>
+//
+// `Prefetch` (the contiguous whole-index sweep only): the dot loop keeps the
+// core busy enough that the hardware prefetcher stops running far enough ahead,
+// so the sweep captures only a fraction of the DRAM bandwidth the box can
+// actually deliver -- measured: a matched-DIMM 8-channel DDR5-4400 part streams
+// at 226 GB/s (pure read) but this scan pulled only ~155 without prefetch. An
+// explicit T2 prefetch `pfBytes` ahead of each of the 8 row streams restores
+// that memory-level parallelism (+12-30% wall clock, output bit-identical).
+// OFF for the gather path (a fixed byte distance is meaningless across
+// scattered rows) and inert on a bandwidth-saturated box (it only reorders
+// demand loads that would be issued anyway; T2 keeps it out of L1).
+template <bool Prefetch, typename RowPtrFn>
 __attribute__((target("avx512bf16,avx512vl,avx512bw,avx512f"))) static void
 dotMultiSimd_(const uint16_t* q, RowPtrFn rowPtr, size_t count, size_t dim,
-              float* out) {
+              float* out, size_t pfBytes) {
   size_t j = 0;
   for (; j + 8 <= count; j += 8) {
     const uint16_t* r0 = rowPtr(j + 0);
@@ -139,6 +170,18 @@ dotMultiSimd_(const uint16_t* q, RowPtrFn rowPtr, size_t count, size_t dim,
     for (size_t c = 0; c < dim; c += 32) {
       __m512bh qv = reinterpret_cast<__m512bh>(
           _mm512_loadu_si512(reinterpret_cast<const void*>(q + c)));
+      if constexpr (Prefetch) {
+        // One prefetch per consumed 64 B line, each row's own stream pfBytes
+        // ahead (contiguous rows -> this reaches into the following blocks).
+        _mm_prefetch(reinterpret_cast<const char*>(r0 + c) + pfBytes, _MM_HINT_T2);
+        _mm_prefetch(reinterpret_cast<const char*>(r1 + c) + pfBytes, _MM_HINT_T2);
+        _mm_prefetch(reinterpret_cast<const char*>(r2 + c) + pfBytes, _MM_HINT_T2);
+        _mm_prefetch(reinterpret_cast<const char*>(r3 + c) + pfBytes, _MM_HINT_T2);
+        _mm_prefetch(reinterpret_cast<const char*>(r4 + c) + pfBytes, _MM_HINT_T2);
+        _mm_prefetch(reinterpret_cast<const char*>(r5 + c) + pfBytes, _MM_HINT_T2);
+        _mm_prefetch(reinterpret_cast<const char*>(r6 + c) + pfBytes, _MM_HINT_T2);
+        _mm_prefetch(reinterpret_cast<const char*>(r7 + c) + pfBytes, _MM_HINT_T2);
+      }
 #define QL_STEP(idx, acc, rp)                                              \
   acc = _mm512_dpbf16_ps(acc, qv,                                         \
                          reinterpret_cast<__m512bh>(_mm512_loadu_si512(   \
@@ -169,24 +212,28 @@ dotMultiSimd_(const uint16_t* q, RowPtrFn rowPtr, size_t count, size_t dim,
 
 void dotBlockSimd(const uint16_t* query, const char* rows,
                   size_t rowStrideBytes, size_t count, size_t dim, float* out) {
-  dotMultiSimd_(
-      query,
-      [&](size_t j) {
-        return reinterpret_cast<const uint16_t*>(rows + j * rowStrideBytes);
-      },
-      count, dim, out);
+  auto rowPtr = [&](size_t j) {
+    return reinterpret_cast<const uint16_t*>(rows + j * rowStrideBytes);
+  };
+  // Prefetch 4 rows ahead (== the tuned ~9 KB for a 2304 B row). Two compiled
+  // variants; the memoized flag picks one -- no per-row branch.
+  if (simdPrefetchEnabled_()) {
+    dotMultiSimd_<true>(query, rowPtr, count, dim, out, 4 * rowStrideBytes);
+  } else {
+    dotMultiSimd_<false>(query, rowPtr, count, dim, out, 0);
+  }
 }
 
 void dotGatherSimd(const uint16_t* query, const char* base,
                    size_t rowStrideBytes, const size_t* rowOf, size_t count,
                    size_t dim, float* out) {
-  dotMultiSimd_(
+  dotMultiSimd_<false>(
       query,
       [&](size_t j) {
         return reinterpret_cast<const uint16_t*>(base +
                                                  rowOf[j] * rowStrideBytes);
       },
-      count, dim, out);
+      count, dim, out, 0);
 }
 
 float dotPairSimd(const uint16_t* a, const uint16_t* b, size_t dim) {
