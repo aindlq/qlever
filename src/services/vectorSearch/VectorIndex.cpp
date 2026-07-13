@@ -2266,11 +2266,22 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
   const size_t nb = distMax + 1;  // buckets 0..distMax
   const bool compact = layer.stride_ <= 256;
   const size_t pfAhead = compact ? 32 : 4;
-  // Bucket of an (exact non-negative integer) coarse distance. A plain
-  // truncating cast is exact for the Hamming popcount-as-float (no `lround`,
-  // which is a slow non-inlined call at this per-row rate); clamped
-  // defensively so a stray value can never index out of `nb`.
-  auto bucketOf = [nb](float d) -> size_t {
+  // The Hamming distance of `i`, as the EXACT non-negative integer bucket. P1
+  // keeps distances as `uint32_t` end to end (no per-row float round-trip):
+  // `coarseDists[i]` stores the popcount directly as a float only when a
+  // caller needs it (the rare widening); the bucket comes straight from the
+  // u32. `rawHamming` is the P3 kernel resolved at open -- the same Hamming
+  // usearch computes -- called directly; `nullptr` (non-NumKong build) falls
+  // back to the punned metric via `distanceBetweenBytes`.
+  auto hammingOf = [&](const char* p) -> uint32_t {
+#if USEARCH_USE_NUMKONG
+    if (layer.rawHammingKernel_ != nullptr) {
+      return layer.rawHamming(queryBytes, p);
+    }
+#endif
+    return static_cast<uint32_t>(layer.distanceBetweenBytes(queryBytes, p));
+  };
+  auto bucketOfU32 = [nb](uint32_t d) -> size_t {
     return std::min(static_cast<size_t>(d), nb - 1);
   };
   // The compute pass for a scoring-index range: Hamming distance ->
@@ -2279,26 +2290,30 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
   // row and a relative prefetch -- instead of the `rowOf` multiply + double
   // lambda call (a measurable slice at this per-row rate; the coarse compute
   // otherwise matches the plain whole-index sweep). `chunkBreak(i)`, polled
-  // once per chunk, returns true to stop (a latched cancellation).
+  // once per chunk, returns true to stop (a latched cancellation). P3: the
+  // per-row local invariants are hoisted so GCC does not reload them across
+  // the opaque kernel call.
   auto computeBins = [&](uint64_t* lh, size_t first, size_t last,
                          const auto& chunkBreak) {
+    float* out = coarseDists;
     if (contiguous) {
       const size_t stride = layer.stride_;
       const char* p = layer.base() + first * stride;
+      const bool cpt = compact;
       for (size_t i = first; i < last; ++i, p += stride) {
         if (VEC_SEARCH_CHECK_CANCELLATION &&
             (i - first) % VEC_SEARCH_PARALLEL_CHUNK == 0 && chunkBreak(i)) {
           break;
         }
-        if (compact) {
+        if (cpt) {
           const char* f = p + 4096;
           __builtin_prefetch(f, 0, 3);
           __builtin_prefetch(f + 64, 0, 3);
           __builtin_prefetch(f + 128, 0, 3);
         }
-        const float d = layer.distanceBetweenBytes(queryBytes, p);
-        coarseDists[i] = d;
-        ++lh[bucketOf(d)];
+        const uint32_t d = hammingOf(p);
+        out[i] = static_cast<float>(d);
+        ++lh[bucketOfU32(d)];
       }
     } else {
       for (size_t i = first; i < last; ++i) {
@@ -2307,19 +2322,34 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
           break;
         }
         prefetchSweepRow(layer, rowOf, i, n, pfAhead, compact);
-        const float d = layer.distanceToRow(queryBytes, rowOf(i));
-        coarseDists[i] = d;
-        ++lh[bucketOf(d)];
+        const uint32_t d = hammingOf(layer.rowPtr(rowOf(i)));
+        out[i] = static_cast<float>(d);
+        ++lh[bucketOfU32(d)];
       }
     }
   };
+  // Per-thread histograms are RETAINED into the collect phase: the
+  // counting-scatter select (P1) derives every thread's exact, non-overlapping
+  // write offset into the output from them, so no comparison sort is needed.
+  int numThreads = 1;
+#ifdef _OPENMP
+  numThreads = vectorSearchThreadCap();
+  const bool parallel = n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1;
+#else
+  const bool parallel = false;
+#endif
+  // `parallel` -> the actual OpenMP team size may be < numThreads; the compute
+  // pass records how many threads (`team`) actually partitioned the rows so
+  // the collect phase uses the same partition. 1 in the serial case.
+  size_t team = 1;
+  std::vector<std::vector<uint64_t>> localHists(
+      parallel ? static_cast<size_t>(numThreads) : size_t{1},
+      std::vector<uint64_t>(nb, 0));
   std::vector<uint64_t> hist(nb, 0);
 #ifdef _OPENMP
-  const int numThreads = vectorSearchThreadCap();
-  if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
-    std::vector<std::vector<uint64_t>> localHists(
-        static_cast<size_t>(numThreads), std::vector<uint64_t>(nb, 0));
+  if (parallel) {
     std::atomic<bool> cancelled{false};
+    std::atomic<size_t> teamSize{0};
     // An exception must never unwind out of the OpenMP region: poll the
     // (throwing) interrupt once per chunk, latch, re-raise after.
     auto chunkBreak = [&](size_t) -> bool {
@@ -2339,17 +2369,21 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
 #pragma omp parallel num_threads(numThreads)
     {
       const size_t tid = static_cast<size_t>(omp_get_thread_num());
-      const size_t team = static_cast<size_t>(omp_get_num_threads());
-      const size_t first = n * tid / team;
-      const size_t last = n * (tid + 1) / team;
+      const size_t t = static_cast<size_t>(omp_get_num_threads());
+      if (tid == 0) {
+        teamSize.store(t, std::memory_order_relaxed);
+      }
+      const size_t first = n * tid / t;
+      const size_t last = n * (tid + 1) / t;
       computeBins(localHists[tid].data(), first, last, chunkBreak);
     }
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
       checkInterrupt();  // re-raise outside the parallel region
     }
-    for (const auto& lh : localHists) {
+    team = teamSize.load(std::memory_order_relaxed);
+    for (size_t t = 0; t < team; ++t) {
       for (size_t b = 0; b < nb; ++b) {
-        hist[b] += lh[b];
+        hist[b] += localHists[t][b];
       }
     }
   } else
@@ -2362,7 +2396,9 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
       }
       return false;
     };
-    computeBins(hist.data(), 0, n, chunkBreak);
+    computeBins(localHists[0].data(), 0, n, chunkBreak);
+    hist = localHists[0];
+    team = 1;
   }
   // 2. Boundary bucket `tb` = smallest distance whose cumulative count reaches
   //    `m`; `below` rows are strictly closer, `need` come from the boundary.
@@ -2379,68 +2415,88 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
       }
     }
   }
-  const size_t need = m - below;  // >= 1 whenever m >= 1
-  // 3. Collect: every row closer than `tb` (all `below` of them, order
-  //    irrelevant -- sorted below), plus the `need` SMALLEST-index rows at
-  //    `tb`. Parallel over contiguous ranges: each thread gathers its own
-  //    closer-rows and up to `need` of its boundary rows (its smallest
-  //    indices; capped since no single thread can contribute more than `need`
-  //    total). Threads own ascending index ranges, so walking them in order
-  //    yields the boundary rows smallest-index-first -- exactly the
-  //    `(distance, index)` tiebreak. The final `sort` on the (exact-integer)
-  //    float distances reproduces the total `(distance, index)` order.
+  // `need` = boundary-bucket rows kept = m - below (>= 1 whenever m >= 1);
+  // used implicitly as the [below, m) tb output slot range below.
   using Pair = std::pair<float, uint64_t>;
-  std::vector<Pair> sel;
-  sel.reserve(m);
-  auto collectRange = [&](size_t first, size_t last, std::vector<Pair>& closer,
-                          std::vector<Pair>& boundary) {
+  std::vector<Pair> sel(m);
+  // 3. Counting-scatter select (P1): place every selected pair at its exact
+  //    final sorted position with NO comparison sort and NO growing per-thread
+  //    vectors. The sorted order is (distance asc, index asc) -- and distances
+  //    ARE the integer buckets, so:
+  //      * buckets [0, tb) are fully included; a pair with distance b lands in
+  //        the output slot range [base[b], base[b+1]) where base[b] is the
+  //        count of all selected pairs in buckets < b;
+  //      * bucket tb contributes exactly its `need` SMALLEST-index rows, into
+  //        slots [below, below+need) == [below, m).
+  //    Within a bucket, output slots must be filled index-ascending. Threads
+  //    own ascending, contiguous index ranges and scan them ascending, so a
+  //    per-(thread,bucket) prefix over the retained `localHists` gives each
+  //    thread the exact starting slot for its rows of each bucket; it then
+  //    writes them sequentially. Bit-identical to `nth_element + sort` of the
+  //    keyed pairs (which the old path did) because both realise the same
+  //    total (distance, index) order.
+  //
+  // base[b] = number of selected pairs strictly closer than bucket b.
+  std::vector<uint64_t> base(nb + 1, 0);
+  for (size_t b = 0; b < tb; ++b) {
+    base[b + 1] = base[b] + hist[b];
+  }
+  // Cursors: `cursor[t*nb + b]` = next output slot for thread t's bucket-b
+  // rows. For buckets < tb: base[b] + (bucket-b rows in threads < t). For
+  // bucket tb: `below` + (tb rows in threads < t), but only the first `need`
+  // globally are kept -- a thread writes tb rows only while its running global
+  // tb-count is < need.
+  const size_t nt = team;
+  std::vector<uint64_t> cursor(nt * nb, 0);
+  {
+    // Prefix over threads for every bucket in [0, tb): start each thread after
+    // all lower-thread rows of that bucket.
+    for (size_t b = 0; b < tb; ++b) {
+      uint64_t run = base[b];
+      for (size_t t = 0; t < nt; ++t) {
+        cursor[t * nb + b] = run;
+        run += localHists[t][b];
+      }
+    }
+    // Bucket tb: prefix the tb output cursor and cap the global count at need.
+    uint64_t run = below;  // first tb slot
+    for (size_t t = 0; t < nt; ++t) {
+      cursor[t * nb + tb] = run;
+      run += localHists[t][tb];
+    }
+  }
+  // Scatter chunk `c` (of `nt` fixed chunks, matching the compute partition):
+  // its rows go to the exact output slots the cursor prefix reserved for it.
+  // Driven by an `omp for` over the FIXED chunk count, so the result is
+  // correct regardless of how many threads the runtime actually grants this
+  // region (each chunk owns disjoint output slots by construction).
+  auto scatterChunk = [&](size_t c) {
+    const size_t first = n * c / nt;
+    const size_t last = n * (c + 1) / nt;
+    uint64_t* cur = cursor.data() + c * nb;
+    uint64_t tbCursor = cur[tb];
+    const uint64_t tbEnd = m;  // == below + need
     for (size_t i = first; i < last; ++i) {
       const float d = coarseDists[i];
-      const size_t b = bucketOf(d);
+      const size_t b = bucketOfU32(static_cast<uint32_t>(d));
       if (b < tb) {
-        closer.emplace_back(d, static_cast<uint64_t>(i));
-      } else if (b == tb && boundary.size() < need) {
-        boundary.emplace_back(d, static_cast<uint64_t>(i));
+        sel[cur[b]++] = Pair{d, static_cast<uint64_t>(i)};
+      } else if (b == tb && tbCursor < tbEnd) {
+        sel[tbCursor++] = Pair{d, static_cast<uint64_t>(i)};
       }
     }
   };
 #ifdef _OPENMP
-  if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
-    const size_t T = static_cast<size_t>(numThreads);
-    std::vector<std::vector<Pair>> closer(T);
-    std::vector<std::vector<Pair>> boundary(T);
-#pragma omp parallel num_threads(numThreads)
-    {
-      const size_t tid = static_cast<size_t>(omp_get_thread_num());
-      const size_t team = static_cast<size_t>(omp_get_num_threads());
-      if (tid < team) {
-        collectRange(n * tid / team, n * (tid + 1) / team, closer[tid],
-                     boundary[tid]);
-      }
-    }
-    for (auto& c : closer) {
-      sel.insert(sel.end(), c.begin(), c.end());
-    }
-    size_t taken = 0;
-    for (auto& b : boundary) {
-      for (const Pair& e : b) {
-        if (taken == need) {
-          break;
-        }
-        sel.push_back(e);
-        ++taken;
-      }
+  if (parallel) {
+#pragma omp parallel for schedule(static) num_threads(numThreads)
+    for (size_t c = 0; c < nt; ++c) {
+      scatterChunk(c);
     }
   } else
 #endif
   {
-    std::vector<Pair> closer;
-    std::vector<Pair> boundary;
-    collectRange(0, n, closer, boundary);
-    sel = std::move(closer);
-    sel.insert(sel.end(), boundary.begin(), boundary.end());
+    scatterChunk(0);
   }
-  std::sort(sel.begin(), sel.end());
   return sel;
 }
 

@@ -408,7 +408,7 @@ TEST(VectorPerf, DISABLED_wholeIndexScanBenchmark) {
 TEST(VectorPerf, DISABLED_profileLoop) {
   setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
   BenchSetup s = setupIndex();
-  const size_t k = 500;
+  const size_t k = envSize("VECTOR_PERF_K", 500);
   const bool fine = envStr("VECTOR_PERF_LAYER", "coarse") == "fine";
   const bool aligned = envStr("VECTOR_PERF_RESIDENCY", "none") == "aligned";
   const int threads =
