@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -35,6 +36,7 @@
 
 #include "backports/StartsWithAndEndsWith.h"
 #include "backports/algorithm.h"
+#include "services/vectorSearch/VectorBf16Kernels.h"
 #include "services/vectorSearch/UsearchGraph.h"
 #include "services/vectorSearch/VectorMemory.h"
 #include "util/Exception.h"
@@ -195,11 +197,56 @@ struct VectorIndex::Impl {
     // finalize, instead of one `nk_angular_bf16` call per row. `nullptr`
     // packed buffer -> not eligible -> callers use the per-row path.
     bool batchedCosineBf16_ = false;
+    // Whether this (bf16 cosine) layer can run the productionized hand-rolled
+    // kernels (`VectorBf16Kernels`): the fixed width-1 AMX tile GEMM and the
+    // multi-row AVX-512-BF16 dot. Resolved once at open from the running CPU
+    // (`bf16kernels::amxAvailable()` / `simdAvailable()`) AND `dim_ % 32 == 0`
+    // (both kernels require a multiple-of-32 depth). These gate the
+    // `vec:bf16Kernel` selector: an explicit kernel the CPU can't run is
+    // downgraded, never an error. False on a non-bf16 / non-cosine layer.
+    bool hasAmxKernel_ = false;
+    bool hasSimdKernel_ = false;
     // One `1 / sqrt(sumsq(row))` per row (`numVectors` entries), computed in
     // one parallel pass at open (~2 B/dim, e.g. 8.6 MB at 2.14M rows). Lets
     // the batched finalize turn a raw dot product into a cosine distance
     // without re-reading the (bf16) row. Empty unless `batchedCosineBf16_`.
     std::vector<float> invNorms_;
+
+    // The CONCRETE per-block kernel this layer runs for a requested
+    // `vec:bf16Kernel`, resolved once against the CPU. Distinct values so the
+    // hot dispatch never overloads `Bf16Kernel::Punned` for two meanings:
+    //   HandAmx  the hand-rolled fixed-AMX tile block (`cosineBlockKernel`);
+    //   HandSimd the hand-rolled AVX-512-BF16 multi-row block;
+    //   Gemm     the NumKong AMX GEMM (`cosineBlockBf16`) -- kept ONLY as the
+    //            fallback when no hand-rolled kernel applies (e.g. `dim % 32`),
+    //            never the `Auto` default (the fixed-AMX block beats it);
+    //   PerRow   no block kernel -> the caller uses the per-row punned metric.
+    enum class BlockKernel { HandAmx, HandSimd, Gemm, PerRow };
+    BlockKernel resolveBlockKernel(Bf16Kernel requested) const {
+      // `Auto` = the fastest AVAILABLE kernel (measured): the fixed-AMX block
+      // on an AMX CPU, else the SIMD block on an AVX-512-BF16 CPU, else the
+      // NumKong GEMM (a bf16 cosine layer whose depth is not a multiple of 32
+      // has no hand-rolled kernel but may still have the GEMM), else per-row.
+      auto autoBest = [this]() {
+        if (hasAmxKernel_) return BlockKernel::HandAmx;
+        if (hasSimdKernel_) return BlockKernel::HandSimd;
+        if (batchedCosineBf16_) return BlockKernel::Gemm;
+        return BlockKernel::PerRow;
+      };
+      switch (requested) {
+        case Bf16Kernel::Auto:
+          return autoBest();
+        case Bf16Kernel::Amx:
+          // Explicit AMX: the hand-rolled fixed kernel; downgrade to the best
+          // available if this CPU/layer lacks it.
+          return hasAmxKernel_ ? BlockKernel::HandAmx : autoBest();
+        case Bf16Kernel::Simd:
+          return hasSimdKernel_ ? BlockKernel::HandSimd : autoBest();
+        case Bf16Kernel::Punned:
+          return BlockKernel::PerRow;
+      }
+      return autoBest();
+    }
 #endif
 
     // Base pointer of the active matrix: the aligned RAM copy if present,
@@ -365,6 +412,59 @@ struct VectorIndex::Impl {
         out[j] = cosineFromDot(dots[j], invN[j], queryInvNorm);
       }
     }
+
+    // Packed AMX query buffer for the FIXED-AMX hand-rolled kernel (36 tiles,
+    // query-only; distinct from `packQueryBf16`'s NumKong GEMM layout). Packed
+    // ONCE per search; the caller keeps it alive across `cosineBlockKernel`
+    // calls. Empty on a layer without the AMX kernel.
+    std::vector<char> packQueryAmxKernel(const char* queryBf16) const {
+      std::vector<char> buf(bf16kernels::packedQuerySizeAmx(dim_));
+      bf16kernels::packQueryAmx(reinterpret_cast<const uint16_t*>(queryBf16),
+                                dim_, buf.data());
+      return buf;
+    }
+
+    // The `vec:bf16Kernel`-routed CONTIGUOUS cosine block: distances of `count`
+    // rows starting at store row `rowStart` via the SELECTED hand-rolled kernel
+    // (`kernel` already resolved to `Amx`/`Simd` by `resolveBf16Kernel`).
+    // `queryBf16` is the plain bf16 query (needed by the SIMD kernel and the
+    // AMX tail); `packedAmx` the once-packed AMX tiles (used only when
+    // `kernel == Amx`, may be nullptr otherwise). `queryInvNorm` and the row
+    // sidecar drive the shared finalize -- so the result is bit-identical to
+    // the AMX GEMM path for the same pair. `dots` is caller scratch (>= count).
+    void cosineBlockKernel(Bf16Kernel kernel, size_t rowStart, size_t count,
+                           const char* queryBf16, const void* packedAmx,
+                           float queryInvNorm, float* dots, float* out) const {
+      const char* rows = base() + rowStart * stride_;
+      if (kernel == Bf16Kernel::Amx) {
+        bf16kernels::dotBlockAmx(
+            packedAmx, reinterpret_cast<const uint16_t*>(queryBf16), rows,
+            stride_, count, dim_, dots);
+      } else {  // Simd
+        bf16kernels::dotBlockSimd(reinterpret_cast<const uint16_t*>(queryBf16),
+                                  rows, stride_, count, dim_, dots);
+      }
+      const float* invN = invNorms_.data() + rowStart;
+      for (size_t j = 0; j < count; ++j) {
+        out[j] = cosineFromDot(dots[j], invN[j], queryInvNorm);
+      }
+    }
+
+    // The `vec:bf16Kernel`-routed SCATTERED cosine gather: distances of `count`
+    // rows given by `rowOf[j]` (store-row indices) via the multi-row SIMD dot
+    // (the AMX path has no efficient gather -- the coarse-ranked rerank rows
+    // are non-contiguous -- so a resolved `Amx` gather uses SIMD here; both
+    // finalize identically). `out[j]` receives the cosine distance of row
+    // `rowOf[j]`.
+    void cosineGatherSimd(size_t count, const char* queryBf16,
+                          const size_t* rowOf, float queryInvNorm, float* dots,
+                          float* out) const {
+      bf16kernels::dotGatherSimd(reinterpret_cast<const uint16_t*>(queryBf16),
+                                 base(), stride_, rowOf, count, dim_, dots);
+      for (size_t j = 0; j < count; ++j) {
+        out[j] = cosineFromDot(dots[j], invNorms_[rowOf[j]], queryInvNorm);
+      }
+    }
 #endif
   };
 
@@ -500,10 +600,46 @@ void configureLayerFastPaths([[maybe_unused]] LayerT& layer,
     layer.rawKernelThirdArg_ = static_cast<nk_size_t>(layer.dim_);
   }
 
-  // P2: batched cosine for the bf16 fine layer, only with AMX.
-  if (scalar == VectorScalar::Bf16 && metric == VectorMetric::Cosine &&
-      (caps & nk_cap_sapphireamx_k) != 0) {
-    layer.batchedCosineBf16_ = true;
+  // Hand-rolled bf16-cosine kernels (`vec:bf16Kernel`): available on a bf16
+  // cosine layer whose depth is a multiple of 32 (both kernels' tile width)
+  // when the CPU has the ISA. AMX implies the SIMD ISA on every shipping part;
+  // SIMD alone (Genoa without AMX) still enables the multi-row dot. Resolved
+  // once here so the per-query selector is a branch on cached flags. The
+  // batched-cosine sidecar (`invNorms_`) is shared by all three kernels.
+  const bool bf16Cosine =
+      scalar == VectorScalar::Bf16 && metric == VectorMetric::Cosine;
+  const bool depthOk = layer.dim_ % 32 == 0;
+  layer.hasSimdKernel_ =
+      bf16Cosine && depthOk && bf16kernels::simdAvailable();
+  layer.hasAmxKernel_ = bf16Cosine && depthOk && bf16kernels::amxAvailable();
+
+  // Any AMX use (the hand-rolled fixed kernel OR the NumKong GEMM) needs the
+  // process's AMX tile-data permission; request + VERIFY it once. If a
+  // kernel/container refuses the grant, DOWNGRADE off every AMX path (the
+  // fixed kernel falls to SIMD via `resolveBlockKernel`; the GEMM stays off)
+  // instead of faulting at `ldtilecfg`. Gated on the SAME feature set as
+  // `amxAvailable()`, not NumKong's INT8-inclusive capability, so a hypothetical
+  // AMX-BF16-without-INT8 part is handled correctly.
+  bool amxUsable = (caps & nk_cap_sapphireamx_k) != 0 || layer.hasAmxKernel_;
+  if (amxUsable) {
+    amxUsable = bf16kernels::ensureAmxPermission();
+    if (!amxUsable) {
+      layer.hasAmxKernel_ = false;  // -> Auto/Amx resolve to SIMD or per-row
+    }
+  }
+
+  // P2: batched cosine for the bf16 fine layer, only with AMX (GEMM).
+  // `batchedCosineBf16_` stays AMX-GATED -- it drives the NumKong AMX GEMM
+  // block path and the `distanceBetweenBytes`/`cosineToRowBf16` bit-identical
+  // finalize (the `Auto` fallback when no hand-rolled kernel applies). The
+  // `hasSimdKernel_`/`hasAmxKernel_` flags are what the selector routes on.
+  const bool amxGemm =
+      bf16Cosine && (caps & nk_cap_sapphireamx_k) != 0 && amxUsable;
+  // The `1/sqrt(sumsq)` sidecar is shared by the AMX GEMM finalize AND both
+  // hand-rolled kernels, so build it whenever ANY of them can run on this
+  // layer (e.g. SIMD-only on a Genoa CPU that lacks the AMX GEMM).
+  if (amxGemm || layer.hasSimdKernel_ || layer.hasAmxKernel_) {
+    layer.batchedCosineBf16_ = amxGemm;
     layer.invNorms_.assign(numRows, 0.0f);
     float* invN = layer.invNorms_.data();
     const size_t dim = layer.dim_;
@@ -1583,25 +1719,48 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
 // Sapphire/Emerald Rapids was 512-2048 (all within ~5% of each other).
 constexpr size_t VEC_BF16_BATCH_ROWS = 1024;
 
-// P2: the whole-index bf16 cosine sweep via the AMX batched GEMM. Same static
-// per-thread partition, tombstone filter, and per-thread `TopK` merge as the
-// per-row `scanWholeIndexIntoTopK`, but distances come a block at a time from
-// `cosineBlockBf16`. Only called when `layer.batchedCosineBf16_` is true. The
-// query is packed ONCE into `packed` (read-only, shared across threads).
+// P2: the whole-index bf16 cosine sweep via a BLOCKED contiguous kernel. Same
+// static per-thread partition, tombstone filter, and per-thread `TopK` merge
+// as the per-row `scanWholeIndexIntoTopK`, but distances come a block at a time
+// from the selected kernel (`kernel`, already resolved to `Amx`/`Simd`/GEMM by
+// the caller): `Amx`/`Simd` -> the hand-rolled `cosineBlockKernel`; the NumKong
+// AMX GEMM (`batchedCosineBf16_`, the Auto default on AMX) -> `cosineBlockBf16`.
+// The query is packed ONCE (read-only, shared across threads).
+// `kernel` selects the contiguous block engine: `Gemm` (the pre-existing
+// NumKong AMX GEMM), `HandAmx` (the fixed-AMX tile block), or `HandSimd` (the
+// AVX-512-BF16 multi-row block). `PerRow` never reaches here.
 template <typename ImplT, typename LayerT>
-void scanWholeIndexBatchedBf16(TopK& top, size_t k, ImplT& impl, LayerT& layer,
-                               const char* queryBytes, float maxDist,
-                               const CheckInterruptCallback& checkInterrupt,
-                               [[maybe_unused]] int numThreads) {
+void scanWholeIndexBatchedBf16(
+    TopK& top, size_t k, ImplT& impl, LayerT& layer, const char* queryBytes,
+    float maxDist, typename LayerT::BlockKernel kernel,
+    const CheckInterruptCallback& checkInterrupt,
+    [[maybe_unused]] int numThreads) {
+  using BK = typename LayerT::BlockKernel;
   const size_t n = impl.meta_.numVectors_;
-  const std::vector<char> packed = layer.packQueryBf16(queryBytes);
-  const void* pq = packed.data();
   const float qInv = LayerT::queryInvNormBf16(queryBytes, layer.dim_);
-  // Score a contiguous block [blockStart, blockStart+count) into `localTop`
-  // via one GEMM, honouring tombstones and the max-distance filter.
+  // The GEMM path packs into the NumKong layout; the hand-rolled AMX kernel
+  // packs its own 36-tile layout; SIMD needs neither (it reads `queryBytes`).
+  // Whichever applies is packed ONCE here, shared read-only across threads.
+  const std::vector<char> packedGemm =
+      kernel == BK::Gemm ? layer.packQueryBf16(queryBytes) : std::vector<char>{};
+  const std::vector<char> packedAmx = kernel == BK::HandAmx
+                                          ? layer.packQueryAmxKernel(queryBytes)
+                                          : std::vector<char>{};
+  const void* pqGemm = packedGemm.data();
+  const void* pqAmx = packedAmx.data();
+  // Score a contiguous block [blockStart, blockStart+count) into `localTop`,
+  // honouring tombstones and the max-distance filter.
   auto scoreBlock = [&](TopK& localTop, size_t blockStart, size_t count,
                         float* dots, float* dists) {
-    layer.cosineBlockBf16(blockStart, count, pq, qInv, dots, dists);
+    if (kernel == BK::Gemm) {
+      layer.cosineBlockBf16(blockStart, count, pqGemm, qInv, dots, dists);
+    } else {
+      // HandAmx or HandSimd -- `cosineBlockKernel` reads `pqAmx` only for AMX.
+      const Bf16Kernel hand =
+          kernel == BK::HandAmx ? Bf16Kernel::Amx : Bf16Kernel::Simd;
+      layer.cosineBlockKernel(hand, blockStart, count, queryBytes, pqAmx, qInv,
+                              dots, dists);
+    }
     for (size_t j = 0; j < count; ++j) {
       const uint64_t id = impl.keys_[blockStart + j];
       if (id != TOMBSTONE_KEY && dists[j] <= maxDist) {
@@ -1678,7 +1837,9 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
                             const char* queryBytes,
                             std::optional<float> maxDistance,
                             const CheckInterruptCallback& checkInterrupt,
-                            [[maybe_unused]] int numThreads) {
+                            [[maybe_unused]] int numThreads,
+                            [[maybe_unused]] Bf16Kernel bf16Kernel =
+                                Bf16Kernel::Auto) {
   const size_t n = impl.meta_.numVectors_;
   // Hoist the `maxDistance` optional out of the per-row hot path: `nullopt`
   // (the whole-index common case) becomes `+inf`, so the filter is a single
@@ -1687,13 +1848,15 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
   const float maxDist =
       maxDistance.value_or(std::numeric_limits<float>::infinity());
 #if USEARCH_USE_NUMKONG
-  // P2: batched bf16 cosine whole-index sweep. One AMX GEMM per block of
-  // contiguous rows (query x block) instead of one angular kernel per row --
-  // keeps memory saturated at the width=1 query shape on AMX. The query is
-  // packed ONCE (shared, read-only) before the parallel region.
-  if (layer.batchedCosineBf16_) {
+  // Blocked bf16 cosine whole-index sweep, routed by `vec:bf16Kernel`
+  // (`resolveBlockKernel` maps the request + CPU to a concrete block engine;
+  // `PerRow` falls through to the per-row punned metric below). The query is
+  // packed ONCE inside the batched sweep.
+  using BK = typename std::remove_reference_t<LayerT>::BlockKernel;
+  const BK blockKernel = layer.resolveBlockKernel(bf16Kernel);
+  if (blockKernel != BK::PerRow) {
     scanWholeIndexBatchedBf16(top, k, impl, layer, queryBytes, maxDist,
-                              checkInterrupt, numThreads);
+                              blockKernel, checkInterrupt, numThreads);
     return;
   }
 #endif
@@ -1914,7 +2077,8 @@ std::vector<ScoredEntity> searchExactBytes(
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored = nullptr,
     std::optional<size_t> integerDistMax = std::nullopt,
-    std::vector<uint64_t>* outRows = nullptr) {
+    std::vector<uint64_t>* outRows = nullptr,
+    Bf16Kernel bf16Kernel = Bf16Kernel::Auto) {
   // `numScored` (optional out-param) reports how many vectors actually had a
   // distance computed -- the WHOLE live set for a whole-index search, or just
   // the candidates that are members for a restricted one. It is NOT the raw
@@ -2018,7 +2182,7 @@ std::vector<ScoredEntity> searchExactBytes(
     }
     SeqScanHint hint{layer, !layer.alignedBuf_};
     scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
-                           checkInterrupt, numThreads);
+                           checkInterrupt, numThreads, bf16Kernel);
     auto out = top.sorted();
     emitRowsFromEntities(out);
     return out;
@@ -2058,7 +2222,7 @@ std::vector<ScoredEntity> searchExactBytes(
       }
       SeqScanHint hint{layer, !layer.alignedBuf_};
       scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
-                             checkInterrupt, checkThreads);
+                             checkInterrupt, checkThreads, bf16Kernel);
       auto out = top.sorted();
       emitRowsFromEntities(out);
       return out;
@@ -2140,7 +2304,7 @@ std::vector<ScoredEntity> searchExactBytes(
     }
     SeqScanHint hint{layer, !layer.alignedBuf_};
     scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
-                           checkInterrupt, numThreads);
+                           checkInterrupt, numThreads, bf16Kernel);
     auto out = top.sorted();
     emitRowsFromEntities(out);
     return out;
@@ -2182,7 +2346,8 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
     ql::span<const float> query, size_t k,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored,
+    Bf16Kernel bf16Kernel) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -2202,7 +2367,8 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
       fineScalar == VectorScalar::Binary ? std::optional<size_t>{impl.dim()}
                                          : std::nullopt;
   return searchExactBytes(impl, layer, queryBytes, k, candidates, maxDistance,
-                          checkInterrupt, numScored, integerDistMax);
+                          checkInterrupt, numScored, integerDistMax,
+                          /*outRows=*/nullptr, bf16Kernel);
 }
 
 // ____________________________________________________________________________
@@ -2268,6 +2434,16 @@ std::vector<ScoredRow> VectorIndex::searchExactCoarseWithRows(
 }
 
 namespace {
+// Forward declaration (defined further below in this TU's anonymous namespace):
+// the shared distance sweep, used here for the SIMD-gather rerank fast path.
+// The default arguments live HERE (a later definition may not repeat them).
+template <typename LayerT, typename RowFn>
+void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
+                       const RowFn& rowOf, float* dists,
+                       const CheckInterruptCallback& checkInterrupt,
+                       bool contiguous = false,
+                       Bf16Kernel bf16Kernel = Bf16Kernel::Auto);
+
 // Core of `searchExactByRows`: score the `rows` (store-row + id survivors of
 // the coarse pass) on `layer` against the encoded `queryBytes`, returning the
 // top-`k` ascending by distance. `k` is already clamped by the caller.
@@ -2275,7 +2451,8 @@ template <typename LayerT>
 std::vector<ScoredEntity> searchExactByRowsBytes(
     LayerT& layer, const char* queryBytes, size_t k,
     ql::span<const ScoredRow> rows, std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt) {
+    const CheckInterruptCallback& checkInterrupt,
+    Bf16Kernel bf16Kernel = Bf16Kernel::Auto) {
   // The rows already ARE the store rows of the coarse survivors (from
   // `searchExactCoarseWithRows`) -- no candidate-id copy/sort and no
   // O(numVectors) `.rowmap` merge-join. Sort a local copy of the (row, id)
@@ -2289,7 +2466,35 @@ std::vector<ScoredEntity> searchExactByRowsBytes(
   }
   std::sort(rowIds.begin(), rowIds.end());
   const bool seqHint = !layer.alignedBuf_;
+  const float maxDist =
+      maxDistance.value_or(std::numeric_limits<float>::infinity());
   TopK top{k};
+#if USEARCH_USE_NUMKONG
+  // If a hand-rolled bf16 kernel is selected for this (fine) layer, score the
+  // scattered survivors with one batched multi-row SIMD gather
+  // (`cslsDistanceSweep` scattered), then offer into the heap -- the SAME
+  // engine and finalize as the CSLS rerank, so the top-k is bit-identical to
+  // the per-row path. `PerRow` (the GEMM/punned/non-bf16 default) keeps the
+  // existing per-row `scanIntoTopK` below.
+  using BK = typename std::remove_reference_t<LayerT>::BlockKernel;
+  const BK rerankKernel = layer.resolveBlockKernel(bf16Kernel);
+  if (rerankKernel == BK::HandSimd || rerankKernel == BK::HandAmx) {
+    std::vector<float> dists(rowIds.size());
+    {
+      SeqScanHint hint{layer, seqHint};
+      cslsDistanceSweep(
+          layer, queryBytes, rowIds.size(),
+          [&](size_t i) { return rowIds[i].first; }, dists.data(),
+          checkInterrupt, /*contiguous=*/false, bf16Kernel);
+    }
+    for (size_t i = 0; i < rowIds.size(); ++i) {
+      if (dists[i] <= maxDist) {
+        top.offer(dists[i], rowIds[i].second);
+      }
+    }
+    return top.sorted();
+  }
+#endif
   {
     SeqScanHint hint{layer, seqHint};
     scanIntoTopK(
@@ -2307,7 +2512,8 @@ std::vector<ScoredEntity> searchExactByRowsBytes(
 std::vector<ScoredEntity> VectorIndex::searchExactByRows(
     ql::span<const float> query, size_t k, ql::span<const ScoredRow> rows,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt) const {
+    const CheckInterruptCallback& checkInterrupt,
+    Bf16Kernel bf16Kernel) const {
   auto& impl = *impl_;
   auto& layer = impl.fine();
   if (query.size() != impl.dim()) {
@@ -2322,14 +2528,15 @@ std::vector<ScoredEntity> VectorIndex::searchExactByRows(
   std::vector<char> buffer;
   const char* queryBytes = layer.encodeQuery(query, buffer);
   return searchExactByRowsBytes(layer, queryBytes, k, rows, maxDistance,
-                                checkInterrupt);
+                                checkInterrupt, bf16Kernel);
 }
 
 // ____________________________________________________________________________
 std::vector<ScoredEntity> VectorIndex::searchExactByRowsByEntity(
     Id entity, size_t k, ql::span<const ScoredRow> rows,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt) const {
+    const CheckInterruptCallback& checkInterrupt,
+    Bf16Kernel bf16Kernel) const {
   auto& impl = *impl_;
   auto& layer = impl.fine();
   auto row = impl.rowOf(entity);
@@ -2343,14 +2550,15 @@ std::vector<ScoredEntity> VectorIndex::searchExactByRowsByEntity(
   // The query point is the entity's own FINE-layer bytes (no f32 round trip),
   // exactly as `searchExactByEntity` uses them.
   return searchExactByRowsBytes(layer, layer.rowPtr(row.value()), k, rows,
-                                maxDistance, checkInterrupt);
+                                maxDistance, checkInterrupt, bf16Kernel);
 }
 
 // ____________________________________________________________________________
 std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored,
+    Bf16Kernel bf16Kernel) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -2360,7 +2568,9 @@ std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
     return {};
   }
   return searchExactBytes(impl, layer, layer.rowPtr(row.value()), k, candidates,
-                          maxDistance, checkInterrupt, numScored);
+                          maxDistance, checkInterrupt, numScored,
+                          /*integerDistMax=*/std::nullopt, /*outRows=*/nullptr,
+                          bf16Kernel);
 }
 
 // ____________________________________________________________________________
@@ -2538,14 +2748,18 @@ inline void prefetchSweepRow(const LayerT& layer, const RowFn& rowOf, size_t i,
 }
 
 // `contiguous`: the scoring indices map to store rows one-to-one in order
-// (`rowOf(i) == i`, the whole-index full fine sweep) -- then P2's batched bf16
-// cosine block path applies. A scattered sweep (`rowOf` is a gather, e.g. the
-// CSLS rerank batch of coarse-ranked rows) keeps the per-row path.
+// (`rowOf(i) == i`, the whole-index full fine sweep) -- then the batched bf16
+// cosine block path applies (GEMM or the `vec:bf16Kernel`-selected hand-rolled
+// block). A scattered sweep (`rowOf` is a gather, e.g. the CSLS rerank batch of
+// coarse-ranked rows) uses the multi-row SIMD gather when a hand-rolled kernel
+// is selected, else the per-row path. `bf16Kernel` is the request; the layer
+// resolves it against the CPU (a no-op / punned metric on any other layer).
 template <typename LayerT, typename RowFn>
 void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
                        const RowFn& rowOf, float* dists,
                        const CheckInterruptCallback& checkInterrupt,
-                       [[maybe_unused]] bool contiguous = false) {
+                       [[maybe_unused]] bool contiguous,
+                       [[maybe_unused]] Bf16Kernel bf16Kernel) {
   // Prefetch tuning (see `prefetchSweepRow`): ~4 KiB lookahead for compact
   // rows, a few rows for large ones.
   const bool compact = layer.stride_ <= 256;
@@ -2554,15 +2768,30 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
   const int numThreads = vectorSearchThreadCap();
 #endif
 #if USEARCH_USE_NUMKONG
-  // P2: batched bf16 cosine, only when the scoring indices ARE store rows in
-  // order. Query packed once (read-only, shared). Blocks of contiguous rows go
-  // through the AMX GEMM; `dists[s+j]` is the cosine distance of row `s + j`.
-  if (contiguous && layer.batchedCosineBf16_) {
-    const std::vector<char> packed = layer.packQueryBf16(queryBytes);
-    const void* pq = packed.data();
+  using BK = typename std::remove_reference_t<decltype(layer)>::BlockKernel;
+  const BK block16 = layer.resolveBlockKernel(bf16Kernel);
+  // Batched bf16 cosine, only when the scoring indices ARE store rows in order.
+  // Query packed once (read-only, shared). Blocks of contiguous rows go through
+  // the selected engine; `dists[s+j]` is the cosine distance of row `s + j`.
+  if (contiguous && block16 != BK::PerRow) {
     const float qInv = LayerT::queryInvNormBf16(queryBytes, layer.dim_);
+    const std::vector<char> packedGemm =
+        block16 == BK::Gemm ? layer.packQueryBf16(queryBytes)
+                            : std::vector<char>{};
+    const std::vector<char> packedAmx =
+        block16 == BK::HandAmx ? layer.packQueryAmxKernel(queryBytes)
+                               : std::vector<char>{};
+    const void* pqGemm = packedGemm.data();
+    const void* pqAmx = packedAmx.data();
     auto block = [&](size_t s, size_t count, float* scratch) {
-      layer.cosineBlockBf16(s, count, pq, qInv, scratch, dists + s);
+      if (block16 == BK::Gemm) {
+        layer.cosineBlockBf16(s, count, pqGemm, qInv, scratch, dists + s);
+      } else {
+        const Bf16Kernel hand =
+            block16 == BK::HandAmx ? Bf16Kernel::Amx : Bf16Kernel::Simd;
+        layer.cosineBlockKernel(hand, s, count, queryBytes, pqAmx, qInv,
+                                scratch, dists + s);
+      }
     };
 #ifdef _OPENMP
     if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
@@ -2606,10 +2835,82 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
     }
     return;
   }
-  // P2: per-row bf16 cosine (SCATTERED gather or non-AMX). Hoist the query's
-  // reciprocal norm ONCE (else `distanceToRow` recomputes it O(dim) per row)
-  // and use the sidecar per-row helper, which is bit-identical to the batched
-  // block for the same pair.
+  // SCATTERED gather with a hand-rolled kernel selected (`HandSimd`/`HandAmx`;
+  // AMX has no efficient scatter, so both use the multi-row SIMD gather). Gather
+  // the chunk's store rows into a contiguous index buffer and score them with
+  // one `cosineGatherSimd` -- the SAME multi-row `vdpbf16ps` engine as the
+  // contiguous block, bit-identical finalize. Only when the layer actually has
+  // the SIMD kernel (`block16` is a hand-rolled value only then).
+  if (!contiguous &&
+      (block16 == BK::HandSimd || block16 == BK::HandAmx)) {
+    const float qInv = LayerT::queryInvNormBf16(queryBytes, layer.dim_);
+    constexpr size_t GATHER_CHUNK = 512;
+    const char* gbase = layer.base();
+    const size_t gstride = layer.stride_;
+    auto gatherChunk = [&](size_t s, size_t count, size_t* rowBuf,
+                           float* scratch) {
+      // Resolve the chunk's scattered store rows, then software-prefetch each
+      // row's first line so the (out-of-order, HW-streamer-invisible) reads are
+      // in flight before the multi-row SIMD dot streams them -- the same
+      // latency hiding the per-row scattered path got from `prefetchSweepRow`,
+      // which the batched gather would otherwise have dropped.
+      for (size_t j = 0; j < count; ++j) {
+        rowBuf[j] = rowOf(s + j);
+        __builtin_prefetch(gbase + rowBuf[j] * gstride, 0, 3);
+      }
+      layer.cosineGatherSimd(count, queryBytes, rowBuf, qInv, scratch,
+                             dists + s);
+    };
+#ifdef _OPENMP
+    if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+      std::atomic<bool> cancelled{false};
+#pragma omp parallel num_threads(numThreads)
+      {
+        const size_t tid = static_cast<size_t>(omp_get_thread_num());
+        const size_t team = static_cast<size_t>(omp_get_num_threads());
+        const size_t first = n * tid / team;
+        const size_t last = n * (tid + 1) / team;
+        std::vector<size_t> rowBuf(GATHER_CHUNK);
+        std::vector<float> scratch(GATHER_CHUNK);
+        for (size_t s = first; s < last; s += GATHER_CHUNK) {
+          if (VEC_SEARCH_CHECK_CANCELLATION) {
+            if (cancelled.load(std::memory_order_relaxed)) break;
+            if (checkInterrupt) {
+              try {
+                checkInterrupt();
+              } catch (...) {
+                cancelled.store(true, std::memory_order_relaxed);
+                break;
+              }
+            }
+          }
+          gatherChunk(s, std::min(GATHER_CHUNK, last - s), rowBuf.data(),
+                      scratch.data());
+        }
+      }
+      if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+        checkInterrupt();
+      }
+      return;
+    }
+#endif
+    std::vector<size_t> rowBuf(GATHER_CHUNK);
+    std::vector<float> scratch(GATHER_CHUNK);
+    size_t sinceCheck = 0;
+    for (size_t s = 0; s < n; s += GATHER_CHUNK) {
+      if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+        sinceCheck = 0;
+        checkInterrupt();
+      }
+      gatherChunk(s, std::min(GATHER_CHUNK, n - s), rowBuf.data(),
+                  scratch.data());
+    }
+    return;
+  }
+  // Per-row bf16 cosine (SCATTERED gather with the GEMM/punned default, or a
+  // non-bf16 layer). Hoist the query's reciprocal norm ONCE (else
+  // `distanceToRow` recomputes it O(dim) per row) and use the sidecar per-row
+  // helper, which is bit-identical to the batched block for the same pair.
   const bool perRowCosineBf16 = layer.batchedCosineBf16_;
   const float qInvCosine =
       perRowCosineBf16 ? LayerT::queryInvNormBf16(queryBytes, layer.dim_) : 0.f;
@@ -3386,7 +3687,8 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
                         size_t neighbors,
                         std::optional<ql::span<const Id>> candidates,
                         const CheckInterruptCallback& checkInterrupt,
-                        bool fullPrecision) {
+                        bool fullPrecision,
+                        Bf16Kernel bf16Kernel = Bf16Kernel::Auto) {
   // For Threshold this is the tau, for Knee the floor (identical machinery);
   // unused by Softmax.
   const float threshold = cut.threshold_;
@@ -3477,7 +3779,7 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
       // `directWhole` -> `rowAt` is identity -> the batched bf16 path (P2).
       cslsDistanceSweep(
           layer, queryBytes, n, [&](size_t i) { return rowAt(i); },
-          dists.data(), checkInterrupt, /*contiguous=*/directWhole);
+          dists.data(), checkInterrupt, /*contiguous=*/directWhole, bf16Kernel);
     }
     // 3. r(q): the mean cosine similarity of the query to its top-`neighbors`
     //    nearest SCORED candidates, the exact self-match excluded.
@@ -3681,11 +3983,13 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
       checkInterrupt();
     }
     // 4. Rerank the batch on the FINE layer. Its rows are coarse-ranked, i.e.
-    //    scattered -- no sequential hint.
+    //    scattered -- no sequential hint, so the hand-rolled kernels use the
+    //    multi-row SIMD gather (`contiguous=false`).
     cslsDistanceSweep(
         layer, queryBytes, batchEnd - batchStart,
         [&](size_t j) { return rowAt(orderIdx(batchStart + j)); },
-        fineDists.get() + batchStart, checkInterrupt);
+        fineDists.get() + batchStart, checkInterrupt, /*contiguous=*/false,
+        bf16Kernel);
     reranked = batchEnd;
     // Widening only ever ADDS candidates to the r(q) neighbourhood pool, so
     // r(q) is non-decreasing across batches and the widen decisions below --
@@ -3819,7 +4123,7 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    bool fullPrecision) const {
+    bool fullPrecision, Bf16Kernel bf16Kernel) const {
   auto& impl = *impl_;
   AD_CONTRACT_CHECK(impl.meta_.config_.csls_ || !cutNeedsCslsSidecar(cut),
                     "searchCsls called with a CSLS cut on an index without "
@@ -3839,9 +4143,9 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
   const char* coarseQueryBytes =
       impl.rerank_.has_value() ? impl.scan_.encodeQuery(query, coarseBuffer)
                                : queryBytes;
-  CslsReranked reranked =
-      rerankCsls(impl, layer, queryBytes, coarseQueryBytes, std::nullopt, cut,
-                 neighbors, candidates, checkInterrupt, fullPrecision);
+  CslsReranked reranked = rerankCsls(impl, layer, queryBytes, coarseQueryBytes,
+                                     std::nullopt, cut, neighbors, candidates,
+                                     checkInterrupt, fullPrecision, bf16Kernel);
   if (numScored != nullptr) {
     *numScored = reranked.scored_;
   }
@@ -3854,7 +4158,7 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    bool fullPrecision) const {
+    bool fullPrecision, Bf16Kernel bf16Kernel) const {
   auto& impl = *impl_;
   AD_CONTRACT_CHECK(impl.meta_.config_.csls_ || !cutNeedsCslsSidecar(cut),
                     "searchCslsByEntity called with a CSLS cut on an index "
@@ -3872,7 +4176,8 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
   }
   CslsReranked reranked = rerankCsls(
       impl, layer, layer.rowPtr(row.value()), impl.scan_.rowPtr(row.value()),
-      row, cut, neighbors, candidates, checkInterrupt, fullPrecision);
+      row, cut, neighbors, candidates, checkInterrupt, fullPrecision,
+      bf16Kernel);
   if (numScored != nullptr) {
     *numScored = reranked.scored_;
   }
@@ -3896,7 +4201,8 @@ CslsReranked VectorIndex::computeCslsReranked(
     ql::span<const float> query, size_t neighbors, float floorFraction,
     float widenFraction, size_t rerankCap,
     std::optional<ql::span<const Id>> candidates,
-    const CheckInterruptCallback& checkInterrupt, bool fullPrecision) const {
+    const CheckInterruptCallback& checkInterrupt, bool fullPrecision,
+    Bf16Kernel bf16Kernel) const {
   auto& impl = *impl_;
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
   auto& layer = impl.fine();
@@ -3913,14 +4219,16 @@ CslsReranked VectorIndex::computeCslsReranked(
                                : queryBytes;
   return rerankCsls(impl, layer, queryBytes, coarseQueryBytes, std::nullopt,
                     plateauRerankCut(floorFraction, widenFraction, rerankCap),
-                    neighbors, candidates, checkInterrupt, fullPrecision);
+                    neighbors, candidates, checkInterrupt, fullPrecision,
+                    bf16Kernel);
 }
 
 // ____________________________________________________________________________
 CslsReranked VectorIndex::computeCslsRerankedByEntity(
     Id entity, size_t neighbors, float floorFraction, float widenFraction,
     size_t rerankCap, std::optional<ql::span<const Id>> candidates,
-    const CheckInterruptCallback& checkInterrupt, bool fullPrecision) const {
+    const CheckInterruptCallback& checkInterrupt, bool fullPrecision,
+    Bf16Kernel bf16Kernel) const {
   auto& impl = *impl_;
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
   auto& layer = impl.fine();
@@ -3931,7 +4239,8 @@ CslsReranked VectorIndex::computeCslsRerankedByEntity(
   return rerankCsls(impl, layer, layer.rowPtr(row.value()),
                     impl.scan_.rowPtr(row.value()), row,
                     plateauRerankCut(floorFraction, widenFraction, rerankCap),
-                    neighbors, candidates, checkInterrupt, fullPrecision);
+                    neighbors, candidates, checkInterrupt, fullPrecision,
+                    bf16Kernel);
 }
 
 // ____________________________________________________________________________
