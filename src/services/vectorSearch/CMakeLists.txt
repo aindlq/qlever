@@ -77,20 +77,18 @@ if (QLEVER_VECTOR_SEARCH_SIMD)
             "${numkong_SOURCE_DIR}/include")
     # PUBLIC: the consuming C++ TUs (usearch headers) must see the same
     # configuration as the dispatch tables.
-    if (QLEVER_MARCH_NATIVE)
-        # NATIVE/STATIC dispatch: `-march=native` (set globally) makes NumKong's
-        # headers auto-detect the host ISA from the compiler's predefined macros
-        # (e.g. `__AVX512BF16__` -> `NK_TARGET_GENOA=1`) and compile a SINGLE
-        # native kernel set, resolved by a direct call -- no runtime dispatch
-        # table. Pass NO `NK_TARGET_*` defines: an explicit `=0` would DISABLE
-        # the header auto-detect and silently drop to a slower (upconvert)
-        # kernel. Removes the `dynamic-dispatch=on` indirection (a small win --
-        # the dispatch table is resolved once at init, not per call).
-        target_compile_definitions(numkongDispatch PUBLIC NK_DYNAMIC_DISPATCH=0)
-    else ()
-        target_compile_definitions(numkongDispatch PUBLIC NK_DYNAMIC_DISPATCH=1
-                ${NUMKONG_ISA_DEFS})
-    endif ()
+    #
+    # NK_DYNAMIC_DISPATCH is ALWAYS 1 -- even under `QLEVER_MARCH_NATIVE`: usearch
+    # consumes NumKong ONLY through its dynamic-dispatch API
+    # (`metric_punned_t::configure_with_numkong` calls `nk_find_kernel_punned`,
+    # which exists only when NK_DYNAMIC_DISPATCH=1), so a static build does not
+    # compile. This is not a real loss: the dispatch table is resolved ONCE at
+    # init and, on any given CPU, selects that CPU's best (native) kernel -- so
+    # the executed machine code is already the native one. `QLEVER_MARCH_NATIVE`
+    # still host-tunes every C++/C TU (including these dispatch sources) via the
+    # global `-march=native`; it just cannot remove the (once-resolved) table.
+    target_compile_definitions(numkongDispatch PUBLIC NK_DYNAMIC_DISPATCH=1
+            ${NUMKONG_ISA_DEFS})
     if (NOT MSVC)
         # Third-party C sources; not subject to our warning level.
         target_compile_options(numkongDispatch PRIVATE -w)
