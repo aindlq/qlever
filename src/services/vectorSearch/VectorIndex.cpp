@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <cctype>
 #include <iomanip>
 #include <atomic>
 #include <cerrno>
@@ -1071,6 +1072,25 @@ int vectorSearchThreadCap() {
 #else
   return std::max(1, cap);
 #endif
+}
+
+// Declared in `VectorIndex.h`.
+bool vectorSearchFullPrecision() {
+  // Memoized: the environment does not change at runtime. Truthy =
+  // `1`/`true`/`on`/`yes` (case-insensitive); anything else (unset, empty,
+  // `0`, `false`, ...) leaves the default OFF.
+  static const bool full = []() {
+    const char* value = std::getenv("QLEVER_VECTOR_SEARCH_FULL_PRECISION");
+    if (value == nullptr) {
+      return false;
+    }
+    std::string v{value};
+    for (char& c : v) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return v == "1" || v == "true" || v == "on" || v == "yes";
+  }();
+  return full;
 }
 
 namespace {
@@ -2613,7 +2633,8 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
                         std::optional<size_t> selfRow, const CslsCut& cut,
                         size_t neighbors,
                         std::optional<ql::span<const Id>> candidates,
-                        const CheckInterruptCallback& checkInterrupt) {
+                        const CheckInterruptCallback& checkInterrupt,
+                        bool fullPrecision) {
   // For Threshold this is the tau, for Knee the floor (identical machinery);
   // unused by Softmax.
   const float threshold = cut.threshold_;
@@ -2686,10 +2707,14 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
   result.scored_ = n;
   result.hasCsls_ = hasCsls;
 
-  if (!impl.rerank_.has_value()) {
-    // SINGLE-LAYER: the coarse and fine layers coincide, so a coarse
-    // preselection would buy nothing -- one full sweep of the only matrix.
-    // Every candidate is reranked, so the depth policy is moot.
+  if (!impl.rerank_.has_value() || fullPrecision) {
+    // SINGLE-LAYER (or FULL-PRECISION forced): the coarse and fine layers
+    // coincide -- or the caller's `fullPrecision` deliberately bypasses the
+    // coarse layer -- so a coarse preselection would buy nothing (or is
+    // suppressed): one full sweep of the FINE matrix (`layer` is always the
+    // fine layer). Every candidate is reranked, so the depth policy is moot.
+    // Forcing this branch on a two-layer index runs autoCut/CSLS directly on
+    // the full-precision layer (e.g. bf16) -- the `vec:fullPrecision` mode.
     //
     // 2. The full fine-layer distance sweep (CSLS needs EVERY cosine, so
     //    there is no top-k shortcut). Rows come out of step 1
@@ -3040,7 +3065,8 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
     ql::span<const float> query, const CslsCut& cut, size_t neighbors,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored,
+    bool fullPrecision) const {
   auto& impl = *impl_;
   AD_CONTRACT_CHECK(impl.meta_.config_.csls_ || !cutNeedsCslsSidecar(cut),
                     "searchCsls called with a CSLS cut on an index without "
@@ -3062,7 +3088,7 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
                                : queryBytes;
   CslsReranked reranked =
       rerankCsls(impl, layer, queryBytes, coarseQueryBytes, std::nullopt, cut,
-                 neighbors, candidates, checkInterrupt);
+                 neighbors, candidates, checkInterrupt, fullPrecision);
   if (numScored != nullptr) {
     *numScored = reranked.scored_;
   }
@@ -3074,7 +3100,8 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
     Id entity, const CslsCut& cut, size_t neighbors,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored,
+    bool fullPrecision) const {
   auto& impl = *impl_;
   AD_CONTRACT_CHECK(impl.meta_.config_.csls_ || !cutNeedsCslsSidecar(cut),
                     "searchCslsByEntity called with a CSLS cut on an index "
@@ -3090,9 +3117,9 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
     }
     return {};
   }
-  CslsReranked reranked = rerankCsls(impl, layer, layer.rowPtr(row.value()),
-                                     impl.scan_.rowPtr(row.value()), row, cut,
-                                     neighbors, candidates, checkInterrupt);
+  CslsReranked reranked = rerankCsls(
+      impl, layer, layer.rowPtr(row.value()), impl.scan_.rowPtr(row.value()),
+      row, cut, neighbors, candidates, checkInterrupt, fullPrecision);
   if (numScored != nullptr) {
     *numScored = reranked.scored_;
   }
@@ -3116,7 +3143,7 @@ CslsReranked VectorIndex::computeCslsReranked(
     ql::span<const float> query, size_t neighbors, float floorFraction,
     float widenFraction, size_t rerankCap,
     std::optional<ql::span<const Id>> candidates,
-    const CheckInterruptCallback& checkInterrupt) const {
+    const CheckInterruptCallback& checkInterrupt, bool fullPrecision) const {
   auto& impl = *impl_;
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
   auto& layer = impl.fine();
@@ -3133,14 +3160,14 @@ CslsReranked VectorIndex::computeCslsReranked(
                                : queryBytes;
   return rerankCsls(impl, layer, queryBytes, coarseQueryBytes, std::nullopt,
                     plateauRerankCut(floorFraction, widenFraction, rerankCap),
-                    neighbors, candidates, checkInterrupt);
+                    neighbors, candidates, checkInterrupt, fullPrecision);
 }
 
 // ____________________________________________________________________________
 CslsReranked VectorIndex::computeCslsRerankedByEntity(
     Id entity, size_t neighbors, float floorFraction, float widenFraction,
     size_t rerankCap, std::optional<ql::span<const Id>> candidates,
-    const CheckInterruptCallback& checkInterrupt) const {
+    const CheckInterruptCallback& checkInterrupt, bool fullPrecision) const {
   auto& impl = *impl_;
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
   auto& layer = impl.fine();
@@ -3151,7 +3178,7 @@ CslsReranked VectorIndex::computeCslsRerankedByEntity(
   return rerankCsls(impl, layer, layer.rowPtr(row.value()),
                     impl.scan_.rowPtr(row.value()), row,
                     plateauRerankCut(floorFraction, widenFraction, rerankCap),
-                    neighbors, candidates, checkInterrupt);
+                    neighbors, candidates, checkInterrupt, fullPrecision);
 }
 
 // ____________________________________________________________________________

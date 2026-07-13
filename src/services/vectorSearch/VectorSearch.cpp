@@ -217,6 +217,15 @@ CslsRerankedCache& cslsRerankedCache() {
                                  ad_utility::MemorySize::megabytes(128)};
   return cache;
 }
+
+// The effective full-precision decision for a query: the per-query
+// `vec:fullPrecision` flag OR the server-wide default env
+// `QLEVER_VECTOR_SEARCH_FULL_PRECISION` (`vectorSearchFullPrecision()`). When
+// true, the search bypasses the quantized coarse layer and scans the
+// full-precision fine layer (e.g. bf16) exhaustively.
+bool effectiveFullPrecision(const VectorSearchConfiguration& config) {
+  return config.fullPrecision_ || vectorSearchFullPrecision();
+}
 }  // namespace
 
 // ____________________________________________________________________________
@@ -233,6 +242,7 @@ std::vector<CslsScoredEntity> runCslsCut(
   auto setHit = [&](bool h) {
     if (rerankCacheHit != nullptr) *rerankCacheHit = h;
   };
+  const bool fullPrecision = effectiveFullPrecision(config);
   // The fixed threshold (and any non-coverage cut) stays on the direct,
   // uncached path -- it is not what mode-switching re-applies.
   if (cut.mode_ != CslsCut::Mode::ZCut && cut.mode_ != CslsCut::Mode::Softmax) {
@@ -240,18 +250,22 @@ std::vector<CslsScoredEntity> runCslsCut(
     return queryEntity.has_value()
                ? vidx.searchCslsByEntity(queryEntity.value(), cut, neighbors,
                                          candidates, config.maxDistance_,
-                                         checkInterrupt, numScored)
+                                         checkInterrupt, numScored,
+                                         fullPrecision)
                : vidx.searchCsls(query, cut, neighbors, candidates,
-                                 config.maxDistance_, checkInterrupt,
-                                 numScored);
+                                 config.maxDistance_, checkInterrupt, numScored,
+                                 fullPrecision);
   }
   // Cache key: the mode-independent rerank drivers. NOT the coverage mode,
   // signal, softmax params, cslsKCap, or maxDistance (all applied at cut time).
+  // `fp=` IS part of the key: full precision changes WHICH candidates are
+  // reranked (the whole fine layer vs. the coarse-preselected batch), so the
+  // two modes must never share a cached reranked set.
   std::string key = absl::StrCat(
       "CSLS_RERANK idx=", config.indexName_, " nb=", neighbors,
       " ff=", absl::Hex(absl::bit_cast<uint32_t>(cut.floorFraction_)),
       " wf=", absl::Hex(absl::bit_cast<uint32_t>(cut.widenFraction_)),
-      " cap=", cut.rerankCap_);
+      " cap=", cut.rerankCap_, " fp=", fullPrecision);
   appendQueryPointToCacheKey(&key, config);
   absl::StrAppend(&key, " cand={", candidateIdentity, "}");
   auto compute = [&]() -> CslsReranked {
@@ -259,10 +273,11 @@ std::vector<CslsScoredEntity> runCslsCut(
                ? vidx.computeCslsRerankedByEntity(
                      queryEntity.value(), neighbors, cut.floorFraction_,
                      cut.widenFraction_, cut.rerankCap_, candidates,
-                     checkInterrupt)
+                     checkInterrupt, fullPrecision)
                : vidx.computeCslsReranked(query, neighbors, cut.floorFraction_,
                                           cut.widenFraction_, cut.rerankCap_,
-                                          candidates, checkInterrupt);
+                                          candidates, checkInterrupt,
+                                          fullPrecision);
   };
   auto res =
       cslsRerankedCache().computeOnce(key, compute, /*onlyReadFromCache=*/false,
@@ -326,6 +341,10 @@ IdTable computeWholeIndexSearch(
                      config.indexName_, "' has no HNSW structure.")};
   }
   auto checkInterrupt = [&handle]() { handle->throwIfCancelled(); };
+  // `vec:fullPrecision` (or the server-wide env default): skip the coarse layer
+  // and scan the full-precision fine layer exhaustively. Applies to both the
+  // CSLS/autoCut path (via `runCslsCut`) and the plain top-k path below.
+  const bool fullPrecision = effectiveFullPrecision(config);
 
   if (config.hasCslsCut()) {
     // CSLS-machinery cut over the WHOLE index -- the fixed tau
@@ -349,9 +368,11 @@ IdTable computeWholeIndexSearch(
     logVectorSearchPhase(
         config.indexName_,
         cacheHit ? "csls rerank (cache hit) + cut"
-                 : (vidx->hasRerankLayer()
-                        ? "coarse scan + rerank (csls)"
-                        : "full fine scan (csls; coarse layer unused)"),
+        : (vidx->hasRerankLayer() && !fullPrecision)
+            ? "coarse scan + rerank (csls)"
+            : (vidx->hasRerankLayer()
+                   ? "full fine scan (csls; full-precision forced, coarse skipped)"
+                   : "full fine scan (csls; coarse layer unused)"),
         ms, numScored);
     logVectorSearchPhase(config.indexName_,
                          absl::StrCat("csls filter: ", numScored,
@@ -383,7 +404,10 @@ IdTable computeWholeIndexSearch(
   // Whole-index search (by the stored vector for the entity form -- no
   // decode/re-encode through f32).
   std::vector<ScoredEntity> results;
-  bool useHnsw = vidx->hasHnsw() && config.algorithm_ != Algo::Exact;
+  // Full-precision mode is an EXHAUSTIVE fine-layer scan, so it also disables
+  // the HNSW probe (an exact brute force, no approximation).
+  bool useHnsw =
+      vidx->hasHnsw() && config.algorithm_ != Algo::Exact && !fullPrecision;
   // The coarse (scan-layer) distance per result entity, kept iff
   // `vec:bindCoarseScore` asked for it. On a single-layer index the two
   // layers coincide, so the fine distance doubles as the coarse one and this
@@ -391,7 +415,7 @@ IdTable computeWholeIndexSearch(
   ad_utility::HashMap<Id, float> coarseDistances;
   const bool withCoarseScore = config.coarseScoreVariable_.has_value();
 
-  if (vidx->hasRerankLayer()) {
+  if (vidx->hasRerankLayer() && !fullPrecision) {
     // TWO-LAYER coarse-scan-then-rerank: (1) the coarse pass searches the
     // quantized scan matrix (brute force, or HNSW per `vec:algorithm` -- the
     // graph reads the scan bytes) for the top-`rerankK` candidates;
@@ -463,7 +487,11 @@ IdTable computeWholeIndexSearch(
                                         config.maxDistance_, checkInterrupt);
     }
     logVectorSearchPhase(
-        config.indexName_, useHnsw ? "HNSW probe" : "brute-force scan",
+        config.indexName_,
+        useHnsw ? "HNSW probe"
+                : (vidx->hasRerankLayer()
+                       ? "brute-force scan (full-precision, coarse layer skipped)"
+                       : "brute-force scan"),
         scanTimer.value().count() / 1000.0,
         useHnsw ? std::optional<size_t>{}
                 : std::optional<size_t>{vidx->numLiveVectors()});

@@ -42,10 +42,16 @@ COPY GitVersion.cmake /qlever/
 # Build. Tests are OFF by default here (vector build fetches usearch + NumKong
 # and running the full suite is slow); pass `--build-arg RUN_TESTS=true` to run.
 ARG RUN_TESTS=false
+# Host-tuned build: pass `--build-arg MARCH_NATIVE=ON` to compile the WHOLE
+# binary with `-march=native` (host-specific, NOT portable) so it can be
+# benchmarked against the default portable runtime-dispatch build. Default OFF
+# keeps the image portable.
+ARG MARCH_NATIVE=OFF
 WORKDIR /qlever/build/
 RUN cmake -DCMAKE_BUILD_TYPE=Release -DLOGLEVEL=INFO -DUSE_PARALLEL=true \
       -D_NO_TIMING_TESTS=ON -DCOMPILER_SUPPORTS_MARCH_NATIVE=FALSE \
       -DQLEVER_WITH_VECTOR_SEARCH=ON -DQLEVER_VECTOR_SEARCH_SIMD=ON \
+      -DQLEVER_MARCH_NATIVE=${MARCH_NATIVE} \
       -GNinja ..
 RUN if [ "$RUN_TESTS" = "true" ]; then \
       cmake --build . && ctest --rerun-failed --output-on-failure; \

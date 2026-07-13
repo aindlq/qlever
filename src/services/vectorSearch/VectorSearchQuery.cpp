@@ -276,6 +276,19 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
       throw VectorSearchException{
           absl::StrCat("Unknown vector-search algorithm `", a, "`.")};
     }
+  } else if (pred == "fullPrecision") {
+    std::string v = requireLiteral();
+    if (v == "true" || v == "1") {
+      fullPrecision_ = true;
+    } else if (v == "false" || v == "0") {
+      fullPrecision_ = false;
+    } else {
+      throw VectorSearchException{
+          "The parameter `<fullPrecision>` expects a boolean (`true`/`false`). "
+          "When true, the search skips the quantized coarse layer and scans "
+          "the full-precision fine layer (e.g. bf16) exhaustively -- no coarse "
+          "preselection or rerank."};
+    }
   } else {
     throw VectorSearchException{absl::StrCat(
         "Unsupported parameter `<", pred,
@@ -285,7 +298,8 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
         "`<bindScore>`, `<bindCoarseScore>`, `<bindCsls>`, `<k>` (alias "
         "`<numNearestNeighbors>`), `<rerankK>`, `<maxDistance>`, "
         "`<cslsThreshold>`, `<cslsNeighbors>`, `<autoCut>`, `<cutSignal>`, "
-        "`<softmaxTemperature>`, `<softmaxN>`, `<algorithm>`.")};
+        "`<softmaxTemperature>`, `<softmaxN>`, `<algorithm>`, "
+        "`<fullPrecision>`.")};
   }
 }
 
@@ -478,6 +492,7 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   // -- the point of the cuts).
   config.cslsKCap_ = hasCslsCut && k_.has_value() ? k_ : std::nullopt;
   config.algorithm_ = algo_;
+  config.fullPrecision_ = fullPrecision_;
   return config;
 }
 

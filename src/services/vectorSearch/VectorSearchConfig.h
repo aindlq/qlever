@@ -167,6 +167,15 @@ struct VectorSearchConfiguration {
   // the index decides (HNSW if available, else exact).
   enum class Algorithm { Automatic, Exact, Hnsw };
   Algorithm algorithm_ = Algorithm::Automatic;
+
+  // `vec:fullPrecision true`: skip the quantized coarse layer and score every
+  // candidate directly on the full-precision FINE layer (e.g. bf16) -- an
+  // exhaustive brute force with no coarse preselection or rerank. Makes a
+  // two-layer (binary + bf16) index behave exactly like a single-layer bf16
+  // one, for A/B benchmarking on the same data. Default false = the normal
+  // coarse-scan-then-rerank. A no-op on single-layer indices. The server-wide
+  // env `QLEVER_VECTOR_SEARCH_FULL_PRECISION` forces it on for every query.
+  bool fullPrecision_ = false;
 };
 
 }  // namespace qlever::vector

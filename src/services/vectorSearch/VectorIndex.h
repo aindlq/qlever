@@ -511,12 +511,16 @@ class VectorIndex {
   // cosine distance stays the score); the caller applies any top-k cap.
   // `numScored`, if set, receives the number of candidates that were scored
   // (the live set, or the members among `candidates`).
+  // `fullPrecision` (the `vec:fullPrecision` query flag) forces an exhaustive
+  // sweep of the FINE layer with NO coarse preselection, even on a two-layer
+  // index -- i.e. the single-layer code path -- so the search runs directly on
+  // the highest-precision layer (e.g. bf16). A no-op on single-layer indices.
   std::vector<CslsScoredEntity> searchCsls(
       ql::span<const float> query, const CslsCut& cut, size_t neighbors,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr) const;
+      size_t* numScored = nullptr, bool fullPrecision = false) const;
 
   // The same with a STORED entity's vector as the query point (its stored
   // bytes of the layer being swept are used directly -- the fine row for the
@@ -528,7 +532,7 @@ class VectorIndex {
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr) const;
+      size_t* numScored = nullptr, bool fullPrecision = false) const;
 
   // Stage (a) of the coverage-mode `vec:autoCut` (the `cosine`/`csls`/`softmax`
   // signals): rerank the candidates to the TOP-ANCHORED depth -- widen in
@@ -544,14 +548,16 @@ class VectorIndex {
       ql::span<const float> query, size_t neighbors, float floorFraction,
       float widenFraction, size_t rerankCap,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
-      const CheckInterruptCallback& checkInterrupt = {}) const;
+      const CheckInterruptCallback& checkInterrupt = {},
+      bool fullPrecision = false) const;
 
   // The same with a STORED entity's vector as the query point.
   CslsReranked computeCslsRerankedByEntity(
       Id entity, size_t neighbors, float floorFraction, float widenFraction,
       size_t rerankCap,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
-      const CheckInterruptCallback& checkInterrupt = {}) const;
+      const CheckInterruptCallback& checkInterrupt = {},
+      bool fullPrecision = false) const;
 
   // Stage (b): apply a coverage-mode `cut` (ZCut over the cosine/CSLS signal,
   // or Softmax) to an already-`computeCslsReranked` set. O(reranked), no
@@ -680,6 +686,18 @@ unsigned physicalCoreCount();
 // leaves the default. Search-side only -- the index-build thread counts are
 // chosen separately.
 int vectorSearchThreadCap();
+
+// Whether every vector search should skip the quantized COARSE layer and score
+// each candidate directly on the full-precision FINE layer (the rerank matrix,
+// e.g. bf16) -- an exhaustive brute force with NO coarse preselection or rerank.
+// Controlled once at process start by the environment variable
+// `QLEVER_VECTOR_SEARCH_FULL_PRECISION` (a truthy value `1`/`true`/`on`/`yes`,
+// case-insensitive). This makes a two-layer (binary + bf16) index behave exactly
+// like a single-layer bf16 index, so the two can be A/B benchmarked on the SAME
+// data with no rebuild. A no-op on single-layer indices (they already sweep
+// their only layer) and on plain top-k as well as `vec:autoCut`/CSLS queries.
+// Default OFF = the normal coarse-scan-then-rerank behaviour. Memoized.
+bool vectorSearchFullPrecision();
 
 }  // namespace qlever::vector
 

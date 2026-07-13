@@ -381,6 +381,26 @@ endif()
 # Enable the specification of additional compiler flags manually from the commandline
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ADDITIONAL_COMPILER_FLAGS}")
 
+# Optional host-tuned build: add `-march=native` to the WHOLE QLever build (all
+# C++ translation units -- the vector-search scan loops included) so it targets
+# the exact CPU it is compiled on. NOT portable (the binary may use instructions
+# absent on other CPUs). Purpose: benchmark a host-native build against the
+# default PORTABLE build, whose NumKong SIMD kernels are runtime-dispatched via
+# CPUID. Enable with `-DQLEVER_MARCH_NATIVE=ON`. The NumKong dispatch library
+# picks this up too (see src/services/vectorSearch/CMakeLists.txt).
+option(QLEVER_MARCH_NATIVE "Build host-tuned with -march=native (not portable)" OFF)
+if (QLEVER_MARCH_NATIVE)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-march=native" QLEVER_HAS_MARCH_NATIVE)
+    if (QLEVER_HAS_MARCH_NATIVE)
+        message(STATUS "QLEVER_MARCH_NATIVE=ON: host-tuned build with -march=native (NOT portable)")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native")
+    else ()
+        message(WARNING "QLEVER_MARCH_NATIVE=ON but the compiler rejects -march=native; ignoring.")
+    endif ()
+endif ()
+
 
 set(VOCAB_UNCOMPRESSED_IN_MEMORY OFF CACHE BOOL "Store QLever's vocabulary uncompressed and completely in RAM")
 if (${VOCAB_UNCOMPRESSED_IN_MEMORY})

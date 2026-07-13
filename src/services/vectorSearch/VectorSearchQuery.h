@@ -114,6 +114,8 @@ struct VectorSearchQuery : MagicServiceQuery {
   std::optional<size_t> softmaxN_;
   qlever::vector::VectorSearchConfiguration::Algorithm algo_ =
       qlever::vector::VectorSearchConfiguration::Algorithm::Automatic;
+  // `vec:fullPrecision true` -> exhaustive fine-layer scan, no coarse/rerank.
+  bool fullPrecision_ = false;
 
   // Inherited from `MagicServiceQuery`.
   void addParameter(const SparqlTriple& triple) override;
