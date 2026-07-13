@@ -8,9 +8,6 @@
 #include "services/vectorSearch/VectorIndex.h"
 
 #include <sys/mman.h>
-#if defined(__linux__)
-#include <sched.h>  // sched_getaffinity: make the thread cap cpuset-aware
-#endif
 
 #include <algorithm>
 #include <cctype>
@@ -1470,26 +1467,15 @@ int vectorSearchThreadCap() {
     return static_cast<int>(parsed);
   }();
   int cap = envThreads.value_or(static_cast<int>(physicalCoreCount()));
-#if defined(__linux__)
-  // Respect a cpuset/affinity applied to the process (e.g. a Docker `cpuset`).
-  // `physicalCoreCount()` reads machine-wide `/proc/cpuinfo` and is BLIND to
-  // it, so on a container pinned to M < 24 cores the default cap would be 24 --
-  // oversubscribing 24 threads onto M cores, which COSTS ~20-30% on the
-  // memory-bound sweep (measured). Clamp by the CPUs actually allowed right now
-  // (not memoized: affinity can change at runtime). CPU_COUNT is logical CPUs;
-  // on the normal "pin to physical cores" cpuset (HT siblings excluded) it
-  // equals the physical-core budget. This also clamps an explicit
-  // QLEVER_VECTOR_SEARCH_THREADS that exceeds the pinned set.
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-    int allowed = CPU_COUNT(&set);
-    if (allowed > 0) {
-      cap = std::min(cap, allowed);
-    }
-  }
-#endif
 #ifdef _OPENMP
+  // `omp_get_max_threads()` already reflects the process's cpuset: libgomp reads
+  // the affinity mask ONCE at startup (before `OMP_PROC_BIND` binds the master
+  // thread) and derives its default thread count from it. So on a container
+  // pinned to M cores with OMP_NUM_THREADS unset this returns M, and the min
+  // below IS the cpuset clamp. Do NOT clamp by a per-scan `sched_getaffinity`
+  // here: it returns the CALLING thread's mask, which `OMP_PROC_BIND=close`
+  // narrows to a SINGLE core for the master -> the whole sweep collapses to 1
+  // thread (a real regression that this NOTE exists to prevent recurring).
   return std::max(1, std::min(omp_get_max_threads(), cap));
 #else
   return std::max(1, cap);
