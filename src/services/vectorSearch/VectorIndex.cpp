@@ -161,6 +161,28 @@ struct VectorIndex::Impl {
     // by the fits-in-RAM gate.
     Residency residency_ = Residency::None;
 
+#if USEARCH_USE_NUMKONG
+    // P3: the RAW NumKong per-pair distance kernel for this layer, resolved
+    // ONCE at open via `nk_find_kernel_punned` -- the SAME kernel usearch's
+    // `metric_punned_t` bakes in, so results are bit-identical, but callable
+    // directly (one indirection, no `optional::value()` / member-function-
+    // pointer bit test / result-through-stack of the punned wrapper). The hot
+    // sweeps call this instead of `distanceBetweenBytes` where profitable.
+    // `nullptr` on a non-NumKong build or an unresolvable kernel -> callers
+    // fall back to the punned `metric_`.
+    //
+    // Signature is the NumKong dense-metric ABI `(a, b, n, &result)`; the
+    // result scalar width is u32 for the (integer) Hamming kernel.
+    using RawU32Kernel = void (*)(const void*, const void*, nk_size_t,
+                                  nk_u32_t*);
+    RawU32Kernel rawHammingKernel_ = nullptr;
+    // The third argument of the raw kernel: for the u1 (binary) Hamming kernel
+    // this is the number of BITS (`dim_`), NOT bytes -- exactly what usearch
+    // passes (`index_plugins.hpp`: `metric_third_arg_ = dimensions_` for
+    // b1x8). Only meaningful when `rawHammingKernel_ != nullptr`.
+    nk_size_t rawKernelThirdArg_ = 0;
+#endif
+
     // Base pointer of the active matrix: the aligned RAM copy if present,
     // else the memory-mapped file.
     const char* base() const {
@@ -204,6 +226,18 @@ struct VectorIndex::Impl {
     float distanceToRow(const char* queryBytes, size_t i) const {
       return distanceBetweenBytes(queryBytes, rowPtr(i));
     }
+
+#if USEARCH_USE_NUMKONG
+    // P3: Hamming distance via the raw kernel resolved at open (see
+    // `rawHammingKernel_`). `queryBytes`/`b` are `rowBytes_`-sized encoded
+    // vectors. Only valid when `rawHammingKernel_ != nullptr`; the u1 kernel
+    // takes the BIT count (`rawKernelThirdArg_`), not the byte count.
+    uint32_t rawHamming(const char* queryBytes, const char* b) const {
+      nk_u32_t r;
+      rawHammingKernel_(queryBytes, b, rawKernelThirdArg_, &r);
+      return static_cast<uint32_t>(r);
+    }
+#endif
   };
 
   VectorIndexMetadata meta_;
@@ -297,6 +331,43 @@ template <typename LayerT>
 void makeLayerResident(LayerT& layer, VectorIndex::Residency residency,
                        size_t numRows, const std::string& indexName,
                        const char* layerLabel);
+
+// Resolve the NumKong fast paths of one matrix layer at open.
+//
+//  - P3 (a layer with an integer Hamming metric, i.e. the binary SCAN layer):
+//    resolve the RAW per-pair Hamming kernel once so the hot coarse sweep can
+//    call it directly instead of through `metric_punned_t`. It is the same
+//    kernel usearch baked into the punned metric.
+//
+// A no-op without NumKong. `scalar`/`metric` are the layer's storage scalar
+// and metric; `numRows` the store row count; `numThreads` a build fan-out
+// (unused here, reserved for later fast paths).
+template <typename LayerT>
+void configureLayerFastPaths([[maybe_unused]] LayerT& layer,
+                             [[maybe_unused]] VectorScalar scalar,
+                             [[maybe_unused]] VectorMetric metric,
+                             [[maybe_unused]] size_t numRows,
+                             [[maybe_unused]] int numThreads) {
+#if USEARCH_USE_NUMKONG
+  const nk_capability_t caps = nk_capabilities_available();
+
+  // P3: raw Hamming kernel for the binary (b1x8) scan layer.
+  if (scalar == VectorScalar::Binary) {
+    nk_kernel_punned_t kfn = nullptr;
+    nk_capability_t used{};
+    nk_find_kernel_punned(nk_kernel_hamming_k, nk_u1_k, caps, &kfn, &used);
+    // memcpy the opaque `(void*)` kernel pointer into the typed slot (same
+    // trick usearch uses for `metric_ptr_`): a plain reinterpret_cast between
+    // incompatible function-pointer types trips -Wcast-function-type.
+    typename LayerT::RawU32Kernel typed = nullptr;
+    std::memcpy(&typed, &kfn, sizeof(typed));
+    layer.rawHammingKernel_ = typed;
+    // The u1 kernel's third argument is the number of BITS (== dim), not
+    // bytes -- exactly what usearch passes for a b1x8 metric.
+    layer.rawKernelThirdArg_ = static_cast<nk_size_t>(layer.dim_);
+  }
+#endif
+}
 
 // ____________________________________________________________________________
 VectorIndex::VectorIndex() : impl_{std::make_unique<Impl>()} {}
@@ -508,6 +579,24 @@ void VectorIndex::open(const std::string& basename, const std::string& name,
     makeLayerResident(impl.rerank_.value(), rerankResidency,
                       impl.meta_.numVectors_, impl.meta_.config_.name_,
                       "rerank");
+  }
+
+  // 6. Resolve the NumKong fast paths (P3 raw Hamming kernel). Done AFTER
+  //    residency so any future sidecar is built over the FINAL layer
+  //    base/stride. The scan layer of a two-layer binary index is Hamming
+  //    (`toUsearchScanMetric`); the fine layer carries the index metric.
+  int fastPathThreads = 1;
+#ifdef _OPENMP
+  fastPathThreads = std::max(1, omp_get_max_threads());
+#endif
+  configureLayerFastPaths(impl.scan_, impl.meta_.config_.scalar_,
+                          impl.meta_.config_.metric_, impl.meta_.numVectors_,
+                          fastPathThreads);
+  if (impl.rerank_.has_value()) {
+    configureLayerFastPaths(impl.rerank_.value(),
+                            impl.meta_.config_.rerankScalar_.value(),
+                            impl.meta_.config_.metric_, impl.meta_.numVectors_,
+                            fastPathThreads);
   }
 }
 
