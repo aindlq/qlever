@@ -77,8 +77,20 @@ if (QLEVER_VECTOR_SEARCH_SIMD)
             "${numkong_SOURCE_DIR}/include")
     # PUBLIC: the consuming C++ TUs (usearch headers) must see the same
     # configuration as the dispatch tables.
-    target_compile_definitions(numkongDispatch PUBLIC NK_DYNAMIC_DISPATCH=1
-            ${NUMKONG_ISA_DEFS})
+    if (QLEVER_MARCH_NATIVE)
+        # NATIVE/STATIC dispatch: `-march=native` (set globally) makes NumKong's
+        # headers auto-detect the host ISA from the compiler's predefined macros
+        # (e.g. `__AVX512BF16__` -> `NK_TARGET_GENOA=1`) and compile a SINGLE
+        # native kernel set, resolved by a direct call -- no runtime dispatch
+        # table. Pass NO `NK_TARGET_*` defines: an explicit `=0` would DISABLE
+        # the header auto-detect and silently drop to a slower (upconvert)
+        # kernel. Removes the `dynamic-dispatch=on` indirection (a small win --
+        # the dispatch table is resolved once at init, not per call).
+        target_compile_definitions(numkongDispatch PUBLIC NK_DYNAMIC_DISPATCH=0)
+    else ()
+        target_compile_definitions(numkongDispatch PUBLIC NK_DYNAMIC_DISPATCH=1
+                ${NUMKONG_ISA_DEFS})
+    endif ()
     if (NOT MSVC)
         # Third-party C sources; not subject to our warning level.
         target_compile_options(numkongDispatch PRIVATE -w)
