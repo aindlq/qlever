@@ -277,11 +277,21 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
           absl::StrCat("Unknown vector-search algorithm `", a, "`.")};
     }
   } else if (pred == "fullPrecision") {
-    std::string v = requireLiteral();
-    if (v == "true" || v == "1") {
-      fullPrecision_ = true;
-    } else if (v == "false" || v == "0") {
-      fullPrecision_ = false;
+    // Accept a bare xsd:boolean (`vec:fullPrecision true`) or a string
+    // (`vec:fullPrecision "true"`).
+    if (object.isBool()) {
+      fullPrecision_ = object.getBool();
+    } else if (object.isLiteral()) {
+      std::string v{asStringViewUnsafe(object.getLiteral().getContent())};
+      if (v == "true" || v == "1") {
+        fullPrecision_ = true;
+      } else if (v == "false" || v == "0") {
+        fullPrecision_ = false;
+      } else {
+        throw VectorSearchException{
+            "The parameter `<fullPrecision>` expects a boolean (`true`/`false`, "
+            "bare or as a string)."};
+      }
     } else {
       throw VectorSearchException{
           "The parameter `<fullPrecision>` expects a boolean (`true`/`false`). "

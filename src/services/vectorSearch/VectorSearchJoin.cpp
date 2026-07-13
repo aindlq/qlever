@@ -441,6 +441,13 @@ void VectorSearchJoin::computePreFilterRows(
   // The CSLS value of every kept candidate, iff a csls cut binding it is set.
   ad_utility::HashMap<Id, float> cslsValues;
   std::vector<qlever::vector::ScoredEntity> scored;
+  // `vec:fullPrecision` (or the server-wide env default): skip the quantized
+  // coarse layer and score every bound candidate directly on the full-precision
+  // fine layer (e.g. bf16) -- i.e. fall through to the single-layer `searchExact`
+  // branch below, even on a two-layer index. (CSLS handles it inside
+  // `runCslsCut`.)
+  const bool fullPrecision =
+      config_.fullPrecision_ || qlever::vector::vectorSearchFullPrecision();
   if (config_.hasCslsCut()) {
     // CSLS-machinery cut over the BOUND set -- the fixed tau
     // (`vec:cslsThreshold`) or a dynamic `vec:autoCut` (knee/softmax): every
@@ -491,7 +498,7 @@ void VectorSearchJoin::computePreFilterRows(
           qlever::vector::ScoredEntity{hit.entity_, hit.distance_});
       cslsValues[hit.entity_] = hit.csls_;
     }
-  } else if (vidx.hasRerankLayer()) {
+  } else if (vidx.hasRerankLayer() && !fullPrecision) {
     // Coarse pass over exactly the bound set, then the fine rerank pass over
     // the coarse survivors (never below `effectiveK`, so the annotate form
     // without `<k>` keeps every candidate). `maxDistance` filters on the
@@ -545,8 +552,13 @@ void VectorSearchJoin::computePreFilterRows(
                                     config_.maxDistance_, checkInterrupt,
                                     &numScored);
     // Members actually scored, not the raw candidate count (see above).
+    // When the index HAS a rerank layer but we reached this branch, it is
+    // because `vec:fullPrecision` forced the coarse layer to be skipped.
     qlever::vector::logVectorSearchPhase(
-        config_.indexName_, "brute-force scan (index members)",
+        config_.indexName_,
+        vidx.hasRerankLayer()
+            ? "brute-force scan (fine layer, full-precision, index members)"
+            : "brute-force scan (index members)",
         scanTimer.value().count() / 1000.0, numScored);
   }
 
