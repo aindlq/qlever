@@ -211,10 +211,12 @@ inline size_t rowBytesFor(VectorScalar s, size_t dim) {
 // Default coarse-candidate count of the two-layer rerank pass when
 // `vec:rerankK` is unset (always additionally clamped to >= k by the
 // callers). The `binary` scan layer keeps 1 bit per component (vs i8's 8), so
-// its Hamming pre-ranking is far coarser and needs a wider candidate margin
-// for the fine rerank to recover the true top-k.
+// its Hamming pre-ranking is coarser and wants a wider fine-rerank margin --
+// but 50*k (e.g. 50k at k=1000) overshoots; a 10k floor (== 10*k at the common
+// k=1000) recovers the true top-k while keeping the rerank pass cheap. Raise it
+// per query with `vec:rerankK` when boundary recall matters more than latency.
 inline size_t defaultRerankK(VectorScalar scanScalar, size_t k) {
-  return scanScalar == VectorScalar::Binary ? std::max<size_t>(50 * k, 500)
+  return scanScalar == VectorScalar::Binary ? std::max<size_t>(10 * k, 10000)
                                             : std::max<size_t>(10 * k, 100);
 }
 
