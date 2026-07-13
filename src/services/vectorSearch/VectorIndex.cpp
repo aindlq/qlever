@@ -215,11 +215,14 @@ struct VectorIndex::Impl {
     // The CONCRETE per-block kernel this layer runs for a requested
     // `vec:bf16Kernel`, resolved once against the CPU. Distinct values so the
     // hot dispatch never overloads `Bf16Kernel::Punned` for two meanings:
-    //   HandAmx  the hand-rolled fixed-AMX tile block (`cosineBlockKernel`);
-    //   HandSimd the hand-rolled AVX-512-BF16 multi-row block;
+    //   HandSimd the hand-rolled AVX-512-BF16 multi-row block -- the `Auto`
+    //            default (memory-bound sweep + gather; scales with threads);
+    //   HandAmx  the hand-rolled fixed-AMX tile block (`cosineBlockKernel`) --
+    //            opt-in via `vec:bf16Kernel "amx"`; wins only when the sweep is
+    //            compute-bound (bandwidth-rich box), not on a memory-bound one;
     //   Gemm     the NumKong AMX GEMM (`cosineBlockBf16`) -- kept ONLY as the
     //            fallback when no hand-rolled kernel applies (e.g. `dim % 32`),
-    //            never the `Auto` default (the fixed-AMX block beats it);
+    //            never the `Auto` default (a hand-rolled block beats it);
     //   PerRow   no block kernel -> the caller uses the per-row punned metric.
     enum class BlockKernel { HandAmx, HandSimd, Gemm, PerRow };
     BlockKernel resolveBlockKernel(Bf16Kernel requested) const {
@@ -228,8 +231,18 @@ struct VectorIndex::Impl {
       // NumKong GEMM (a bf16 cosine layer whose depth is not a multiple of 32
       // has no hand-rolled kernel but may still have the GEMM), else per-row.
       auto autoBest = [this]() {
-        if (hasAmxKernel_) return BlockKernel::HandAmx;
+        // SIMD BEFORE AMX -- measured, not assumed. The whole-index bf16 sweep
+        // is a ~5 GB streaming read; on a memory-bound box the tightest
+        // sequential streamer (the SIMD `vdpbf16ps` block) rides the bandwidth
+        // wall and SCALES with threads, while the fixed-AMX block is pinned by
+        // its per-block pack/tile overhead (it does NOT scale with threads) and
+        // has no gather for the scattered rerank. On a Sapphire Rapids/DDR5-4400
+        // box at 24 threads SIMD ran the full sweep at ~112 GB/s (44 ms) vs
+        // AMX's ~77 GB/s (64 ms), and the gap only widens with more threads.
+        // AMX wins only on bandwidth-rich boxes where the sweep is compute-
+        // bound; ask for it there with `vec:bf16Kernel "amx"`.
         if (hasSimdKernel_) return BlockKernel::HandSimd;
+        if (hasAmxKernel_) return BlockKernel::HandAmx;
         if (batchedCosineBf16_) return BlockKernel::Gemm;
         return BlockKernel::PerRow;
       };
