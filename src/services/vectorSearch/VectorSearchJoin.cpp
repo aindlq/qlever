@@ -264,6 +264,10 @@ std::string VectorSearchJoin::getCacheKeyImpl() const {
       " annotate=", annotatesCandidatesInPlace(),
       " score=", config_.scoreVariable_.has_value(),
       " coarseScore=", config_.coarseScoreVariable_.has_value());
+  // See VectorSearch::getCacheKeyImpl: fullPrecision changes the result and
+  // bf16Kernel must isolate an A/B run from cross-variant cache hits.
+  absl::StrAppend(&key, " fullPrecision=", config_.fullPrecision_,
+                  " bf16Kernel=", static_cast<int>(config_.bf16Kernel_));
   if (config_.rerankK_.has_value()) {
     absl::StrAppend(&key, " rerankK=", config_.rerankK_.value());
   }

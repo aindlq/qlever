@@ -606,6 +606,12 @@ std::string VectorSearch::getCacheKeyImpl() const {
       " algo=", static_cast<int>(config_.algorithm_),
       " score=", config_.scoreVariable_.has_value(),
       " coarseScore=", config_.coarseScoreVariable_.has_value());
+  // Execution knobs that change the result (fullPrecision skips the coarse
+  // layer -> a different, exact top-k) or that must keep an A/B benchmark from
+  // reading another variant's cached result (bf16Kernel). The CSLS score cache
+  // already keys on both; the main op cache MUST too.
+  absl::StrAppend(&key, " fullPrecision=", config_.fullPrecision_,
+                  " bf16Kernel=", static_cast<int>(config_.bf16Kernel_));
   if (config_.rerankK_.has_value()) {
     absl::StrAppend(&key, " rerankK=", config_.rerankK_.value());
   }

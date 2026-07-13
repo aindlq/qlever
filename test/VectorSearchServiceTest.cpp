@@ -567,6 +567,30 @@ TEST(VectorSearchService, cacheKeyIsBitExactInQueryVector) {
   EXPECT_NE(opA.getCacheKey(), opB.getCacheKey());
 }
 
+// Regression test: `fullPrecision` changes the (exact) top-k and `bf16Kernel`
+// is an A/B dial -- both MUST be in the cache key, else a query pinned to one
+// variant silently reads another variant's cached result (and an A/B run just
+// re-reads the first kernel's timing).
+TEST(VectorSearchService, cacheKeyIncludesFullPrecisionAndBf16Kernel) {
+  auto* qec = qecWithVectorIndex();
+  qlever::vector::VectorSearchConfiguration base;
+  base.indexName_ = "clip";
+  base.resultVariable_ = Variable{"?x"};
+  base.queryVector_ = std::vector<float>{1.f, 0.f, 0.f, 0.f};
+
+  qlever::vector::VectorSearchConfiguration fp = base;
+  fp.fullPrecision_ = true;
+  EXPECT_NE(VectorSearch(qec, base).getCacheKey(),
+            VectorSearch(qec, fp).getCacheKey());
+
+  qlever::vector::VectorSearchConfiguration simd = base;
+  simd.bf16Kernel_ = qlever::vector::Bf16Kernel::Simd;
+  qlever::vector::VectorSearchConfiguration amx = base;
+  amx.bf16Kernel_ = qlever::vector::Bf16Kernel::Amx;
+  EXPECT_NE(VectorSearch(qec, simd).getCacheKey(),
+            VectorSearch(qec, amx).getCacheKey());
+}
+
 // _____________________________________________________________________________
 // Every query form is cacheable, including the embedding-based ones: the query
 // text/image is part of the cache key, and the endpoint + model are fixed for
