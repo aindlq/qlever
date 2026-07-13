@@ -1373,18 +1373,18 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
       const size_t last = n * (tid + 1) / team;
       const char* p = layer.base() + first * layer.stride_;
       const size_t stride = layer.stride_;
-      // Software prefetch to overlap the NEXT rows' loads with the current
-      // row's distance compute. Compact rows (<=256 B) prefetch a fixed ~4 KiB
-      // ahead; large rows (bf16 fine layer, ~2.3 KiB) prefetch ~3 rows ahead
-      // and a few lines to seed the hardware streamer -- with ~46 cycles of
-      // cosine compute per row the streamer alone did NOT keep the sweep
-      // memory-bound (a Sapphire Rapids box held ~90 GB/s of a ~197 GB/s
-      // ceiling). Prefetch never faults, so overrunning the partition/mapping
-      // end is harmless.
-      const size_t pfAhead = stride <= 256 ? size_t{4096} : 3 * stride;
+      // Software prefetch for COMPACT rows: at ~144 B/row the per-row kernel
+      // is too short for the hardware streamer to keep enough misses in
+      // flight, so prefetch the row ~4 KiB ahead explicitly (3 lines cover
+      // one stride advance; prefetch never faults, so running past the
+      // partition or mapping end is harmless). Large rows (bf16 fine layer)
+      // skip this: explicitly prefetching them ~3 rows ahead was measured
+      // SLOWER on a Sapphire Rapids box (50 -> 63 ms -- cache pollution /
+      // prefetch throttling), so the HW streamer handles the big rows.
+      const bool prefetch = stride <= 256;
       for (size_t row = first; row < last; ++row, p += stride) {
-        {
-          const char* f = p + pfAhead;
+        if (prefetch) {
+          const char* f = p + 4096;
           __builtin_prefetch(f, 0, 3);
           __builtin_prefetch(f + 64, 0, 3);
           __builtin_prefetch(f + 128, 0, 3);
@@ -1426,11 +1426,11 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
 #endif
   const char* p = layer.base();
   const size_t stride = layer.stride_;
-  const size_t pfAhead = stride <= 256 ? size_t{4096} : 3 * stride;  // see above
+  const bool prefetch = stride <= 256;  // see the parallel loop above
   size_t sinceCheck = 0;
   for (size_t row = 0; row < n; ++row, p += stride) {
-    {
-      const char* f = p + pfAhead;
+    if (prefetch) {
+      const char* f = p + 4096;
       __builtin_prefetch(f, 0, 3);
       __builtin_prefetch(f + 64, 0, 3);
       __builtin_prefetch(f + 128, 0, 3);
