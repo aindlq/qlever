@@ -175,6 +175,14 @@ struct VectorSearchConfiguration {
   // one, for A/B benchmarking on the same data. Default false = the normal
   // coarse-scan-then-rerank. A no-op on single-layer indices. The server-wide
   // env `QLEVER_VECTOR_SEARCH_FULL_PRECISION` forces it on for every query.
+  //
+  // NOTE for `vec:autoCut`: full precision is not merely a precision refinement
+  // -- it changes the survivor COUNT. The z-cut's noise floor `mu` is the
+  // median of the low half of the SCORED window; full precision scores the
+  // whole corpus (low global-background `mu`), whereas coarse+rerank scores
+  // only the coarse-good prefix (a higher `mu`). The band
+  // `s_max - f*(s_max - mu)` therefore sits LOWER under full precision, so an
+  // autoCut query systematically keeps MORE survivors with it on.
   bool fullPrecision_ = false;
 
   // `vec:bf16Kernel "simd"|"amx"` (default `Auto`): which exact-bf16-cosine

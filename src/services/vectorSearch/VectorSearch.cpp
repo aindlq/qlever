@@ -61,6 +61,15 @@ void appendQueryPointToCacheKey(std::string* key,
 // ____________________________________________________________________________
 void appendCslsCutToCacheKey(std::string* key,
                              const VectorSearchConfiguration& config) {
+  // NOTE: this appends the RAW query-level cut parameters; the RESOLVED cut
+  // (the per-index `zcutFraction*`/`zcutGateZ`/`softmaxTemperature`/`softmaxN`
+  // serving defaults, the `.meta` softmax calibration, and the index's
+  // `cslsRerankFloor` -- see `resolveCslsCut`) is NOT part of the key. That is
+  // sound only because those inputs are process-static: the serving defaults
+  // are fixed once at startup per index NAME (which IS in every caller's key)
+  // and the calibration is immutable per index build. If any of them ever
+  // becomes runtime-mutable, the resolved values MUST join this key (and the
+  // CSLS_RERANK score-cache key in `runCslsCut` for the set-changing ones).
   if (!config.hasCslsCut()) {
     return;
   }
@@ -266,12 +275,24 @@ std::vector<CslsScoredEntity> runCslsCut(
   // reranked set from one kernel must not silently answer a query pinned to
   // another -- and it keeps an A/B benchmark's timings from being polluted by
   // cross-kernel cache hits.
+  // `floorM=` (the per-index `cslsRerankFloor` serving setting) IS part of the
+  // key: it is the rerank WIDENING batch size, so it changes which candidates
+  // end up in the cached reranked set (`cap=` alone does not capture it once
+  // the `max(floor * 8, 10'000)` clamp flattens distinct floors onto one cap).
+  // NOTE: the remaining RESOLVED cut inputs that come from per-index serving
+  // defaults (`fraction_`/`gateZ_`/`temperature_`/`softmaxN_`, see
+  // `resolveCslsCut`) are applied at CUT time over the cached set, never at
+  // rerank time, so they are deliberately NOT in this key. That is sound only
+  // while the serving defaults stay process-static (fixed once at startup); if
+  // they ever become runtime-mutable, the resolved values MUST join the
+  // OPERATION cache key (`appendCslsCutToCacheKey`) -- and anything that
+  // changes the reranked SET itself must join this one.
   std::string key = absl::StrCat(
       "CSLS_RERANK idx=", config.indexName_, " nb=", neighbors,
       " ff=", absl::Hex(absl::bit_cast<uint32_t>(cut.floorFraction_)),
       " wf=", absl::Hex(absl::bit_cast<uint32_t>(cut.widenFraction_)),
-      " cap=", cut.rerankCap_, " fp=", fullPrecision,
-      " bf16k=", static_cast<int>(bf16Kernel));
+      " cap=", cut.rerankCap_, " floorM=", vidx.cslsRerankFloor(),
+      " fp=", fullPrecision, " bf16k=", static_cast<int>(bf16Kernel));
   appendQueryPointToCacheKey(&key, config);
   absl::StrAppend(&key, " cand={", candidateIdentity, "}");
   auto compute = [&]() -> CslsReranked {
