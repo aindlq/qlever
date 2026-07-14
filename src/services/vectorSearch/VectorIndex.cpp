@@ -3531,16 +3531,25 @@ inline std::vector<CslsScoredEntity> applyZCut(
   if (m == 0) {
     return out;
   }
-  // Candidates by signal DESCENDING (ties by entity id) -- the keep set is a
-  // predictable prefix of this order.
-  std::vector<uint32_t> order(m);
-  std::iota(order.begin(), order.end(), 0u);
-  auto bySignalDesc = [&](uint32_t a, uint32_t b) {
-    return signal[a] != signal[b] ? signal[a] > signal[b]
-                                  : entityBits[a] < entityBits[b];
-  };
-  std::sort(order.begin(), order.end(), bySignalDesc);
-  const float sMax = signal[order[0]];
+  // The best candidate: max signal, ties by LOWEST entity id -- O(m). The
+  // former signal-descending sort of ALL m indices existed only to make the
+  // keep set a prefix; but that prefix (break at the first below-band signal
+  // of a descending order) is exactly the SET `{j : signal[j] >= band}`, so a
+  // linear filter below selects the identical set without the sort. The sort
+  // was sized for the two-layer reranked window (m ~ 1e4, ~1 ms) but the
+  // full-precision / single-layer path feeds ALL scored candidates through
+  // here (m ~ 2e6), where the serial indirect sort cost ~450 ms -- ~7x the
+  // whole fine-layer distance sweep it postprocessed. The caller
+  // (`applyCslsCutImpl`) re-sorts the survivors by (distance, id) either way,
+  // so the output is bit-identical.
+  size_t bestJ = 0;
+  for (size_t j = 1; j < m; ++j) {
+    if (signal[j] > signal[bestJ] ||
+        (signal[j] == signal[bestJ] && entityBits[j] < entityBits[bestJ])) {
+      bestJ = j;
+    }
+  }
+  const float sMax = signal[bestJ];
   // The noise floor from the low tail (a copy, since the estimator reorders).
   std::vector<float> scratch(signal);
   const NoiseFloor floor = estimateNoiseFloor(scratch, cut.floorFraction_);
@@ -3555,27 +3564,34 @@ inline std::vector<CslsScoredEntity> applyZCut(
   // median (query-independent; `>= (1-f)*s_max + f*mu`).
   const float band = sMax - cut.fraction_ * (sMax - floor.mu_);
   if (!gated || topClears) {
-    keep = 1;  // the best is always kept once we answer at all
     // A degenerate window with no gap (best == floor: a flat / no-standout
     // field) has band == s_max, so only the single best is kept -- never the
     // whole tied field.
     if (sMax > floor.mu_) {
-      for (; keep < m; ++keep) {
-        // `order` is signal-descending, so the first below-band ends the set.
-        if (signal[order[keep]] < band) {
-          break;
+      // The keep set (formerly the descending order's above-band prefix,
+      // including `order[0]` unconditionally -- `s_max >= band` always).
+      auto keepJ = [&](size_t j) {
+        const float d = fineDist[j];
+        ++keep;  // `keep` counts band-passers BEFORE the maxDistance filter
+        if (maxDistance.has_value() && d > maxDistance.value()) {
+          return;
+        }
+        out.push_back(
+            CslsScoredEntity{Id::fromBits(entityBits[j]), d, csls[j]});
+      };
+      for (size_t j = 0; j < m; ++j) {
+        if (signal[j] >= band) {
+          keepJ(j);
         }
       }
+    } else {
+      keep = 1;  // the best is always kept once we answer at all
+      const float d = fineDist[bestJ];
+      if (!maxDistance.has_value() || d <= maxDistance.value()) {
+        out.push_back(CslsScoredEntity{Id::fromBits(entityBits[bestJ]), d,
+                                       csls[bestJ]});
+      }
     }
-  }
-  out.reserve(keep);
-  for (size_t r = 0; r < keep; ++r) {
-    const uint32_t j = order[r];
-    const float d = fineDist[j];
-    if (maxDistance.has_value() && d > maxDistance.value()) {
-      continue;
-    }
-    out.push_back(CslsScoredEntity{Id::fromBits(entityBits[j]), d, csls[j]});
   }
   AD_LOG_INFO << "Vector index \"" << indexName << "\": csls zcut ("
               << (cut.signal_ == CslsCut::Signal::Csls ? "csls" : "cosine")
