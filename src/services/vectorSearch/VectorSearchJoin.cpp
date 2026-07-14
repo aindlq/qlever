@@ -439,6 +439,12 @@ void VectorSearchJoin::computePreFilterRows(
   }
   const size_t effectiveK =
       config_.keepAllCandidates_ ? candidates.size() : config_.k_;
+  // The annotate form must score and return EVERY bound candidate, so it may
+  // not be truncated by the engine's hard `MAX_SEARCH_RESULTS` top-k cap
+  // (`keepAll` lifts the cap on every primitive of this path; the result stays
+  // bounded by the already-materialized candidate table). A genuine top-k
+  // (explicit `vec:k`, or a distinct `<result>` variable) keeps the cap.
+  const bool keepAll = config_.keepAllCandidates_;
 
   const bool withCoarseScore = config_.coarseScoreVariable_.has_value();
   ad_utility::HashMap<Id, float> coarseDistances;
@@ -531,10 +537,10 @@ void VectorSearchJoin::computePreFilterRows(
                                                      rerankK, candidates,
                                                      std::nullopt,
                                                      checkInterrupt,
-                                                     &coarseScored)
+                                                     &coarseScored, keepAll)
             : vidx.searchExactCoarseWithRows(query, rerankK, candidates,
                                              std::nullopt, checkInterrupt,
-                                             &coarseScored);
+                                             &coarseScored, keepAll);
     // `coarseScored` = candidates that HAVE a vector (were actually scored),
     // not the raw candidate count -- the merge-join skips the vectorless ones.
     qlever::vector::logVectorSearchPhase(
@@ -551,10 +557,11 @@ void VectorSearchJoin::computePreFilterRows(
         queryEntity.has_value()
             ? vidx.searchExactByRowsByEntity(queryEntity.value(), effectiveK,
                                              prunedRows, config_.maxDistance_,
-                                             checkInterrupt, config_.bf16Kernel_)
+                                             checkInterrupt, config_.bf16Kernel_,
+                                             keepAll)
             : vidx.searchExactByRows(query, effectiveK, prunedRows,
                                      config_.maxDistance_, checkInterrupt,
-                                     config_.bf16Kernel_);
+                                     config_.bf16Kernel_, keepAll);
     qlever::vector::logVectorSearchPhase(
         config_.indexName_, "rerank (fine layer)",
         rerankTimer.value().count() / 1000.0, coarse.size());
@@ -565,10 +572,10 @@ void VectorSearchJoin::computePreFilterRows(
                  ? vidx.searchExactByEntity(queryEntity.value(), effectiveK,
                                             candidates, config_.maxDistance_,
                                             checkInterrupt, &numScored,
-                                            config_.bf16Kernel_)
+                                            config_.bf16Kernel_, keepAll)
                  : vidx.searchExact(query, effectiveK, candidates,
                                     config_.maxDistance_, checkInterrupt,
-                                    &numScored, config_.bf16Kernel_);
+                                    &numScored, config_.bf16Kernel_, keepAll);
     // Members actually scored, not the raw candidate count (see above).
     // When the index HAS a rerank layer but we reached this branch, it is
     // because `vec:fullPrecision` forced the coarse layer to be skipped.

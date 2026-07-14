@@ -326,8 +326,14 @@ dotBlockAmx(const void* packedQuery, const uint16_t* query, const char* rows,
   }
   _tile_release();
   // Tail rows (< 32): exact via the SIMD one-row dot on the plain query, so
-  // no output is left to a masked AMX edge tile (bit-identical to a full AMX
-  // block for the same pair -- same bf16 dot).
+  // no output is left to a masked AMX edge tile. NOTE: the same bf16 dot, but
+  // NOT bit-identical to the AMX tile -- the fp32 accumulation ORDER differs
+  // (16 SIMD lanes + a tree reduce vs the tile's sequential per-pair
+  // accumulation), so a tail row's dot can differ by ~1 ulp from what a full
+  // AMX group would produce. Callers that must be partition-independent
+  // therefore keep their block boundaries 32-row-aligned, so that ONLY the
+  // true end of a sweep ever lands here (see the AMX_GROUP alignment in
+  // VectorIndex.cpp).
   for (; r < count; ++r) {
     out[r] = dotOneSimd_(
         query, reinterpret_cast<const uint16_t*>(rows + r * rowStrideBytes),

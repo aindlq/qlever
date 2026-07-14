@@ -442,13 +442,19 @@ class VectorIndex {
   // `bf16Kernel` (the `vec:bf16Kernel` performance dial) selects the exact
   // bf16-cosine kernel of the FINE layer -- a no-op on any other layer and
   // always result-identical to ~1e-6 across kernels.
+  // `keepAll` (the SERVICE's FORM P annotate form, which must score and
+  // return EVERY bound candidate): clamp `k` only to the live/candidate
+  // bound, NOT to the hard `MAX_SEARCH_RESULTS` cap -- the result size is
+  // then bounded by the caller's already-materialized candidate table, so
+  // the cap's OOM-lever rationale does not apply. Same meaning on every
+  // `searchExact*` overload below that takes it.
   std::vector<ScoredEntity> searchExact(
       ql::span<const float> query, size_t k,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr,
-      Bf16Kernel bf16Kernel = Bf16Kernel::Auto) const;
+      size_t* numScored = nullptr, Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
+      bool keepAll = false) const;
 
   // The fine pass of the two-layer rerank over a set of survivors whose store
   // ROWS are already known (from `searchExactCoarseWithRows`): score exactly
@@ -463,7 +469,7 @@ class VectorIndex {
       ql::span<const float> query, size_t k, ql::span<const ScoredRow> rows,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      Bf16Kernel bf16Kernel = Bf16Kernel::Auto) const;
+      Bf16Kernel bf16Kernel = Bf16Kernel::Auto, bool keepAll = false) const;
 
   // The same exact brute-force search on the COARSE scan matrix (identical to
   // `searchExact` on a single-layer index). This is the SERVICE's coarse
@@ -486,7 +492,7 @@ class VectorIndex {
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr) const;
+      size_t* numScored = nullptr, bool keepAll = false) const;
 
   // Approximate top-`k` via the HNSW graph over the whole index. Requires
   // `hasHnsw()`. Results are ascending by distance. `k` is clamped to the
@@ -508,8 +514,8 @@ class VectorIndex {
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr,
-      Bf16Kernel bf16Kernel = Bf16Kernel::Auto) const;
+      size_t* numScored = nullptr, Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
+      bool keepAll = false) const;
   std::vector<ScoredEntity> searchExactCoarseByEntity(
       Id entity, size_t k,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
@@ -525,12 +531,12 @@ class VectorIndex {
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr) const;
+      size_t* numScored = nullptr, bool keepAll = false) const;
   std::vector<ScoredEntity> searchExactByRowsByEntity(
       Id entity, size_t k, ql::span<const ScoredRow> rows,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      Bf16Kernel bf16Kernel = Bf16Kernel::Auto) const;
+      Bf16Kernel bf16Kernel = Bf16Kernel::Auto, bool keepAll = false) const;
   std::vector<ScoredEntity> searchHnswByEntity(
       Id entity, size_t k, std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {}) const;
@@ -761,6 +767,16 @@ int vectorSearchThreadCap();
 // their only layer) and on plain top-k as well as `vec:autoCut`/CSLS queries.
 // Default OFF = the normal coarse-scan-then-rerank behaviour. Memoized.
 bool vectorSearchFullPrecision();
+
+namespace detail {
+// TEST SEAM: mutable reference to the hard per-search result cap
+// (`MAX_SEARCH_RESULTS`, default 100'000 -- see VectorIndex.cpp). Every
+// `searchExact*`/`searchHnsw*` clamps its `k` to this cap unless the caller
+// passes `keepAll` (the annotate form). Tests shrink it to exercise the cap
+// (and the annotate form's exemption from it) on tiny fixtures without
+// materializing 100k+ vectors; production code only ever READS it.
+size_t& maxSearchResultsForTesting();
+}  // namespace detail
 
 }  // namespace qlever::vector
 

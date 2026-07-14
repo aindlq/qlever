@@ -13,9 +13,13 @@
 // (`vec:rerankK`, `vec:bindScore` = fine, `vec:bindCoarseScore` = coarse).
 // Also covers the `vec:candidates` rename of `vec:left` (alias kept).
 
+#include <absl/base/casts.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <array>
 #include <cmath>
@@ -37,6 +41,7 @@
 #include "index/IndexExtension.h"
 #include "index/IndexImpl.h"
 #include "parser/SparqlParser.h"
+#include "services/vectorSearch/VectorBf16Kernels.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexBuilder.h"
 #include "services/vectorSearch/VectorIndexExtension.h"
@@ -988,7 +993,7 @@ namespace {
 constexpr size_t KERNEL_DIM = 128;
 constexpr size_t KERNEL_ROWS = 500;
 
-std::vector<float> kernelRow(uint64_t seed) {
+std::vector<float> kernelRow(uint64_t seed, size_t dim = KERNEL_DIM) {
   // splitmix64 for deterministic, well-spread components.
   auto next = [&seed]() {
     uint64_t z = (seed += 0x9e3779b97f4a7c15ULL);
@@ -996,7 +1001,7 @@ std::vector<float> kernelRow(uint64_t seed) {
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
     return z ^ (z >> 31);
   };
-  std::vector<float> v(KERNEL_DIM);
+  std::vector<float> v(dim);
   for (float& x : v) {
     x = static_cast<int32_t>(next()) * (1.0f / 2147483648.0f);
   }
@@ -1004,19 +1009,21 @@ std::vector<float> kernelRow(uint64_t seed) {
 }
 
 std::string buildKernelFixture(std::string name, VectorScalar scan,
-                               std::optional<VectorScalar> rerank) {
+                               std::optional<VectorScalar> rerank,
+                               size_t rows = KERNEL_ROWS,
+                               size_t dim = KERNEL_DIM) {
   std::string basename = uniqueTmpBasename();
   VectorIndexConfig cfg;
   cfg.name_ = name;
-  cfg.dimensions_ = KERNEL_DIM;
+  cfg.dimensions_ = dim;
   cfg.metric_ = VectorMetric::Cosine;
   cfg.scalar_ = scan;
   cfg.rerankScalar_ = rerank;
   cfg.buildHnsw_ = false;
   VectorIndexBuilder builder{basename, cfg};
-  for (size_t i = 0; i < KERNEL_ROWS; ++i) {
+  for (size_t i = 0; i < rows; ++i) {
     builder.add(mkId(100 + i), "<http://ex/" + std::to_string(i) + ">",
-                kernelRow(0x1234'0000ULL + i));
+                kernelRow(0x1234'0000ULL + i, dim));
   }
   builder.build();
   return basename;
@@ -1118,4 +1125,233 @@ TEST(VectorRerank, bf16KernelSelectorAgreesAcrossKernels) {
     }
     cleanupTmp(basename, "k2");
   }
+}
+
+// _____________________________________________________________________________
+// The RESTRICTED (non-covering) candidate search: `searchExact(k, candidates)`
+// with a candidate SUBSET takes the scattered-gather branch of the exact
+// search, which used to ignore `vec:bf16Kernel` and score through the per-row
+// punned metric only -- the ONE rerank path with a different dot engine, so a
+// candidate-restricted `?score` could disagree (~1e-6) with the exact
+// `vec:distance` of the same pair. Now it routes through the same batched
+// SIMD gather as every other rerank path, so all kernels must agree on the
+// top-k (distances to ~1e-6, and equal entities -- this well-spread fixture
+// has no ties).
+TEST(VectorRerank, bf16KernelAgreesOnRestrictedCandidateSearch) {
+  using qlever::vector::Bf16Kernel;
+  const std::vector<float> query = kernelRow(0xDEAD'BEEFULL);
+  const std::array<Bf16Kernel, 4> kernels = {
+      Bf16Kernel::Auto, Bf16Kernel::Amx, Bf16Kernel::Simd, Bf16Kernel::Punned};
+  const size_t k = 25;
+  // Two-layer binary+bf16: `searchExact` scores the FINE bf16 layer, where
+  // the hand-rolled kernels apply.
+  std::string basename =
+      buildKernelFixture("k3", VectorScalar::Binary, VectorScalar::Bf16);
+  VectorIndex idx;
+  idx.open(basename, "k3");
+  // Every third entity: a genuinely NON-COVERING subset, so the search cannot
+  // shortcut to the covering whole-index sweep -- it must run the scattered
+  // candidate gather under test.
+  std::vector<Id> candidates;
+  for (size_t i = 0; i < KERNEL_ROWS; i += 3) {
+    candidates.push_back(mkId(100 + i));
+  }
+  std::optional<ql::span<const Id>> candSpan{candidates};
+  size_t scoredRef = 0;
+  auto ref = idx.searchExact(query, k, candSpan, std::nullopt, {}, &scoredRef,
+                             Bf16Kernel::Punned);
+  ASSERT_EQ(ref.size(), k);
+  // Sanity: only the subset's members were scored (the restricted branch ran).
+  ASSERT_EQ(scoredRef, candidates.size());
+  for (Bf16Kernel kern : kernels) {
+    size_t scored = 0;
+    auto got =
+        idx.searchExact(query, k, candSpan, std::nullopt, {}, &scored, kern);
+    ASSERT_EQ(scored, candidates.size()) << "kernel=" << int(kern);
+    ASSERT_EQ(got.size(), ref.size()) << "kernel=" << int(kern);
+    for (size_t i = 0; i < ref.size(); ++i) {
+      EXPECT_NEAR(ref[i].distance_, got[i].distance_, 1e-6f)
+          << "restricted scattered search kernel=" << int(kern) << " i=" << i;
+      EXPECT_EQ(ref[i].entity_, got[i].entity_)
+          << "restricted scattered search kernel=" << int(kern) << " i=" << i;
+    }
+  }
+  // `maxDistance` filters identically on the batched branch. Cut midway
+  // between two consecutive distances (their gap dwarfs the ~1e-6
+  // cross-kernel wobble, so the survivor set is unambiguous).
+  ASSERT_GT(ref[k / 2 + 1].distance_ - ref[k / 2].distance_, 1e-4f);
+  const float maxDist =
+      0.5f * (ref[k / 2].distance_ + ref[k / 2 + 1].distance_);
+  auto refFiltered = idx.searchExact(query, k, candSpan, maxDist, {}, nullptr,
+                                     Bf16Kernel::Punned);
+  ASSERT_EQ(refFiltered.size(), k / 2 + 1);
+  for (Bf16Kernel kern : kernels) {
+    auto gotFiltered =
+        idx.searchExact(query, k, candSpan, maxDist, {}, nullptr, kern);
+    ASSERT_EQ(gotFiltered.size(), refFiltered.size()) << "kernel=" << int(kern);
+  }
+  cleanupTmp(basename, "k3");
+}
+
+// _____________________________________________________________________________
+// The hard `MAX_SEARCH_RESULTS` top-k cap (shrunk via the test seam) applies
+// to every plain top-k primitive -- but the annotate form (`keepAll`) is
+// exempt on EVERY primitive of its path, because its contract is to score and
+// return ALL bound candidates: primitive-level trace over the whole two-layer
+// pipeline, then end-to-end through the SERVICE (the annotate FORM P returns
+// every candidate even when their count exceeds the cap, while plain top-k
+// still caps).
+TEST(VectorRerank, annotateFormScoresAllCandidatesBeyondCap) {
+  auto* qec = qecWithRerankIndexes();
+  auto vidx = getVectorIndex(qec->getIndex(), "embrr");
+  ASSERT_TRUE(vidx != nullptr);
+  ASSERT_EQ(vidx->numLiveVectors(), 6u);
+  const std::vector<float> query{0.f, 1.f, 0.f, 0.f};
+  auto getId = makeGetId(qec->getIndex());
+
+  // RAII: shrink the cap below the candidate count, restore on exit.
+  struct ScopedCap {
+    size_t old_ = qlever::vector::detail::maxSearchResultsForTesting();
+    explicit ScopedCap(size_t v) {
+      qlever::vector::detail::maxSearchResultsForTesting() = v;
+    }
+    ~ScopedCap() {
+      qlever::vector::detail::maxSearchResultsForTesting() = old_;
+    }
+  } capGuard{3};
+  // Nothing computed under the tiny cap may be served to other tests (nor
+  // stale full-cap results to this one).
+  qec->getQueryTreeCache().clearAll();
+
+  std::vector<Id> candidates;
+  for (const char* e : {"<r0>", "<r1>", "<r2>", "<r3>", "<r4>", "<r5>"}) {
+    candidates.push_back(getId(e));
+  }
+  std::optional<ql::span<const Id>> candSpan{candidates};
+
+  // --- Primitive level: every primitive of the annotate path. ---
+  // The exact search (the single-layer / full-precision branch).
+  EXPECT_EQ(vidx->searchExact(query, 6, candSpan).size(), 3u);
+  EXPECT_EQ(vidx->searchExact(query, 6, candSpan, std::nullopt, {}, nullptr,
+                              Bf16Kernel::Auto, /*keepAll=*/true)
+                .size(),
+            6u);
+  // The two-layer pipeline: the coarse pass (the `rerankK` clamp), then the
+  // fine rerank over its rows.
+  EXPECT_EQ(vidx->searchExactCoarseWithRows(query, 6, candSpan).size(), 3u);
+  auto coarseAll = vidx->searchExactCoarseWithRows(
+      query, 6, candSpan, std::nullopt, {}, nullptr, /*keepAll=*/true);
+  ASSERT_EQ(coarseAll.size(), 6u);
+  ql::span<const ScoredRow> rowsSpan{coarseAll};
+  EXPECT_EQ(vidx->searchExactByRows(query, 6, rowsSpan).size(), 3u);
+  EXPECT_EQ(vidx->searchExactByRows(query, 6, rowsSpan, std::nullopt, {},
+                                    Bf16Kernel::Auto, /*keepAll=*/true)
+                .size(),
+            6u);
+  // The by-entity twins (the `vec:query <iri>` flow).
+  Id q = getId("<r2>");
+  EXPECT_EQ(vidx->searchExactByEntity(q, 6, candSpan).size(), 3u);
+  EXPECT_EQ(vidx->searchExactByEntity(q, 6, candSpan, std::nullopt, {},
+                                      nullptr, Bf16Kernel::Auto,
+                                      /*keepAll=*/true)
+                .size(),
+            6u);
+  EXPECT_EQ(vidx->searchExactCoarseByEntityWithRows(q, 6, candSpan).size(),
+            3u);
+  auto coarseByEntity = vidx->searchExactCoarseByEntityWithRows(
+      q, 6, candSpan, std::nullopt, {}, nullptr, /*keepAll=*/true);
+  ASSERT_EQ(coarseByEntity.size(), 6u);
+  ql::span<const ScoredRow> rowsByEntity{coarseByEntity};
+  EXPECT_EQ(vidx->searchExactByRowsByEntity(q, 6, rowsByEntity).size(), 3u);
+  EXPECT_EQ(vidx->searchExactByRowsByEntity(q, 6, rowsByEntity, std::nullopt,
+                                            {}, Bf16Kernel::Auto,
+                                            /*keepAll=*/true)
+                .size(),
+            6u);
+
+  // --- End-to-end: the annotate FORM P (no `vec:k`) returns ALL 6 bound
+  // candidates although the cap is 3 -- on the two-layer index (the coarse
+  // `rerankK` clamp plus the rerank-by-rows clamp) AND the single-layer one
+  // (the plain `searchExact` clamp). ---
+  for (const char* index : {"embrr", "embbf"}) {
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} +
+                 "SELECT * WHERE { ?e <is-a> <RItem> . "
+                 "SERVICE vec: { _:c vec:index \"" +
+                 index +
+                 "\" ; vec:queryVector \"0,1,0,0\" ; vec:candidates ?e ; "
+                 "vec:result ?e ; vec:bindScore ?dCap . } }");
+    auto result = qet.getResult();
+    EXPECT_EQ(result->idTable().numRows(), 6u) << index;
+  }
+  // A genuine top-k (distinct `<result>`, explicit `vec:k 6`) KEEPS the cap:
+  // only the 3 nearest come back.
+  {
+    QueryExecutionTree qet = planQuery(
+        qec, std::string{PREFIX} +
+                 "SELECT * WHERE { ?e <is-a> <RItem> . "
+                 "SERVICE vec: { _:c vec:index \"embrr\" ; "
+                 "vec:queryVector \"0,1,0,0\" ; vec:candidates ?e ; "
+                 "vec:result ?nnCap ; vec:k 6 . } }");
+    auto result = qet.getResult();
+    EXPECT_EQ(result->idTable().numRows(), 3u);
+  }
+  qec->getQueryTreeCache().clearAll();
+}
+
+// _____________________________________________________________________________
+// A pinned `vec:bf16Kernel "amx"` must be THREAD-COUNT INVARIANT: the AMX
+// block kernel scores full 32-row tile groups on AMX and each block's < 32-row
+// remainder with the SIMD one-row dot, whose fp32 accumulation order differs
+// (~1 ulp). The per-thread partition boundaries are therefore aligned to the
+// 32-row group, so WHICH rows take the SIMD path no longer depends on the
+// team size -- the whole-index AMX sweep returns BIT-identical distances for
+// every thread count (the serial one-thread sweep is the reference).
+TEST(VectorRerank, amxPinnedKernelIsThreadCountInvariant) {
+#ifndef _OPENMP
+  GTEST_SKIP() << "Without OpenMP there is no partitioning to test.";
+#else
+  if (!qlever::vector::bf16kernels::amxAvailable()) {
+    GTEST_SKIP() << "This CPU has no AMX-BF16.";
+  }
+  // Above the parallel threshold (2048) so the sweep actually partitions
+  // across threads, and NOT a multiple of 32 so the true end exercises the
+  // SIMD remainder.
+  constexpr size_t N = 4099;
+  constexpr size_t DIM = 256;
+  std::string basename =
+      buildKernelFixture("amxinv", VectorScalar::Bf16, std::nullopt, N, DIM);
+  VectorIndex idx;
+  idx.open(basename, "amxinv");
+  const std::vector<float> query = kernelRow(0xF00D'F00DULL, DIM);
+  // RAII: whatever happens, later tests keep the default team size.
+  struct OmpGuard {
+    int old_ = omp_get_max_threads();
+    ~OmpGuard() { omp_set_num_threads(old_); }
+  } ompGuard;
+  // (distance bits, entity bits) rows -- an exact, printable comparison.
+  auto asBits = [](const std::vector<ScoredEntity>& v) {
+    std::vector<std::pair<uint32_t, uint64_t>> out;
+    out.reserve(v.size());
+    for (const auto& e : v) {
+      out.emplace_back(absl::bit_cast<uint32_t>(e.distance_),
+                       e.entity_.getBits());
+    }
+    return out;
+  };
+  // Reference: the serial sweep (k = N returns EVERY row, so any 1-ulp drift
+  // anywhere in the index shows up).
+  omp_set_num_threads(1);
+  auto ref = idx.searchExact(query, N, std::nullopt, std::nullopt, {}, nullptr,
+                             Bf16Kernel::Amx);
+  ASSERT_EQ(ref.size(), N);
+  const auto refBits = asBits(ref);
+  for (int t : {2, 3, 5, 7}) {
+    omp_set_num_threads(t);
+    auto got = idx.searchExact(query, N, std::nullopt, std::nullopt, {},
+                               nullptr, Bf16Kernel::Amx);
+    EXPECT_EQ(asBits(got), refBits) << "threads=" << t;
+  }
+  cleanupTmp(basename, "amxinv");
+#endif
 }

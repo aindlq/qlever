@@ -67,7 +67,9 @@ constexpr bool VEC_SEARCH_CHECK_CANCELLATION = true;
 // gigabytes of (unaccounted) scratch and an effectively whole-index HNSW probe.
 // A nearest-neighbour query asking for more than this is pathological; the
 // result is capped (not an error). 100k results = ~1.2 MB of key+distance
-// buffers, and a bounded HNSW search.
+// buffers, and a bounded HNSW search. The live value sits behind
+// `detail::maxSearchResultsForTesting()` (see below) so tests can shrink it;
+// production code never writes it, so it stays this default.
 constexpr size_t MAX_SEARCH_RESULTS = 100'000;
 
 // A pool of usearch search-context ids. Each concurrent HNSW search needs a
@@ -131,6 +133,38 @@ class SearchSlotPool {
   std::condition_variable cv_;
   std::queue<size_t> free_;
 };
+}  // namespace
+
+// ____________________________________________________________________________
+// Declared in `VectorIndex.h` (TEST SEAM; production code only reads it).
+size_t& detail::maxSearchResultsForTesting() {
+  static size_t cap = MAX_SEARCH_RESULTS;
+  return cap;
+}
+
+namespace {
+// Clamp a requested `k` to `bound` (the live-vector count, or the candidate
+// row count of a rerank-by-rows pass) and -- unless `keepAll` -- to the hard
+// `MAX_SEARCH_RESULTS` cap. When the cap actually reduces the answer, log ONE
+// warning naming it, so a silently truncated huge-k query is visible instead
+// of quietly returning fewer results. `keepAll` is the SERVICE's FORM P
+// annotate form (`vec:candidates` == `vec:result`, no `vec:k`), whose contract
+// is to score and return EVERY bound candidate: its result size is bounded by
+// the caller's already-materialized candidate table, so the cap's OOM-lever
+// rationale does not apply there.
+size_t clampSearchK(size_t k, size_t bound, bool keepAll,
+                    const std::string& indexName) {
+  k = std::min(k, bound);
+  const size_t cap = detail::maxSearchResultsForTesting();
+  if (!keepAll && k > cap) {
+    AD_LOG_WARN << "Vector index \"" << indexName << "\": the requested k="
+                << k << " exceeds the hard result cap MAX_SEARCH_RESULTS="
+                << cap << "; the result is truncated to the " << cap
+                << " nearest." << std::endl;
+    k = cap;
+  }
+  return k;
+}
 }  // namespace
 
 // Deleter for the `posix_memalign`-allocated aligned copy (freed with
@@ -1798,8 +1832,29 @@ void scanWholeIndexBatchedBf16(
       const size_t tid = static_cast<size_t>(omp_get_thread_num());
       const size_t team = static_cast<size_t>(omp_get_num_threads());
       TopK& localTop = locals[tid];
-      const size_t first = n * tid / team;
-      const size_t last = n * (tid + 1) / team;
+      size_t first = n * tid / team;
+      size_t last = n * (tid + 1) / team;
+      if (kernel == BK::HandAmx) {
+        // Align the partition boundaries DOWN to the 32-row AMX tile group:
+        // `dotBlockAmx` scores full 32-row groups on AMX and the (< 32)-row
+        // remainder of each block with the SIMD one-row dot, whose result can
+        // differ from the AMX tile's by ~1 ulp (different fp32 accumulation
+        // order). With unaligned `n*tid/team` boundaries, WHICH rows land in
+        // such a remainder depends on the team size -- so a pinned
+        // `vec:bf16Kernel "amx"` result would vary with the thread count.
+        // Aligned boundaries (and the 32-divisible `VEC_BF16_BATCH_ROWS`)
+        // leave exactly ONE remainder, at the true end `n` -- identical to
+        // the serial walk below, for every team size. (A row's AMX value
+        // itself is group-independent: each tile row accumulates only its own
+        // dot.) Rounding down keeps the ranges a disjoint cover of [0, n);
+        // the +-31-row imbalance is noise at n >= the parallel threshold.
+        constexpr size_t AMX_GROUP = 32;
+        static_assert(VEC_BF16_BATCH_ROWS % AMX_GROUP == 0);
+        first -= first % AMX_GROUP;
+        if (tid + 1 < team) {
+          last -= last % AMX_GROUP;
+        }
+      }
       std::vector<float> dots(VEC_BF16_BATCH_ROWS);
       std::vector<float> dists(VEC_BF16_BATCH_ROWS);
       for (size_t s = first; s < last; s += VEC_BF16_BATCH_ROWS) {
@@ -2085,12 +2140,26 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
     const LayerT& layer, const char* queryBytes, size_t n, const RowFn& rowOf,
     bool contiguous, float* coarseDists, size_t topM, size_t distMax,
     const CheckInterruptCallback& checkInterrupt);
+
+// Forward declaration (defined further below in this TU's anonymous
+// namespace): the shared distance sweep, used by the SIMD-gather rerank fast
+// paths of `searchExactBytes` (the scattered candidate gather) and
+// `searchExactByRowsBytes` (the rerank-by-rows pass). The default arguments
+// live HERE (a later declaration or the definition may not repeat them).
+template <typename LayerT, typename RowFn>
+void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
+                       const RowFn& rowOf, float* dists,
+                       const CheckInterruptCallback& checkInterrupt,
+                       bool contiguous = false,
+                       Bf16Kernel bf16Kernel = Bf16Kernel::Auto);
 }  // namespace
 
 // `integerDistMax`, when set, means THIS layer's metric returns an integer
 // distance in [0, integerDistMax] (the binary layer's Hamming count) -- so the
 // top-k selection uses the branchless histogram instead of the bounded heap.
 // `nullopt` (a float metric: i8/bf16/f32) keeps the heap.
+// `keepAll` (the annotate form): clamp `k` to the live bound only, NOT to
+// `MAX_SEARCH_RESULTS` -- see `clampSearchK`.
 template <typename ImplT, typename LayerT>
 std::vector<ScoredEntity> searchExactBytes(
     ImplT& impl, LayerT& layer, const char* queryBytes, size_t k,
@@ -2099,7 +2168,7 @@ std::vector<ScoredEntity> searchExactBytes(
     const CheckInterruptCallback& checkInterrupt, size_t* numScored = nullptr,
     std::optional<size_t> integerDistMax = std::nullopt,
     std::vector<uint64_t>* outRows = nullptr,
-    Bf16Kernel bf16Kernel = Bf16Kernel::Auto) {
+    Bf16Kernel bf16Kernel = Bf16Kernel::Auto, bool keepAll = false) {
   // `numScored` (optional out-param) reports how many vectors actually had a
   // distance computed -- the WHOLE live set for a whole-index search, or just
   // the candidates that are members for a restricted one. It is NOT the raw
@@ -2134,10 +2203,11 @@ std::vector<ScoredEntity> searchExactBytes(
     }
     emitRows(std::move(rows));
   };
-  // Clamp `k` (user-supplied, unbounded) to the live vector count AND a hard
-  // maximum: it bounds the `TopK` heap and would otherwise be a remote OOM
-  // lever.
-  k = std::min({k, impl.numLive(), MAX_SEARCH_RESULTS});
+  // Clamp `k` (user-supplied, unbounded) to the live vector count AND -- for
+  // a genuine top-k, but NOT the annotate form's score-everything pass
+  // (`keepAll`) -- a hard maximum: it bounds the `TopK` heap and would
+  // otherwise be a remote OOM lever.
+  k = clampSearchK(k, impl.numLive(), keepAll, impl.meta_.config_.name_);
   if (k == 0) {
     reportScored(0);
     emitRows({});
@@ -2348,6 +2418,42 @@ std::vector<ScoredEntity> searchExactBytes(
         matched.size(), [&](size_t i) { return matched[i].first; },
         [&](size_t i) { return matched[i].second; }, /*contiguous=*/false);
   }
+#if USEARCH_USE_NUMKONG
+  // If a hand-rolled bf16 kernel is selected for this layer, score the
+  // scattered members with the batched multi-row SIMD gather
+  // (`cslsDistanceSweep` scattered) -- the SAME engine and finalize as the
+  // whole-index sweep, the rerank-by-rows pass (`searchExactByRowsBytes`),
+  // and the CSLS rerank. Without this, a RESTRICTED (non-covering) candidate
+  // search was the ONE rerank path still scoring through the per-row punned
+  // metric, so its distances disagreed (~1e-6) with the exact `vec:distance`
+  // of the same pair and `vec:bf16Kernel` silently did nothing here. `PerRow`
+  // (the GEMM/punned/non-bf16 resolution -- e.g. always the COARSE i8/binary
+  // layer) keeps the unchanged per-row `scanIntoTopK` below.
+  {
+    using BK = typename std::remove_reference_t<LayerT>::BlockKernel;
+    const BK gatherKernel = layer.resolveBlockKernel(bf16Kernel);
+    if (gatherKernel == BK::HandSimd || gatherKernel == BK::HandAmx) {
+      std::vector<float> dists(matched.size());
+      {
+        SeqScanHint hint{layer, seqHint && monotonic};
+        cslsDistanceSweep(
+            layer, queryBytes, matched.size(),
+            [&](size_t i) { return matched[i].first; }, dists.data(),
+            checkInterrupt, /*contiguous=*/false, bf16Kernel);
+      }
+      const float maxDist =
+          maxDistance.value_or(std::numeric_limits<float>::infinity());
+      for (size_t i = 0; i < matched.size(); ++i) {
+        if (dists[i] <= maxDist) {
+          top.offer(dists[i], matched[i].second);
+        }
+      }
+      auto out = top.sorted();
+      emitRowsFromEntities(out);
+      return out;
+    }
+  }
+#endif
   {
     SeqScanHint hint{layer, seqHint && monotonic};
     scanIntoTopK(
@@ -2368,7 +2474,7 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    Bf16Kernel bf16Kernel) const {
+    Bf16Kernel bf16Kernel, bool keepAll) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -2389,7 +2495,7 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
                                          : std::nullopt;
   return searchExactBytes(impl, layer, queryBytes, k, candidates, maxDistance,
                           checkInterrupt, numScored, integerDistMax,
-                          /*outRows=*/nullptr, bf16Kernel);
+                          /*outRows=*/nullptr, bf16Kernel, keepAll);
 }
 
 // ____________________________________________________________________________
@@ -2424,7 +2530,8 @@ std::vector<ScoredRow> VectorIndex::searchExactCoarseWithRows(
     ql::span<const float> query, size_t k,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored,
+    bool keepAll) const {
   auto& impl = *impl_;
   if (query.size() != impl.dim()) {
     AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
@@ -2439,11 +2546,14 @@ std::vector<ScoredRow> VectorIndex::searchExactCoarseWithRows(
           : std::nullopt;
   // Run the identical coarse pass as `searchExactCoarse`, but capture the
   // survivors' store rows (`outRows`) so the fine rerank need not re-derive
-  // them (see `ScoredRow` / `searchExactByRows`).
+  // them (see `ScoredRow` / `searchExactByRows`). `keepAll` (the annotate
+  // form) lifts the `MAX_SEARCH_RESULTS` clamp off the coarse `rerankK` too --
+  // the coarse pass must keep EVERY candidate for the fine pass then.
   std::vector<uint64_t> rows;
   auto scored = searchExactBytes(impl, impl.scan_, queryBytes, k, candidates,
                                  maxDistance, checkInterrupt, numScored,
-                                 integerDistMax, &rows);
+                                 integerDistMax, &rows, Bf16Kernel::Auto,
+                                 keepAll);
   // `outRows` is filled in lock-step with `scored`, so the two align 1:1.
   AD_CORRECTNESS_CHECK(rows.size() == scored.size());
   std::vector<ScoredRow> out;
@@ -2455,16 +2565,6 @@ std::vector<ScoredRow> VectorIndex::searchExactCoarseWithRows(
 }
 
 namespace {
-// Forward declaration (defined further below in this TU's anonymous namespace):
-// the shared distance sweep, used here for the SIMD-gather rerank fast path.
-// The default arguments live HERE (a later definition may not repeat them).
-template <typename LayerT, typename RowFn>
-void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
-                       const RowFn& rowOf, float* dists,
-                       const CheckInterruptCallback& checkInterrupt,
-                       bool contiguous = false,
-                       Bf16Kernel bf16Kernel = Bf16Kernel::Auto);
-
 // Core of `searchExactByRows`: score the `rows` (store-row + id survivors of
 // the coarse pass) on `layer` against the encoded `queryBytes`, returning the
 // top-`k` ascending by distance. `k` is already clamped by the caller.
@@ -2533,8 +2633,8 @@ std::vector<ScoredEntity> searchExactByRowsBytes(
 std::vector<ScoredEntity> VectorIndex::searchExactByRows(
     ql::span<const float> query, size_t k, ql::span<const ScoredRow> rows,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt,
-    Bf16Kernel bf16Kernel) const {
+    const CheckInterruptCallback& checkInterrupt, Bf16Kernel bf16Kernel,
+    bool keepAll) const {
   auto& impl = *impl_;
   auto& layer = impl.fine();
   if (query.size() != impl.dim()) {
@@ -2542,7 +2642,7 @@ std::vector<ScoredEntity> VectorIndex::searchExactByRows(
              ", but vector index \"" + impl.meta_.config_.name_ +
              "\" has dimension " + std::to_string(impl.dim()) + ".");
   }
-  k = std::min({k, rows.size(), MAX_SEARCH_RESULTS});
+  k = clampSearchK(k, rows.size(), keepAll, impl.meta_.config_.name_);
   if (k == 0) {
     return {};
   }
@@ -2556,15 +2656,15 @@ std::vector<ScoredEntity> VectorIndex::searchExactByRows(
 std::vector<ScoredEntity> VectorIndex::searchExactByRowsByEntity(
     Id entity, size_t k, ql::span<const ScoredRow> rows,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt,
-    Bf16Kernel bf16Kernel) const {
+    const CheckInterruptCallback& checkInterrupt, Bf16Kernel bf16Kernel,
+    bool keepAll) const {
   auto& impl = *impl_;
   auto& layer = impl.fine();
   auto row = impl.rowOf(entity);
   if (!row.has_value()) {
     return {};
   }
-  k = std::min({k, rows.size(), MAX_SEARCH_RESULTS});
+  k = clampSearchK(k, rows.size(), keepAll, impl.meta_.config_.name_);
   if (k == 0) {
     return {};
   }
@@ -2579,7 +2679,7 @@ std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    Bf16Kernel bf16Kernel) const {
+    Bf16Kernel bf16Kernel, bool keepAll) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -2591,7 +2691,7 @@ std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
   return searchExactBytes(impl, layer, layer.rowPtr(row.value()), k, candidates,
                           maxDistance, checkInterrupt, numScored,
                           /*integerDistMax=*/std::nullopt, /*outRows=*/nullptr,
-                          bf16Kernel);
+                          bf16Kernel, keepAll);
 }
 
 // ____________________________________________________________________________
@@ -2614,18 +2714,21 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarseByEntity(
 std::vector<ScoredRow> VectorIndex::searchExactCoarseByEntityWithRows(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored,
+    bool keepAll) const {
   auto& impl = *impl_;
   auto row = impl.rowOf(entity);
   if (!row.has_value()) {
     return {};
   }
   // Same coarse-by-entity pass as `searchExactCoarseByEntity`, capturing the
-  // survivors' store rows (`outRows`) for the fine rerank.
+  // survivors' store rows (`outRows`) for the fine rerank. `keepAll` lifts
+  // the `MAX_SEARCH_RESULTS` clamp (see `searchExactCoarseWithRows`).
   std::vector<uint64_t> rows;
   auto scored = searchExactBytes(
       impl, impl.scan_, impl.scan_.rowPtr(row.value()), k, candidates,
-      maxDistance, checkInterrupt, numScored, std::nullopt, &rows);
+      maxDistance, checkInterrupt, numScored, std::nullopt, &rows,
+      Bf16Kernel::Auto, keepAll);
   AD_CORRECTNESS_CHECK(rows.size() == scored.size());
   std::vector<ScoredRow> out;
   out.reserve(scored.size());
@@ -2646,7 +2749,8 @@ std::vector<ScoredEntity> searchHnswBytes(
                     "searchHnsw called but this index has no HNSW structure.");
   // Clamp `k` (user-supplied, unbounded) to the live vector count AND a hard
   // maximum -- it drives the allocations and the search expansion below.
-  k = std::min({k, impl.numLive(), MAX_SEARCH_RESULTS});
+  k = clampSearchK(k, impl.numLive(), /*keepAll=*/false,
+                   impl.meta_.config_.name_);
   if (k == 0) {
     return {};
   }
@@ -2821,8 +2925,20 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
       {
         const size_t tid = static_cast<size_t>(omp_get_thread_num());
         const size_t team = static_cast<size_t>(omp_get_num_threads());
-        const size_t first = n * tid / team;
-        const size_t last = n * (tid + 1) / team;
+        size_t first = n * tid / team;
+        size_t last = n * (tid + 1) / team;
+        if (block16 == BK::HandAmx) {
+          // Align the partition to the 32-row AMX tile group so the SIMD-dot
+          // remainder rows are the SAME for every team size (only the true
+          // end of the sweep) -- see the identical alignment in
+          // `scanWholeIndexBatchedBf16` for the full rationale.
+          constexpr size_t AMX_GROUP = 32;
+          static_assert(VEC_BF16_BATCH_ROWS % AMX_GROUP == 0);
+          first -= first % AMX_GROUP;
+          if (tid + 1 < team) {
+            last -= last % AMX_GROUP;
+          }
+        }
         std::vector<float> scratch(VEC_BF16_BATCH_ROWS);
         for (size_t s = first; s < last; s += VEC_BF16_BATCH_ROWS) {
           if (VEC_SEARCH_CHECK_CANCELLATION) {
@@ -3558,8 +3674,13 @@ inline std::vector<CslsScoredEntity> applyZCut(
   const bool gated = !cut.keepAtLeastOne_;  // `exact`
   // The best must clear the floor gate for `exact`; the others always answer.
   // The gate stays SIGMA-based: `exact` answers only if the best clears the
-  // floor by `gateZ` spreads.
-  const bool topClears = sigma > 0.f && sMax >= floor.mu_ + cut.gateZ_ * sigma;
+  // floor by `gateZ` spreads. A DEGENERATE floor (sigma == 0: the low half is
+  // perfectly flat -- a tight spike, or duplicate/tied vectors) is MAXIMAL
+  // confidence, not none, so the best clears iff it is strictly above the floor
+  // (`sMax > mu`); the old `sigma > 0` guard wrongly answered "no match" there.
+  const bool topClears = sigma > 0.f
+                             ? (sMax >= floor.mu_ + cut.gateZ_ * sigma)
+                             : (sMax > floor.mu_);
   // The keep band is a fraction of the way from the best down to the floor
   // median (query-independent; `>= (1-f)*s_max + f*mu`).
   const float band = sMax - cut.fraction_ * (sMax - floor.mu_);
