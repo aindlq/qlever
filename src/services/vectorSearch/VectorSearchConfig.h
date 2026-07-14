@@ -83,8 +83,8 @@ struct VectorSearchConfiguration {
 
   // Two-layer indices only: how many candidates the coarse scan pass keeps
   // for the fine rerank pass (`vec:rerankK`). Unset = `defaultRerankK` of the
-  // index's scan scalar (`max(10 * k, 100)`; the far coarser 1-bit `binary`
-  // layer keeps `max(50 * k, 500)`). Ignored on a single-layer index.
+  // index's scan scalar (i8: `max(10 * k, 100)`; the far coarser 1-bit `binary`
+  // layer keeps `max(10 * k, 10000)`). Ignored on a single-layer index.
   std::optional<size_t> rerankK_;
 
   // Optional upper bound on the distance of returned neighbours.

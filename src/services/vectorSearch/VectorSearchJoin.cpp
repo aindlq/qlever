@@ -472,9 +472,13 @@ void VectorSearchJoin::computePreFilterRows(
     bool cacheHit = false;
     // The candidate set's cache identity is the child subtree's cache key (NOT
     // the millions of materialized ids), so a mode switch over the SAME bound
-    // set hits the cached reranked stage.
+    // set hits the cached reranked stage. `leftCol_` MUST be part of it: the
+    // same child can bind DIFFERENT candidate columns (e.g. `?photo` vs
+    // `?painting`), which are different candidate sets under one child key --
+    // without it the second query is served the first column's reranked set.
     const std::string candidateIdentity =
-        child_ ? child_->getCacheKey() : std::string{"INCOMPLETE"};
+        child_ ? absl::StrCat(child_->getCacheKey(), " leftCol=", leftCol_)
+               : std::string{"INCOMPLETE"};
     auto hits = qlever::vector::runCslsCut(
         vidx, config_, cut, neighbors, queryEntity, query,
         std::optional<ql::span<const Id>>{candidates}, candidateIdentity,
@@ -483,9 +487,12 @@ void VectorSearchJoin::computePreFilterRows(
     qlever::vector::logVectorSearchPhase(
         config_.indexName_,
         cacheHit ? "csls rerank (cache hit) + cut (index members)"
-                 : (vidx.hasRerankLayer()
-                        ? "coarse scan + rerank (csls, index members)"
-                        : "full fine scan (csls, index members)"),
+        : (vidx.hasRerankLayer() && !fullPrecision)
+            ? "coarse scan + rerank (csls, index members)"
+            : (vidx.hasRerankLayer()
+                   ? "full fine scan (csls, index members; full-precision "
+                     "forced, coarse skipped)"
+                   : "full fine scan (csls, index members)"),
         ms, numScored);
     qlever::vector::logVectorSearchPhase(
         config_.indexName_,
