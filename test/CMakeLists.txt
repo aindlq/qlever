@@ -219,6 +219,12 @@ if (QLEVER_WITH_VECTOR_SEARCH)
     # only; run with --gtest_also_run_disabled_tests).
     addLinkAndDiscoverTest(VectorPerfTest vectorStorage)
 
+    # The i8 coarse-layer scan fast path: the hand-rolled VNNI kernels, the
+    # O(n) float-histogram select, and the two-layer i8+bf16 end-to-end
+    # equivalences (fast path vs punned baseline, histogram vs heap route,
+    # the `vec:i8Kernel` dial, filtered gather, coarse+rerank recall).
+    addLinkAndDiscoverTest(VectorI8ScanTest vectorStorage)
+
     # The `QLEVER_VECTOR_SEARCH_ENDPOINTS` runtime override of the persisted
     # embedding endpoints (env parsing + the in-memory-only mutator).
     addLinkAndDiscoverTest(VectorIndexEndpointOverrideTest vectorStorage)

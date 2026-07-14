@@ -186,6 +186,40 @@ TEST(VectorSearchService, bf16KernelSelectorParsesAndAgrees) {
 }
 
 // _____________________________________________________________________________
+// `vec:i8Kernel` -- the i8-cosine sibling of `vec:bf16Kernel` (the COARSE
+// scan layer's engine dial): every accepted value must parse and return the
+// IDENTICAL result (on a VNNI CPU both engines share one integer-dot +
+// finalize; elsewhere both are the punned metric), and an unknown value is
+// rejected with a clear message.
+TEST(VectorSearchService, i8KernelSelectorParsesAndAgrees) {
+  auto* qec = qecWithVectorIndex();
+  auto getId = makeGetId(qec->getIndex());
+  auto queryWith = [&](std::string_view kernel) {
+    std::string kernelClause =
+        kernel.empty() ? std::string{}
+                       : absl::StrCat(" ; vec:i8Kernel \"", kernel, "\"");
+    return std::string{PREFIX} +
+           "SELECT * WHERE { SERVICE vec: { _:c vec:index \"clip\" ; "
+           "vec:queryVector \"1,0,0,0\" ; vec:result ?nn ; vec:k 2" +
+           kernelClause + " . } }";
+  };
+  for (std::string_view kernel : {"", "auto", "vnni", "punned"}) {
+    auto [result, col] = runQuery(qec, queryWith(kernel), Variable{"?nn"});
+    const IdTable& table = result->idTable();
+    ASSERT_EQ(table.numRows(), 2u) << "kernel=" << kernel;
+    EXPECT_EQ(table(0, col), getId("<e0>")) << "kernel=" << kernel;
+    EXPECT_EQ(table(1, col), getId("<e1>")) << "kernel=" << kernel;
+  }
+  // An unknown kernel value is rejected at parse time.
+  AD_EXPECT_THROW_WITH_MESSAGE(
+      planQuery(qec, std::string{PREFIX} +
+                         "SELECT * WHERE { SERVICE vec: { _:c vec:index "
+                         "\"clip\" ; vec:queryVector \"1,0,0,0\" ; "
+                         "vec:result ?nn ; vec:i8Kernel \"gpu\" . } }"),
+      HasSubstr("Unknown `<i8Kernel>` value"));
+}
+
+// _____________________________________________________________________________
 TEST(VectorSearchService, queryEntityForm) {
   auto* qec = qecWithVectorIndex();
   auto [result, col] =

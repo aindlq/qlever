@@ -9,6 +9,7 @@
 add_library(vectorStorage
         VectorIndex.cpp
         VectorBf16Kernels.cpp
+        VectorI8Kernels.cpp
         VectorIndexBuilder.cpp
         VectorInputReader.cpp)
 qlever_target_link_libraries(vectorStorage util global)

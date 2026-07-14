@@ -177,6 +177,21 @@ enum class VectorScalar : uint8_t { F32, F16, I8, Bf16, Binary };
 // metric). NOT persisted -- a per-query serving choice only.
 enum class Bf16Kernel : uint8_t { Auto, Amx, Simd, Punned };
 
+// Which per-row/block kernel to use for the exact i8 COSINE distance of the
+// COARSE scan layer (the `vec:i8Kernel` query knob) -- the i8 sibling of
+// `Bf16Kernel`, and like it a pure performance A/B dial. On a CPU with the
+// hand-rolled VNNI kernel the layer computes EVERY exact i8 distance with the
+// one shared integer-dot + finalize (see `VectorI8Kernels.h`), so `Auto`/
+// `Vnni` (the block engine) and `Punned` (the per-row engine) return
+// BIT-IDENTICAL results there; on a CPU without it every value falls back to
+// usearch's punned metric (whose distances may differ by ~1 ulp from the
+// hand-rolled ones -- the same accepted tolerance as the bf16 kernels).
+//   - `Vnni`   the multi-row AVX-512-VNNI `vpdpbusd` block/gather kernel.
+//   - `Punned` the per-row engine (the pre-change scan shape).
+// A no-op on any non-i8 / non-cosine layer. NOT persisted -- a per-query
+// serving choice only.
+enum class I8Kernel : uint8_t { Auto, Vnni, Punned };
+
 // Bytes per stored scalar value. UNDEFINED for `Binary` (a scalar is a single
 // bit, 8 packed per byte) -- every row/byte-length computation must go through
 // `rowBytesFor` below, which handles the packed-bit case; calling this with

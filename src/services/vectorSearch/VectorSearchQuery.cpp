@@ -299,6 +299,30 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
           "the full-precision fine layer (e.g. bf16) exhaustively -- no coarse "
           "preselection or rerank."};
     }
+  } else if (pred == "i8Kernel") {
+    // Which exact-i8-cosine kernel the coarse scan layer uses -- a
+    // performance A/B dial (identical results on a VNNI CPU: both engines
+    // share one integer-dot + finalize). A string literal
+    // (`"vnni"`/`"auto"`/`"punned"`); unset = `Auto`.
+    if (!object.isLiteral()) {
+      throw VectorSearchException{
+          "The parameter `<i8Kernel>` expects a string "
+          "(`\"vnni\"`, `\"auto\"`, or `\"punned\"`)."};
+    }
+    std::string v{asStringViewUnsafe(object.getLiteral().getContent())};
+    if (v == "auto") {
+      i8Kernel_ = qlever::vector::I8Kernel::Auto;
+    } else if (v == "vnni") {
+      i8Kernel_ = qlever::vector::I8Kernel::Vnni;
+    } else if (v == "punned") {
+      i8Kernel_ = qlever::vector::I8Kernel::Punned;
+    } else {
+      throw VectorSearchException{absl::StrCat(
+          "Unknown `<i8Kernel>` value `", v,
+          "`; expected `\"vnni\"`, `\"auto\"`, or `\"punned\"`. This is a "
+          "performance A/B dial (identical results across kernels); a kernel "
+          "the CPU cannot run is silently downgraded.")};
+    }
   } else if (pred == "bf16Kernel") {
     // Which exact-bf16-cosine kernel the fine layer uses -- a performance A/B
     // dial (identical results to ~1e-6 across kernels). A string literal
@@ -334,7 +358,7 @@ void VectorSearchQuery::addParameter(const SparqlTriple& triple) {
         "`<numNearestNeighbors>`), `<rerankK>`, `<maxDistance>`, "
         "`<cslsThreshold>`, `<cslsNeighbors>`, `<autoCut>`, `<cutSignal>`, "
         "`<softmaxTemperature>`, `<softmaxN>`, `<algorithm>`, "
-        "`<fullPrecision>`, `<bf16Kernel>`.")};
+        "`<fullPrecision>`, `<bf16Kernel>`, `<i8Kernel>`.")};
   }
 }
 
@@ -529,6 +553,7 @@ VectorSearchQuery::toVectorSearchConfiguration() const {
   config.algorithm_ = algo_;
   config.fullPrecision_ = fullPrecision_;
   config.bf16Kernel_ = bf16Kernel_;
+  config.i8Kernel_ = i8Kernel_;
   return config;
 }
 

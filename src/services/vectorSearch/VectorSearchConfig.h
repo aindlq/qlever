@@ -193,6 +193,15 @@ struct VectorSearchConfiguration {
   // coarse+rerank fine pass (and the single-pair `vec:distance`). A no-op on
   // any non-bf16/non-cosine layer. Not persisted.
   Bf16Kernel bf16Kernel_ = Bf16Kernel::Auto;
+
+  // `vec:i8Kernel "vnni"|"punned"` (default `Auto`): the i8-cosine sibling of
+  // `bf16Kernel_`, for the COARSE i8 scan layer (or a single-layer i8 index):
+  // `Auto`/`Vnni` = the multi-row AVX-512-VNNI block engine, `Punned` = the
+  // per-row engine. On a VNNI CPU both engines compute the IDENTICAL
+  // distances (one shared integer-dot + finalize), so this is a pure
+  // performance A/B; on a CPU without VNNI it is a no-op (punned metric). A
+  // no-op on any non-i8/non-cosine layer. Not persisted.
+  I8Kernel i8Kernel_ = I8Kernel::Auto;
 };
 
 }  // namespace qlever::vector

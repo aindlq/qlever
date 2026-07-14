@@ -36,9 +36,11 @@
 
 #include "backports/StartsWithAndEndsWith.h"
 #include "backports/algorithm.h"
-#include "services/vectorSearch/VectorBf16Kernels.h"
 #include "services/vectorSearch/UsearchGraph.h"
+#include "services/vectorSearch/VectorBf16Kernels.h"
+#include "services/vectorSearch/VectorI8Kernels.h"
 #include "services/vectorSearch/VectorMemory.h"
+#include "services/vectorSearch/VectorSelect.h"
 #include "util/Exception.h"
 #include "util/HashSet.h"
 #include "util/Log.h"
@@ -294,6 +296,114 @@ struct VectorIndex::Impl {
       }
       return autoBest();
     }
+
+    // The i8 (quantized-cosine) COARSE-layer fast path -- the i8 analog of
+    // the bf16 kernels above (see `VectorI8Kernels.h`). Present iff this is
+    // an i8 layer with a Cosine metric AND the CPU has AVX-512-VNNI. When
+    // set, EVERY exact i8 distance of this layer -- the whole-index block
+    // sweep, the scattered gather, the per-row fallback, and the single
+    // pair -- is computed as the exact integer dot plus the ONE shared
+    // `angularFinalize`, so all agree on any given pair to the bit. It can
+    // differ from usearch's punned metric by ~1 ulp on a small fraction of
+    // pairs (the punned finalize is compiled under a different ISA context);
+    // that tolerance is accepted exactly like the bf16 batched cosine (the
+    // HNSW graph only pre-selects, its candidates are re-scored by these).
+    bool hasI8VnniKernel_ = false;
+    // Per-row sidecars built at open (8 B/row, e.g. ~17 MB at 2.14M rows):
+    // `sum(row)` (the exact-integer correction of the unsigned-biased VNNI
+    // dot, `dot = dotU - 128*sum`) and `sum(row^2)` (the finalize's |b|^2).
+    std::vector<int32_t> rowSumsI8_;
+    std::vector<int32_t> rowNormSqI8_;
+
+    // Whether a requested `vec:i8Kernel` resolves to the BLOCK (VNNI) engine
+    // on this layer. `Punned` keeps the per-row engine; both return
+    // bit-identical distances when `hasI8VnniKernel_` (the dial is a pure
+    // performance A/B), and identical punned results without it.
+    bool resolveI8Vnni(I8Kernel requested) const {
+      return hasI8VnniKernel_ && requested != I8Kernel::Punned;
+    }
+
+    // The query biased ONCE per search for the unsigned-first `vpdpbusd`
+    // (`qx[i] = q[i] XOR 0x80`); the caller keeps the buffer alive across
+    // block/gather calls. Only valid when `hasI8VnniKernel_`.
+    std::vector<uint8_t> xorQueryI8(const char* queryBytes) const {
+      std::vector<uint8_t> qx(dim_);
+      const auto* q = reinterpret_cast<const uint8_t*>(queryBytes);
+      for (size_t i = 0; i < dim_; ++i) {
+        qx[i] = static_cast<uint8_t>(q[i] ^ 0x80u);
+      }
+      return qx;
+    }
+
+    // The query's exact integer |q|^2 (the finalize's a2 term), hoisted once
+    // per search by the hot sweeps (the per-row fallback recomputes it).
+    static int32_t queryNormSqI8(const char* queryBytes, size_t dim) {
+      int32_t sum, normSq;
+      i8kernels::rowSums(reinterpret_cast<const int8_t*>(queryBytes), dim, &sum,
+                         &normSq);
+      return normSq;
+    }
+
+    // Angular distance of an i8 query to store row `i`: exact signed dot +
+    // sidecar |row|^2 + the shared finalize. `qNormSq` is the hoisted
+    // (float-cast) query norm term. Bit-identical to the block kernel for
+    // the same pair. Only valid when `hasI8VnniKernel_`.
+    float angularToRowI8(const char* queryBytes, size_t i,
+                         float qNormSq) const {
+      const int32_t dot =
+          i8kernels::dotPair(reinterpret_cast<const int8_t*>(queryBytes),
+                             reinterpret_cast<const int8_t*>(rowPtr(i)), dim_);
+      return i8kernels::angularFinalize(static_cast<float>(dot), qNormSq,
+                                        static_cast<float>(rowNormSqI8_[i]));
+    }
+
+    // Angular distance between two arbitrary i8-encoded vectors (no sidecar
+    // row): both norm terms computed live. The single-pair slow path; bit-
+    // identical to the block kernel for the same pair.
+    float angularPairI8(const char* a, const char* b) const {
+      const auto* ai = reinterpret_cast<const int8_t*>(a);
+      const auto* bi = reinterpret_cast<const int8_t*>(b);
+      int32_t aSum, a2, bSum, b2;
+      i8kernels::rowSums(ai, dim_, &aSum, &a2);
+      i8kernels::rowSums(bi, dim_, &bSum, &b2);
+      const int32_t dot = i8kernels::dotPair(ai, bi, dim_);
+      return i8kernels::angularFinalize(static_cast<float>(dot),
+                                        static_cast<float>(a2),
+                                        static_cast<float>(b2));
+    }
+
+    // Angular distances for a CONTIGUOUS block of `count` rows starting at
+    // store row `rowStart`, via the multi-row VNNI dot (`qx` from
+    // `xorQueryI8`, `qNormSq` from `queryNormSqI8`) plus the per-row sidecar
+    // finalize. `dots` is caller scratch (>= count i32). Only valid when
+    // `hasI8VnniKernel_`.
+    void angularBlockI8(size_t rowStart, size_t count, const uint8_t* qx,
+                        float qNormSq, int32_t* dots, float* out) const {
+      i8kernels::dotBlockVnni(qx, base() + rowStart * stride_, stride_, count,
+                              dim_, dots);
+      const int32_t* sums = rowSumsI8_.data() + rowStart;
+      const int32_t* norms = rowNormSqI8_.data() + rowStart;
+      for (size_t j = 0; j < count; ++j) {
+        const int32_t dot = dots[j] - 128 * sums[j];
+        out[j] = i8kernels::angularFinalize(static_cast<float>(dot), qNormSq,
+                                            static_cast<float>(norms[j]));
+      }
+    }
+
+    // The SCATTERED sibling: distances of `count` rows given by `rowOf[j]`
+    // (store-row indices) via the multi-row VNNI gather. `out[j]` receives
+    // the angular distance of row `rowOf[j]`.
+    void angularGatherI8(size_t count, const uint8_t* qx, const size_t* rowOf,
+                         float qNormSq, int32_t* dots, float* out) const {
+      i8kernels::dotGatherVnni(qx, base(), stride_, rowOf, count, dim_, dots);
+      for (size_t j = 0; j < count; ++j) {
+        const size_t r = rowOf[j];
+        const int32_t dot = dots[j] - 128 * rowSumsI8_[r];
+        out[j] =
+            i8kernels::angularFinalize(static_cast<float>(dot), qNormSq,
+                                       static_cast<float>(rowNormSqI8_[r]));
+      }
+    }
 #endif
 
     // Base pointer of the active matrix: the aligned RAM copy if present,
@@ -345,6 +455,13 @@ struct VectorIndex::Impl {
         return cosineBf16(a, b, queryInvNormBf16(a, dim_),
                           queryInvNormBf16(b, dim_));
       }
+      // The i8 sibling of the rule above: with the VNNI fast path resolved at
+      // open, EVERY exact i8 distance uses the one shared integer-dot +
+      // finalize (see `hasI8VnniKernel_`), so the block sweep, the gather,
+      // and this single-pair path agree to the bit.
+      if (hasI8VnniKernel_) {
+        return angularPairI8(a, b);
+      }
 #endif
       return static_cast<float>(
           metric_.value()(reinterpret_cast<const uu::byte_t*>(a),
@@ -356,6 +473,13 @@ struct VectorIndex::Impl {
 #if USEARCH_USE_NUMKONG
       if (batchedCosineBf16_) {
         return cosineToRowBf16(queryBytes, i, queryInvNormBf16(queryBytes, dim_));
+      }
+      if (hasI8VnniKernel_) {
+        // The generic per-row fallback recomputes the query norm per call
+        // (like the bf16 branch above); hot sweeps hoist it and call
+        // `angularToRowI8` directly.
+        return angularToRowI8(
+            queryBytes, i, static_cast<float>(queryNormSqI8(queryBytes, dim_)));
       }
 #endif
       return distanceBetweenBytes(queryBytes, rowPtr(i));
@@ -630,6 +754,44 @@ void configureLayerFastPaths([[maybe_unused]] LayerT& layer,
                              [[maybe_unused]] int numThreads) {
 #if USEARCH_USE_NUMKONG
   const nk_capability_t caps = nk_capabilities_available();
+
+  // The i8 (quantized-cosine) fast path: the hand-rolled VNNI kernels plus
+  // the per-row (sum, |row|^2) sidecars they finalize with, built in one
+  // parallel pass at open (~8 B/row). See `hasI8VnniKernel_` for the
+  // bit-consistency contract. i8 is cosine-only by construction (the builder
+  // rejects every other metric), but gate on the metric anyway so a
+  // hypothetical non-cosine i8 layer keeps the punned metric.
+  // QLEVER_VECTOR_SEARCH_I8=0/false/off/no disables the whole i8 fast path at
+  // OPEN time (safety valve; also how the tests obtain the punned-metric
+  // baseline on a VNNI CPU). Read per open (not memoized) so one process can
+  // hold both variants.
+  auto i8FastPathEnabled = []() {
+    const char* v = std::getenv("QLEVER_VECTOR_SEARCH_I8");
+    if (v == nullptr) {
+      return true;
+    }
+    std::string s{v};
+    for (char& c : s) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return !(s == "0" || s == "false" || s == "off" || s == "no");
+  };
+  if (scalar == VectorScalar::I8 && metric == VectorMetric::Cosine &&
+      i8kernels::vnniAvailable() && i8FastPathEnabled()) {
+    layer.rowSumsI8_.assign(numRows, 0);
+    layer.rowNormSqI8_.assign(numRows, 0);
+    int32_t* sums = layer.rowSumsI8_.data();
+    int32_t* norms = layer.rowNormSqI8_.data();
+    const size_t dimI8 = layer.dim_;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(numThreads)
+#endif
+    for (size_t i = 0; i < numRows; ++i) {
+      i8kernels::rowSums(reinterpret_cast<const int8_t*>(layer.rowPtr(i)),
+                         dimI8, &sums[i], &norms[i]);
+    }
+    layer.hasI8VnniKernel_ = true;
+  }
 
   // P3: raw Hamming kernel for the binary (b1x8) scan layer.
   if (scalar == VectorScalar::Binary) {
@@ -1894,6 +2056,87 @@ void scanWholeIndexBatchedBf16(
     scoreBlock(top, s, count, dots.data(), dists.data());
   }
 }
+
+// Rows per i8 VNNI block: same shape as the bf16 batching (1024 rows at the
+// 1152-dim image rows = ~1.15 MB of A per block).
+constexpr size_t VEC_I8_BATCH_ROWS = 1024;
+
+// The whole-index i8 (quantized-cosine) top-k sweep via the multi-row VNNI
+// block kernel -- the i8 analog of `scanWholeIndexBatchedBf16`: the same
+// static per-thread partition, tombstone filter, and per-thread `TopK`
+// merge, distances a block at a time from `angularBlockI8`. The query is
+// biased (`xorQueryI8`) and its norm term hoisted ONCE, shared read-only
+// across threads. Only called when `resolveI8Vnni` said yes.
+template <typename ImplT, typename LayerT>
+void scanWholeIndexBatchedI8(TopK& top, size_t k, ImplT& impl, LayerT& layer,
+                             const char* queryBytes, float maxDist,
+                             const CheckInterruptCallback& checkInterrupt,
+                             [[maybe_unused]] int numThreads) {
+  const size_t n = impl.meta_.numVectors_;
+  const std::vector<uint8_t> qx = layer.xorQueryI8(queryBytes);
+  const float qNormSq =
+      static_cast<float>(LayerT::queryNormSqI8(queryBytes, layer.dim_));
+  const uint8_t* qxp = qx.data();
+  auto scoreBlock = [&](TopK& localTop, size_t blockStart, size_t count,
+                        int32_t* dots, float* dists) {
+    layer.angularBlockI8(blockStart, count, qxp, qNormSq, dots, dists);
+    for (size_t j = 0; j < count; ++j) {
+      const uint64_t id = impl.keys_[blockStart + j];
+      if (id != TOMBSTONE_KEY && dists[j] <= maxDist) {
+        localTop.offer(dists[j], id);
+      }
+    }
+  };
+#ifdef _OPENMP
+  if (numThreads > 1) {
+    std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
+    std::atomic<bool> cancelled{false};
+#pragma omp parallel num_threads(numThreads)
+    {
+      const size_t tid = static_cast<size_t>(omp_get_thread_num());
+      const size_t team = static_cast<size_t>(omp_get_num_threads());
+      TopK& localTop = locals[tid];
+      const size_t first = n * tid / team;
+      const size_t last = n * (tid + 1) / team;
+      std::vector<int32_t> dots(VEC_I8_BATCH_ROWS);
+      std::vector<float> dists(VEC_I8_BATCH_ROWS);
+      for (size_t s = first; s < last; s += VEC_I8_BATCH_ROWS) {
+        if (VEC_SEARCH_CHECK_CANCELLATION) {
+          if (cancelled.load(std::memory_order_relaxed)) {
+            break;
+          }
+          if (checkInterrupt) {
+            try {
+              checkInterrupt();
+            } catch (...) {
+              cancelled.store(true, std::memory_order_relaxed);
+              break;
+            }
+          }
+        }
+        const size_t count = std::min(VEC_I8_BATCH_ROWS, last - s);
+        scoreBlock(localTop, s, count, dots.data(), dists.data());
+      }
+    }
+    if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+      checkInterrupt();  // re-raise outside the parallel region
+    }
+    top.mergeLocals(locals);
+    return;
+  }
+#endif
+  std::vector<int32_t> dots(VEC_I8_BATCH_ROWS);
+  std::vector<float> dists(VEC_I8_BATCH_ROWS);
+  size_t sinceCheck = 0;
+  for (size_t s = 0; s < n; s += VEC_I8_BATCH_ROWS) {
+    if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+      sinceCheck = 0;
+      checkInterrupt();
+    }
+    const size_t count = std::min(VEC_I8_BATCH_ROWS, n - s);
+    scoreBlock(top, s, count, dots.data(), dists.data());
+  }
+}
 #endif
 
 // The dedicated WHOLE-INDEX top-k sweep (the filtered search keeps the
@@ -1909,13 +2152,13 @@ void scanWholeIndexBatchedBf16(
 // irrelevant to the result: the same distances are offered as in the serial
 // walk, and the top-k is bit-identical (for distinct distances).
 template <typename ImplT, typename LayerT>
-void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
-                            const char* queryBytes,
-                            std::optional<float> maxDistance,
-                            const CheckInterruptCallback& checkInterrupt,
-                            [[maybe_unused]] int numThreads,
-                            [[maybe_unused]] Bf16Kernel bf16Kernel =
-                                Bf16Kernel::Auto) {
+void scanWholeIndexIntoTopK(
+    TopK& top, size_t k, ImplT& impl, LayerT& layer, const char* queryBytes,
+    std::optional<float> maxDistance,
+    const CheckInterruptCallback& checkInterrupt,
+    [[maybe_unused]] int numThreads,
+    [[maybe_unused]] Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
+    [[maybe_unused]] I8Kernel i8Kernel = I8Kernel::Auto) {
   const size_t n = impl.meta_.numVectors_;
   // Hoist the `maxDistance` optional out of the per-row hot path: `nullopt`
   // (the whole-index common case) becomes `+inf`, so the filter is a single
@@ -1935,7 +2178,36 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
                               blockKernel, checkInterrupt, numThreads);
     return;
   }
+  // Blocked i8 quantized-cosine sweep, routed by `vec:i8Kernel` (`Punned`
+  // falls through to the per-row loop below; same distances either way --
+  // see `hasI8VnniKernel_`).
+  if (layer.resolveI8Vnni(i8Kernel)) {
+    scanWholeIndexBatchedI8(top, k, impl, layer, queryBytes, maxDist,
+                            checkInterrupt, numThreads);
+    return;
+  }
+  // The i8 PER-ROW engine (the `vec:i8Kernel "punned"` dial): hoist the
+  // query's |q|^2 term once and score each row via the sidecar helper --
+  // NOT `distanceBetweenBytes`, whose pair form would recompute BOTH norm
+  // terms live per row (a measured ~2.5x slowdown even against the old
+  // usearch metric). Same distances as the block engine (see
+  // `hasI8VnniKernel_`).
+  const bool i8PerRow = layer.hasI8VnniKernel_;
+  const float qNormSqI8 =
+      i8PerRow
+          ? static_cast<float>(std::remove_reference_t<LayerT>::queryNormSqI8(
+                queryBytes, layer.dim_))
+          : 0.f;
 #endif
+  auto distOfRow = [&](size_t row, [[maybe_unused]] const char* p) -> float {
+#if USEARCH_USE_NUMKONG
+    if (i8PerRow) {
+      return layer.angularToRowI8(queryBytes, row, qNormSqI8);
+    }
+#endif
+    (void)row;
+    return layer.distanceBetweenBytes(queryBytes, p);
+  };
 #ifdef _OPENMP
   if (numThreads > 1) {
     std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
@@ -1987,7 +2259,7 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
         }
         uint64_t id = impl.keys_[row];
         if (id != TOMBSTONE_KEY) {
-          float dist = layer.distanceBetweenBytes(queryBytes, p);
+          float dist = distOfRow(row, p);
           if (dist <= maxDist) {
             localTop.offer(dist, id);
           }
@@ -2019,7 +2291,7 @@ void scanWholeIndexIntoTopK(TopK& top, size_t k, ImplT& impl, LayerT& layer,
     }
     uint64_t id = impl.keys_[row];
     if (id != TOMBSTONE_KEY) {
-      float dist = layer.distanceBetweenBytes(queryBytes, p);
+      float dist = distOfRow(row, p);
       if (dist <= maxDist) {
         top.offer(dist, id);
       }
@@ -2151,13 +2423,25 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
                        const RowFn& rowOf, float* dists,
                        const CheckInterruptCallback& checkInterrupt,
                        bool contiguous = false,
-                       Bf16Kernel bf16Kernel = Bf16Kernel::Auto);
+                       Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
+                       I8Kernel i8Kernel = I8Kernel::Auto);
 }  // namespace
+
+// Minimum `k` for which the i8 whole-index top-k routes through the O(n)
+// float-histogram select (`selectSmallestPairsFloat`) instead of the blocked
+// sweep + bounded `TopK` heap. Measured crossover on a 2.14M x 1152 i8 sweep
+// (24-core EMR Xeon): the fused heap wins slightly up to k ~ 500 (12.0 vs
+// 12.6 ms), the histogram wins beyond (k=1000: 13.4 vs 15.0 ms; k=10^4:
+// 13.5 vs 20.2 ms -- the heap anti-scales with k), so the gate sits between
+// the default small-k rerank (k=100) and the production k=1000 rerankK=10^4.
+constexpr size_t I8_HISTOGRAM_MIN_K = 512;
 
 // `integerDistMax`, when set, means THIS layer's metric returns an integer
 // distance in [0, integerDistMax] (the binary layer's Hamming count) -- so the
 // top-k selection uses the branchless histogram instead of the bounded heap.
-// `nullopt` (a float metric: i8/bf16/f32) keeps the heap.
+// `nullopt` (a float metric: i8/bf16/f32) keeps the heap -- except the i8
+// layer's whole-index sweep at a large `k`, which uses the O(n)
+// float-histogram select (see `I8_HISTOGRAM_MIN_K`).
 // `keepAll` (the annotate form): clamp `k` to the live bound only, NOT to
 // `MAX_SEARCH_RESULTS` -- see `clampSearchK`.
 template <typename ImplT, typename LayerT>
@@ -2168,7 +2452,8 @@ std::vector<ScoredEntity> searchExactBytes(
     const CheckInterruptCallback& checkInterrupt, size_t* numScored = nullptr,
     std::optional<size_t> integerDistMax = std::nullopt,
     std::vector<uint64_t>* outRows = nullptr,
-    Bf16Kernel bf16Kernel = Bf16Kernel::Auto, bool keepAll = false) {
+    Bf16Kernel bf16Kernel = Bf16Kernel::Auto, bool keepAll = false,
+    [[maybe_unused]] I8Kernel i8Kernel = I8Kernel::Auto) {
   // `numScored` (optional out-param) reports how many vectors actually had a
   // distance computed -- the WHOLE live set for a whole-index search, or just
   // the candidates that are members for a restricted one. It is NOT the raw
@@ -2252,6 +2537,59 @@ std::vector<ScoredEntity> searchExactBytes(
   const bool histWholeIndex =
       integerDistMax.has_value() && impl.meta_.numTombstones_ == 0;
 
+  // The i8 sibling: whole-index top-k via the blocked VNNI sweep into a
+  // materialized distance array plus the O(n) float-histogram select
+  // (`selectSmallestPairsFloat`) -- the same route the binary layer takes
+  // through `coarseSweepSelectHistogram`, for the same reason (the bounded
+  // heap anti-scales with `k`; see `I8_HISTOGRAM_MIN_K` for the measured
+  // gate). Only on a tombstone-free store (same reason as above); smaller
+  // `k` / tombstones keep the blocked sweep + `TopK` heap below. Ties at the
+  // k-boundary resolve by (distance, ROW) here vs the heap's thread-order /
+  // (distance, id) -- the same documented latitude as the binary histogram
+  // (equal-distance boundary ties may keep either entity).
+#if USEARCH_USE_NUMKONG
+  const bool i8HistWholeIndex =
+      !integerDistMax.has_value() && layer.resolveI8Vnni(i8Kernel) &&
+      impl.meta_.numTombstones_ == 0 && k >= I8_HISTOGRAM_MIN_K;
+#else
+  constexpr bool i8HistWholeIndex = false;  // no fast path without NumKong
+#endif
+  auto histSelectFloatI8 = [&]() -> std::vector<ScoredEntity> {
+    const size_t n = impl.meta_.numVectors_;
+    std::unique_ptr<float[]> dists(new float[n]);
+    {
+      SeqScanHint hint{layer, !layer.alignedBuf_};
+      cslsDistanceSweep(
+          layer, queryBytes, n, [](size_t i) { return i; }, dists.get(),
+          checkInterrupt, /*contiguous=*/true, bf16Kernel, i8Kernel);
+    }
+    int selThreads = 1;
+#ifdef _OPENMP
+    if (n >= VEC_SEARCH_PARALLEL_THRESHOLD) {
+      selThreads = vectorSearchThreadCap();
+    }
+#endif
+    auto sel = selectSmallestPairsFloat(dists.get(), n, k, selThreads);
+    const float maxDist =
+        maxDistance.value_or(std::numeric_limits<float>::infinity());
+    std::vector<ScoredEntity> out;
+    out.reserve(sel.size());
+    std::vector<uint64_t> rows;
+    if (outRows != nullptr) {
+      rows.reserve(sel.size());
+    }
+    for (const auto& [dist, row] : sel) {
+      if (dist <= maxDist) {
+        out.push_back(ScoredEntity{Id::fromBits(impl.keys_[row]), dist});
+        if (outRows != nullptr) {
+          rows.push_back(row);
+        }
+      }
+    }
+    emitRows(std::move(rows));
+    return out;
+  };
+
   if (!candidates.has_value()) {
     // Whole-index brute force: rows are visited in order, so it is sequential.
     // The distance sweep runs in parallel (per-thread heaps) above the
@@ -2271,9 +2609,12 @@ std::vector<ScoredEntity> searchExactBytes(
           impl.meta_.numVectors_, [](size_t i) { return i; },
           [&](size_t i) { return impl.keys_[i]; }, /*contiguous=*/true);
     }
+    if (i8HistWholeIndex) {
+      return histSelectFloatI8();
+    }
     SeqScanHint hint{layer, !layer.alignedBuf_};
     scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
-                           checkInterrupt, numThreads, bf16Kernel);
+                           checkInterrupt, numThreads, bf16Kernel, i8Kernel);
     auto out = top.sorted();
     emitRowsFromEntities(out);
     return out;
@@ -2311,9 +2652,13 @@ std::vector<ScoredEntity> searchExactBytes(
             impl.meta_.numVectors_, [](size_t i) { return i; },
             [&](size_t i) { return impl.keys_[i]; }, /*contiguous=*/true);
       }
+      if (i8HistWholeIndex) {
+        return histSelectFloatI8();
+      }
       SeqScanHint hint{layer, !layer.alignedBuf_};
       scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
-                             checkInterrupt, checkThreads, bf16Kernel);
+                             checkInterrupt, checkThreads, bf16Kernel,
+                             i8Kernel);
       auto out = top.sorted();
       emitRowsFromEntities(out);
       return out;
@@ -2393,9 +2738,12 @@ std::vector<ScoredEntity> searchExactBytes(
           impl.meta_.numVectors_, [](size_t i) { return i; },
           [&](size_t i) { return impl.keys_[i]; }, /*contiguous=*/true);
     }
+    if (i8HistWholeIndex) {
+      return histSelectFloatI8();
+    }
     SeqScanHint hint{layer, !layer.alignedBuf_};
     scanWholeIndexIntoTopK(top, k, impl, layer, queryBytes, maxDistance,
-                           checkInterrupt, numThreads, bf16Kernel);
+                           checkInterrupt, numThreads, bf16Kernel, i8Kernel);
     auto out = top.sorted();
     emitRowsFromEntities(out);
     return out;
@@ -2432,14 +2780,18 @@ std::vector<ScoredEntity> searchExactBytes(
   {
     using BK = typename std::remove_reference_t<LayerT>::BlockKernel;
     const BK gatherKernel = layer.resolveBlockKernel(bf16Kernel);
-    if (gatherKernel == BK::HandSimd || gatherKernel == BK::HandAmx) {
+    // The i8 layer's scattered members route through the SAME batched gather
+    // sweep via the multi-row VNNI kernel (`cslsDistanceSweep` dispatches on
+    // the layer), for the same consistency reason as the bf16 branch.
+    if (gatherKernel == BK::HandSimd || gatherKernel == BK::HandAmx ||
+        layer.resolveI8Vnni(i8Kernel)) {
       std::vector<float> dists(matched.size());
       {
         SeqScanHint hint{layer, seqHint && monotonic};
         cslsDistanceSweep(
             layer, queryBytes, matched.size(),
             [&](size_t i) { return matched[i].first; }, dists.data(),
-            checkInterrupt, /*contiguous=*/false, bf16Kernel);
+            checkInterrupt, /*contiguous=*/false, bf16Kernel, i8Kernel);
       }
       const float maxDist =
           maxDistance.value_or(std::numeric_limits<float>::infinity());
@@ -2474,7 +2826,7 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    Bf16Kernel bf16Kernel, bool keepAll) const {
+    Bf16Kernel bf16Kernel, bool keepAll, I8Kernel i8Kernel) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -2488,6 +2840,8 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
   const char* queryBytes = layer.encodeQuery(query, buffer);
   // The FINE layer is binary only for a single-layer binary index (no rerank);
   // then its Hamming distances are integers -> the histogram select applies.
+  // (`i8Kernel` matters only for a single-layer i8 index, where the fine
+  // layer IS the i8 store.)
   const VectorScalar fineScalar =
       impl.meta_.config_.rerankScalar_.value_or(impl.meta_.config_.scalar_);
   const std::optional<size_t> integerDistMax =
@@ -2495,7 +2849,7 @@ std::vector<ScoredEntity> VectorIndex::searchExact(
                                          : std::nullopt;
   return searchExactBytes(impl, layer, queryBytes, k, candidates, maxDistance,
                           checkInterrupt, numScored, integerDistMax,
-                          /*outRows=*/nullptr, bf16Kernel, keepAll);
+                          /*outRows=*/nullptr, bf16Kernel, keepAll, i8Kernel);
 }
 
 // ____________________________________________________________________________
@@ -2503,7 +2857,8 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarse(
     ql::span<const float> query, size_t k,
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored,
+    I8Kernel i8Kernel) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -2516,13 +2871,17 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarse(
   const char* queryBytes = impl.scan_.encodeQuery(query, buffer);
   // The coarse SCAN layer's binary Hamming distances are integers -> the
   // O(n) histogram select (matches the CSLS coarse pass; avoids the O(n log k)
-  // heap that dominated the plain top-k coarse pass at the binary rerankK=50*k).
+  // heap that dominated the plain top-k coarse pass at the binary
+  // rerankK=50*k). The i8 scan layer takes the float-histogram sibling inside
+  // `searchExactBytes` (routed by `i8Kernel`).
   const std::optional<size_t> integerDistMax =
       impl.meta_.config_.scalar_ == VectorScalar::Binary
           ? std::optional<size_t>{impl.dim()}
           : std::nullopt;
   return searchExactBytes(impl, impl.scan_, queryBytes, k, candidates,
-                          maxDistance, checkInterrupt, numScored, integerDistMax);
+                          maxDistance, checkInterrupt, numScored,
+                          integerDistMax, /*outRows=*/nullptr, Bf16Kernel::Auto,
+                          /*keepAll=*/false, i8Kernel);
 }
 
 // ____________________________________________________________________________
@@ -2531,7 +2890,7 @@ std::vector<ScoredRow> VectorIndex::searchExactCoarseWithRows(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    bool keepAll) const {
+    bool keepAll, I8Kernel i8Kernel) const {
   auto& impl = *impl_;
   if (query.size() != impl.dim()) {
     AD_THROW("The query vector has dimension " + std::to_string(query.size()) +
@@ -2550,10 +2909,9 @@ std::vector<ScoredRow> VectorIndex::searchExactCoarseWithRows(
   // form) lifts the `MAX_SEARCH_RESULTS` clamp off the coarse `rerankK` too --
   // the coarse pass must keep EVERY candidate for the fine pass then.
   std::vector<uint64_t> rows;
-  auto scored = searchExactBytes(impl, impl.scan_, queryBytes, k, candidates,
-                                 maxDistance, checkInterrupt, numScored,
-                                 integerDistMax, &rows, Bf16Kernel::Auto,
-                                 keepAll);
+  auto scored = searchExactBytes(
+      impl, impl.scan_, queryBytes, k, candidates, maxDistance, checkInterrupt,
+      numScored, integerDistMax, &rows, Bf16Kernel::Auto, keepAll, i8Kernel);
   // `outRows` is filled in lock-step with `scored`, so the two align 1:1.
   AD_CORRECTNESS_CHECK(rows.size() == scored.size());
   std::vector<ScoredRow> out;
@@ -2679,7 +3037,7 @@ std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    Bf16Kernel bf16Kernel, bool keepAll) const {
+    Bf16Kernel bf16Kernel, bool keepAll, I8Kernel i8Kernel) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -2691,14 +3049,15 @@ std::vector<ScoredEntity> VectorIndex::searchExactByEntity(
   return searchExactBytes(impl, layer, layer.rowPtr(row.value()), k, candidates,
                           maxDistance, checkInterrupt, numScored,
                           /*integerDistMax=*/std::nullopt, /*outRows=*/nullptr,
-                          bf16Kernel, keepAll);
+                          bf16Kernel, keepAll, i8Kernel);
 }
 
 // ____________________________________________________________________________
 std::vector<ScoredEntity> VectorIndex::searchExactCoarseByEntity(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
-    const CheckInterruptCallback& checkInterrupt, size_t* numScored) const {
+    const CheckInterruptCallback& checkInterrupt, size_t* numScored,
+    I8Kernel i8Kernel) const {
   // Non-const so the gather can toggle the flat store's (advisory) access-
   // pattern hint; all result-affecting state stays read-only.
   auto& impl = *impl_;
@@ -2707,7 +3066,9 @@ std::vector<ScoredEntity> VectorIndex::searchExactCoarseByEntity(
     return {};
   }
   return searchExactBytes(impl, impl.scan_, impl.scan_.rowPtr(row.value()), k,
-                          candidates, maxDistance, checkInterrupt, numScored);
+                          candidates, maxDistance, checkInterrupt, numScored,
+                          /*integerDistMax=*/std::nullopt, /*outRows=*/nullptr,
+                          Bf16Kernel::Auto, /*keepAll=*/false, i8Kernel);
 }
 
 // ____________________________________________________________________________
@@ -2715,7 +3076,7 @@ std::vector<ScoredRow> VectorIndex::searchExactCoarseByEntityWithRows(
     Id entity, size_t k, std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    bool keepAll) const {
+    bool keepAll, I8Kernel i8Kernel) const {
   auto& impl = *impl_;
   auto row = impl.rowOf(entity);
   if (!row.has_value()) {
@@ -2728,7 +3089,7 @@ std::vector<ScoredRow> VectorIndex::searchExactCoarseByEntityWithRows(
   auto scored = searchExactBytes(
       impl, impl.scan_, impl.scan_.rowPtr(row.value()), k, candidates,
       maxDistance, checkInterrupt, numScored, std::nullopt, &rows,
-      Bf16Kernel::Auto, keepAll);
+      Bf16Kernel::Auto, keepAll, i8Kernel);
   AD_CORRECTNESS_CHECK(rows.size() == scored.size());
   std::vector<ScoredRow> out;
   out.reserve(scored.size());
@@ -2884,7 +3245,8 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
                        const RowFn& rowOf, float* dists,
                        const CheckInterruptCallback& checkInterrupt,
                        [[maybe_unused]] bool contiguous,
-                       [[maybe_unused]] Bf16Kernel bf16Kernel) {
+                       [[maybe_unused]] Bf16Kernel bf16Kernel,
+                       [[maybe_unused]] I8Kernel i8Kernel) {
   // Prefetch tuning (see `prefetchSweepRow`): ~4 KiB lookahead for compact
   // rows, a few rows for large ones.
   const bool compact = layer.stride_ <= 256;
@@ -2895,6 +3257,122 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
 #if USEARCH_USE_NUMKONG
   using BK = typename std::remove_reference_t<decltype(layer)>::BlockKernel;
   const BK block16 = layer.resolveBlockKernel(bf16Kernel);
+  // The i8 (quantized-cosine) sweep, routed by `vec:i8Kernel`: the CONTIGUOUS
+  // whole-store sweep through the multi-row VNNI block, a SCATTERED one
+  // through the multi-row VNNI gather (rows resolved into a chunk buffer and
+  // software-prefetched, exactly like the bf16 gather below). Same distances
+  // as the per-row fallback at the bottom (the shared integer-dot + finalize;
+  // see `hasI8VnniKernel_`), so this is purely a performance route.
+  if (layer.resolveI8Vnni(i8Kernel)) {
+    const std::vector<uint8_t> qx = layer.xorQueryI8(queryBytes);
+    const float qNormSq = static_cast<float>(
+        std::remove_reference_t<decltype(layer)>::queryNormSqI8(queryBytes,
+                                                                layer.dim_));
+    const uint8_t* qxp = qx.data();
+    if (contiguous) {
+      auto block = [&](size_t s, size_t count, int32_t* scratch) {
+        layer.angularBlockI8(s, count, qxp, qNormSq, scratch, dists + s);
+      };
+#ifdef _OPENMP
+      if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+        std::atomic<bool> cancelled{false};
+#pragma omp parallel num_threads(numThreads)
+        {
+          const size_t tid = static_cast<size_t>(omp_get_thread_num());
+          const size_t team = static_cast<size_t>(omp_get_num_threads());
+          const size_t first = n * tid / team;
+          const size_t last = n * (tid + 1) / team;
+          std::vector<int32_t> scratch(VEC_I8_BATCH_ROWS);
+          for (size_t s = first; s < last; s += VEC_I8_BATCH_ROWS) {
+            if (VEC_SEARCH_CHECK_CANCELLATION) {
+              if (cancelled.load(std::memory_order_relaxed)) break;
+              if (checkInterrupt) {
+                try {
+                  checkInterrupt();
+                } catch (...) {
+                  cancelled.store(true, std::memory_order_relaxed);
+                  break;
+                }
+              }
+            }
+            block(s, std::min(VEC_I8_BATCH_ROWS, last - s), scratch.data());
+          }
+        }
+        if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+          checkInterrupt();
+        }
+        return;
+      }
+#endif
+      std::vector<int32_t> scratch(VEC_I8_BATCH_ROWS);
+      size_t sinceCheck = 0;
+      for (size_t s = 0; s < n; s += VEC_I8_BATCH_ROWS) {
+        if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+          sinceCheck = 0;
+          checkInterrupt();
+        }
+        block(s, std::min(VEC_I8_BATCH_ROWS, n - s), scratch.data());
+      }
+      return;
+    }
+    // Scattered gather chunks.
+    constexpr size_t GATHER_CHUNK_I8 = 512;
+    const char* gbase = layer.base();
+    const size_t gstride = layer.stride_;
+    auto gatherChunk = [&](size_t s, size_t count, size_t* rowBuf,
+                           int32_t* scratch) {
+      for (size_t j = 0; j < count; ++j) {
+        rowBuf[j] = rowOf(s + j);
+        __builtin_prefetch(gbase + rowBuf[j] * gstride, 0, 3);
+      }
+      layer.angularGatherI8(count, qxp, rowBuf, qNormSq, scratch, dists + s);
+    };
+#ifdef _OPENMP
+    if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
+      std::atomic<bool> cancelled{false};
+#pragma omp parallel num_threads(numThreads)
+      {
+        const size_t tid = static_cast<size_t>(omp_get_thread_num());
+        const size_t team = static_cast<size_t>(omp_get_num_threads());
+        const size_t first = n * tid / team;
+        const size_t last = n * (tid + 1) / team;
+        std::vector<size_t> rowBuf(GATHER_CHUNK_I8);
+        std::vector<int32_t> scratch(GATHER_CHUNK_I8);
+        for (size_t s = first; s < last; s += GATHER_CHUNK_I8) {
+          if (VEC_SEARCH_CHECK_CANCELLATION) {
+            if (cancelled.load(std::memory_order_relaxed)) break;
+            if (checkInterrupt) {
+              try {
+                checkInterrupt();
+              } catch (...) {
+                cancelled.store(true, std::memory_order_relaxed);
+                break;
+              }
+            }
+          }
+          gatherChunk(s, std::min(GATHER_CHUNK_I8, last - s), rowBuf.data(),
+                      scratch.data());
+        }
+      }
+      if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
+        checkInterrupt();
+      }
+      return;
+    }
+#endif
+    std::vector<size_t> rowBuf(GATHER_CHUNK_I8);
+    std::vector<int32_t> scratch(GATHER_CHUNK_I8);
+    size_t sinceCheck = 0;
+    for (size_t s = 0; s < n; s += GATHER_CHUNK_I8) {
+      if (checkInterrupt && ++sinceCheck == CHECK_INTERRUPT_PERIOD) {
+        sinceCheck = 0;
+        checkInterrupt();
+      }
+      gatherChunk(s, std::min(GATHER_CHUNK_I8, n - s), rowBuf.data(),
+                  scratch.data());
+    }
+    return;
+  }
   // Batched bf16 cosine, only when the scoring indices ARE store rows in order.
   // Query packed once (read-only, shared). Blocks of contiguous rows go through
   // the selected engine; `dists[s+j]` is the cosine distance of row `s + j`.
@@ -3051,9 +3529,20 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
   const bool perRowCosineBf16 = layer.batchedCosineBf16_;
   const float qInvCosine =
       perRowCosineBf16 ? LayerT::queryInvNormBf16(queryBytes, layer.dim_) : 0.f;
+  // The i8 per-row fallback (the `vec:i8Kernel "punned"` engine): the SAME
+  // hoist for the query's |q|^2 term, and the sidecar per-row helper --
+  // bit-identical to the VNNI block for the same pair.
+  const bool perRowI8 = layer.hasI8VnniKernel_;
+  const float qNormSqPerRow =
+      perRowI8
+          ? static_cast<float>(LayerT::queryNormSqI8(queryBytes, layer.dim_))
+          : 0.f;
   auto distAt = [&](size_t i) -> float {
     if (perRowCosineBf16) {
       return layer.cosineToRowBf16(queryBytes, rowOf(i), qInvCosine);
+    }
+    if (perRowI8) {
+      return layer.angularToRowI8(queryBytes, rowOf(i), qNormSqPerRow);
     }
     return layer.distanceToRow(queryBytes, rowOf(i));
   };
@@ -3846,7 +4335,8 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
                         std::optional<ql::span<const Id>> candidates,
                         const CheckInterruptCallback& checkInterrupt,
                         bool fullPrecision,
-                        Bf16Kernel bf16Kernel = Bf16Kernel::Auto) {
+                        Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
+                        I8Kernel i8Kernel = I8Kernel::Auto) {
   // For Threshold this is the tau, for Knee the floor (identical machinery);
   // unused by Softmax.
   const float threshold = cut.threshold_;
@@ -3934,10 +4424,12 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
     std::vector<float> dists(n);
     {
       SeqScanHint hint{layer, !layer.alignedBuf_};
-      // `directWhole` -> `rowAt` is identity -> the batched bf16 path (P2).
+      // `directWhole` -> `rowAt` is identity -> the batched bf16 path (P2)
+      // (or the blocked i8 path for a single-layer i8 index).
       cslsDistanceSweep(
           layer, queryBytes, n, [&](size_t i) { return rowAt(i); },
-          dists.data(), checkInterrupt, /*contiguous=*/directWhole, bf16Kernel);
+          dists.data(), checkInterrupt, /*contiguous=*/directWhole, bf16Kernel,
+          i8Kernel);
     }
     // 3. r(q): the mean cosine similarity of the query to its top-`neighbors`
     //    nearest SCORED candidates, the exact self-match excluded.
@@ -3993,12 +4485,22 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
   const size_t floorM = std::max<size_t>(impl.cslsRerankFloor_, 1);
   // The binary scan layer's coarse distance is an integer Hamming count in
   // [0, dim] -> a counting/histogram select (O(n), no heap, scales with
-  // threads AND k). Every other scan scalar's coarse distance is a quantized
-  // FLOAT (cosine/l2sq) -> the bounded-heap select.
+  // threads AND k). The i8 scan layer's quantized-cosine distances are
+  // floats, but with the VNNI fast path the blocked sweep materializes them
+  // all anyway -- then the O(n) FLOAT-histogram select
+  // (`selectSmallestPairsFloat`, bit-identical to the heap) replaces the
+  // bounded heap, whose ~k*ln(n/k) cache-spilling pushes + O(threads*k)
+  // merge cost ~8 ms extra at the default floorM=10^4 on a 2.14M-row sweep.
+  // Every other scan scalar keeps the bounded-heap select.
   const bool integerCoarse = impl.meta_.config_.scalar_ == VectorScalar::Binary;
-  // Materialized eagerly by the histogram path (it needs every distance for
-  // the collect pass and reuses it for any widening), lazily by the heap
-  // path's `ensureKeyed` on the first widen only.
+#if USEARCH_USE_NUMKONG
+  const bool i8Coarse = !integerCoarse && impl.scan_.resolveI8Vnni(i8Kernel);
+#else
+  constexpr bool i8Coarse = false;  // no fast path without NumKong
+#endif
+  // Materialized eagerly by the histogram paths (they need every distance for
+  // the select and reuse it for any widening), lazily by the heap path's
+  // `ensureKeyed` on the first widen only.
   std::unique_ptr<float[]> coarseDists;
   std::vector<std::pair<float, uint64_t>> sel;
   {
@@ -4008,6 +4510,19 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
       sel = coarseSweepSelectHistogram(
           impl.scan_, coarseQueryBytes, n, [&](size_t i) { return rowAt(i); },
           directWhole, coarseDists.get(), floorM, impl.dim(), checkInterrupt);
+    } else if (i8Coarse) {
+      coarseDists.reset(new float[n]);
+      cslsDistanceSweep(
+          impl.scan_, coarseQueryBytes, n, [&](size_t i) { return rowAt(i); },
+          coarseDists.get(), checkInterrupt, /*contiguous=*/directWhole,
+          Bf16Kernel::Auto, i8Kernel);
+      int selThreads = 1;
+#ifdef _OPENMP
+      if (n >= VEC_SEARCH_PARALLEL_THRESHOLD) {
+        selThreads = vectorSearchThreadCap();
+      }
+#endif
+      sel = selectSmallestPairsFloat(coarseDists.get(), n, floorM, selThreads);
     } else {
       // Pass null: the common no-widen path never needs the full
       // coarse-distance array, only the coarse-best batch (`sel`).
@@ -4036,7 +4551,8 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
       SeqScanHint hint{impl.scan_, !impl.scan_.alignedBuf_};
       cslsDistanceSweep(
           impl.scan_, coarseQueryBytes, n, [&](size_t i) { return rowAt(i); },
-          coarseDists.get(), checkInterrupt, /*contiguous=*/directWhole);
+          coarseDists.get(), checkInterrupt, /*contiguous=*/directWhole,
+          Bf16Kernel::Auto, i8Kernel);
     }
     keyed.resize(n);
 #ifdef _OPENMP
@@ -4281,7 +4797,7 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    bool fullPrecision, Bf16Kernel bf16Kernel) const {
+    bool fullPrecision, Bf16Kernel bf16Kernel, I8Kernel i8Kernel) const {
   auto& impl = *impl_;
   AD_CONTRACT_CHECK(impl.meta_.config_.csls_ || !cutNeedsCslsSidecar(cut),
                     "searchCsls called with a CSLS cut on an index without "
@@ -4301,9 +4817,9 @@ std::vector<CslsScoredEntity> VectorIndex::searchCsls(
   const char* coarseQueryBytes =
       impl.rerank_.has_value() ? impl.scan_.encodeQuery(query, coarseBuffer)
                                : queryBytes;
-  CslsReranked reranked = rerankCsls(impl, layer, queryBytes, coarseQueryBytes,
-                                     std::nullopt, cut, neighbors, candidates,
-                                     checkInterrupt, fullPrecision, bf16Kernel);
+  CslsReranked reranked = rerankCsls(
+      impl, layer, queryBytes, coarseQueryBytes, std::nullopt, cut, neighbors,
+      candidates, checkInterrupt, fullPrecision, bf16Kernel, i8Kernel);
   if (numScored != nullptr) {
     *numScored = reranked.scored_;
   }
@@ -4316,7 +4832,7 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
     std::optional<ql::span<const Id>> candidates,
     std::optional<float> maxDistance,
     const CheckInterruptCallback& checkInterrupt, size_t* numScored,
-    bool fullPrecision, Bf16Kernel bf16Kernel) const {
+    bool fullPrecision, Bf16Kernel bf16Kernel, I8Kernel i8Kernel) const {
   auto& impl = *impl_;
   AD_CONTRACT_CHECK(impl.meta_.config_.csls_ || !cutNeedsCslsSidecar(cut),
                     "searchCslsByEntity called with a CSLS cut on an index "
@@ -4332,10 +4848,10 @@ std::vector<CslsScoredEntity> VectorIndex::searchCslsByEntity(
     }
     return {};
   }
-  CslsReranked reranked = rerankCsls(
-      impl, layer, layer.rowPtr(row.value()), impl.scan_.rowPtr(row.value()),
-      row, cut, neighbors, candidates, checkInterrupt, fullPrecision,
-      bf16Kernel);
+  CslsReranked reranked = rerankCsls(impl, layer, layer.rowPtr(row.value()),
+                                     impl.scan_.rowPtr(row.value()), row, cut,
+                                     neighbors, candidates, checkInterrupt,
+                                     fullPrecision, bf16Kernel, i8Kernel);
   if (numScored != nullptr) {
     *numScored = reranked.scored_;
   }
@@ -4360,7 +4876,7 @@ CslsReranked VectorIndex::computeCslsReranked(
     float widenFraction, size_t rerankCap,
     std::optional<ql::span<const Id>> candidates,
     const CheckInterruptCallback& checkInterrupt, bool fullPrecision,
-    Bf16Kernel bf16Kernel) const {
+    Bf16Kernel bf16Kernel, I8Kernel i8Kernel) const {
   auto& impl = *impl_;
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
   auto& layer = impl.fine();
@@ -4378,7 +4894,7 @@ CslsReranked VectorIndex::computeCslsReranked(
   return rerankCsls(impl, layer, queryBytes, coarseQueryBytes, std::nullopt,
                     plateauRerankCut(floorFraction, widenFraction, rerankCap),
                     neighbors, candidates, checkInterrupt, fullPrecision,
-                    bf16Kernel);
+                    bf16Kernel, i8Kernel);
 }
 
 // ____________________________________________________________________________
@@ -4386,7 +4902,7 @@ CslsReranked VectorIndex::computeCslsRerankedByEntity(
     Id entity, size_t neighbors, float floorFraction, float widenFraction,
     size_t rerankCap, std::optional<ql::span<const Id>> candidates,
     const CheckInterruptCallback& checkInterrupt, bool fullPrecision,
-    Bf16Kernel bf16Kernel) const {
+    Bf16Kernel bf16Kernel, I8Kernel i8Kernel) const {
   auto& impl = *impl_;
   AD_CORRECTNESS_CHECK(impl.meta_.config_.metric_ == VectorMetric::Cosine);
   auto& layer = impl.fine();
@@ -4394,11 +4910,10 @@ CslsReranked VectorIndex::computeCslsRerankedByEntity(
   if (!row.has_value()) {
     return {};
   }
-  return rerankCsls(impl, layer, layer.rowPtr(row.value()),
-                    impl.scan_.rowPtr(row.value()), row,
-                    plateauRerankCut(floorFraction, widenFraction, rerankCap),
-                    neighbors, candidates, checkInterrupt, fullPrecision,
-                    bf16Kernel);
+  return rerankCsls(
+      impl, layer, layer.rowPtr(row.value()), impl.scan_.rowPtr(row.value()),
+      row, plateauRerankCut(floorFraction, widenFraction, rerankCap), neighbors,
+      candidates, checkInterrupt, fullPrecision, bf16Kernel, i8Kernel);
 }
 
 // ____________________________________________________________________________

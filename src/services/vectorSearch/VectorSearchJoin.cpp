@@ -267,7 +267,8 @@ std::string VectorSearchJoin::getCacheKeyImpl() const {
   // See VectorSearch::getCacheKeyImpl: fullPrecision changes the result and
   // bf16Kernel must isolate an A/B run from cross-variant cache hits.
   absl::StrAppend(&key, " fullPrecision=", config_.fullPrecision_,
-                  " bf16Kernel=", static_cast<int>(config_.bf16Kernel_));
+                  " bf16Kernel=", static_cast<int>(config_.bf16Kernel_),
+                  " i8Kernel=", static_cast<int>(config_.i8Kernel_));
   if (config_.rerankK_.has_value()) {
     absl::StrAppend(&key, " rerankK=", config_.rerankK_.value());
   }
@@ -533,14 +534,12 @@ void VectorSearchJoin::computePreFilterRows(
     // O(numVectors) `.rowmap` merge-join to recover them from the entity ids.
     auto coarse =
         queryEntity.has_value()
-            ? vidx.searchExactCoarseByEntityWithRows(queryEntity.value(),
-                                                     rerankK, candidates,
-                                                     std::nullopt,
-                                                     checkInterrupt,
-                                                     &coarseScored, keepAll)
-            : vidx.searchExactCoarseWithRows(query, rerankK, candidates,
-                                             std::nullopt, checkInterrupt,
-                                             &coarseScored, keepAll);
+            ? vidx.searchExactCoarseByEntityWithRows(
+                  queryEntity.value(), rerankK, candidates, std::nullopt,
+                  checkInterrupt, &coarseScored, keepAll, config_.i8Kernel_)
+            : vidx.searchExactCoarseWithRows(
+                  query, rerankK, candidates, std::nullopt, checkInterrupt,
+                  &coarseScored, keepAll, config_.i8Kernel_);
     // `coarseScored` = candidates that HAVE a vector (were actually scored),
     // not the raw candidate count -- the merge-join skips the vectorless ones.
     qlever::vector::logVectorSearchPhase(
@@ -568,14 +567,15 @@ void VectorSearchJoin::computePreFilterRows(
   } else {
     ad_utility::Timer scanTimer{ad_utility::Timer::Started};
     size_t numScored = 0;
-    scored = queryEntity.has_value()
-                 ? vidx.searchExactByEntity(queryEntity.value(), effectiveK,
-                                            candidates, config_.maxDistance_,
-                                            checkInterrupt, &numScored,
-                                            config_.bf16Kernel_, keepAll)
-                 : vidx.searchExact(query, effectiveK, candidates,
-                                    config_.maxDistance_, checkInterrupt,
-                                    &numScored, config_.bf16Kernel_, keepAll);
+    scored =
+        queryEntity.has_value()
+            ? vidx.searchExactByEntity(
+                  queryEntity.value(), effectiveK, candidates,
+                  config_.maxDistance_, checkInterrupt, &numScored,
+                  config_.bf16Kernel_, keepAll, config_.i8Kernel_)
+            : vidx.searchExact(query, effectiveK, candidates,
+                               config_.maxDistance_, checkInterrupt, &numScored,
+                               config_.bf16Kernel_, keepAll, config_.i8Kernel_);
     // Members actually scored, not the raw candidate count (see above).
     // When the index HAS a rerank layer but we reached this branch, it is
     // because `vec:fullPrecision` forced the coarse layer to be skipped.

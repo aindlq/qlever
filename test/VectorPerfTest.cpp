@@ -45,6 +45,7 @@
 #include "global/IndexTypes.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexBuilder.h"
+#include "util/HashSet.h"
 
 using namespace qlever::vector;
 
@@ -128,9 +129,12 @@ struct BenchSetup {
   size_t fineRowBytes() const { return dim * 2; }
 };
 
-// Build (or reuse a cached) synthetic two-layer index: binary scan layer +
-// bf16 rerank layer, cosine, no HNSW, no csls.
-BenchSetup setupIndex() {
+// Build (or reuse a cached) synthetic two-layer index: `scanScalar` scan
+// layer + bf16 rerank layer, cosine, no HNSW, no csls. `subdir` (may be
+// empty) isolates the on-disk cache of each scan-scalar variant; every
+// variant is built from the IDENTICAL per-row seeds, so their fine (bf16)
+// layers -- and hence the exact ground truth -- coincide.
+BenchSetup setupIndexWithScalar(VectorScalar scanScalar, const char* subdir) {
   BenchSetup s;
   s.n = envSize("VECTOR_PERF_N", 2140516);
   s.dim = envSize("VECTOR_PERF_DIM", 1152);
@@ -139,6 +143,9 @@ BenchSetup setupIndex() {
       "VECTOR_PERF_DIR",
       (std::filesystem::temp_directory_path() / "qlever-vecperf-cache")
           .string());
+  if (subdir[0] != '\0') {
+    s.dir += std::string{"/"} + subdir;
+  }
   std::filesystem::create_directories(s.dir);
   s.basename = s.dir + "/idx";
 
@@ -154,14 +161,14 @@ BenchSetup setupIndex() {
     return s;
   }
 
-  printf("[setup] building synthetic index: n=%zu dim=%zu (binary + bf16)\n",
-         s.n, s.dim);
+  printf("[setup] building synthetic index: n=%zu dim=%zu (%s + bf16)\n", s.n,
+         s.dim, toString(scanScalar).c_str());
   fflush(stdout);
   VectorIndexConfig cfg;
   cfg.name_ = "perf";
   cfg.dimensions_ = static_cast<uint32_t>(s.dim);
   cfg.metric_ = VectorMetric::Cosine;
-  cfg.scalar_ = VectorScalar::Binary;
+  cfg.scalar_ = scanScalar;
   cfg.rerankScalar_ = VectorScalar::Bf16;
   cfg.buildHnsw_ = false;
   auto buildStart = std::chrono::steady_clock::now();
@@ -186,6 +193,11 @@ BenchSetup setupIndex() {
          toMs(std::chrono::steady_clock::now() - buildStart) / 1000.0);
   fflush(stdout);
   return s;
+}
+
+// The historical default setup: the binary + bf16 index in the cache root.
+BenchSetup setupIndex() {
+  return setupIndexWithScalar(VectorScalar::Binary, "");
 }
 
 // Force the OpenMP max-thread ICV (the scan reads it via
@@ -817,4 +829,203 @@ TEST(VectorPerf, DISABLED_autoCutModeSwitchBenchmark) {
         "(reranked=%zu, keep precise=%zu broad=%zu, cap=%zu)\n",
         t, aMn, reranked.rerankDepth(), keptPrecise, keptBroad, cap);
   }
+}
+
+// ___________________________________________________________________________
+// i8 coarse-layer benchmark: the whole-index i8 (quantized-cosine) sweep +
+// select, A/B over the `vec:i8Kernel` dial (Auto = multi-row VNNI block +
+// O(n) float-histogram select at k >= 512; Punned = the per-row engine) and
+// vs the pre-change baseline (QLEVER_VECTOR_SEARCH_I8=off -> usearch's
+// punned metric + bounded heap). Builds (or reuses) an i8+bf16 twin of the
+// binary+bf16 index, in the `i8/` cache subdirectory.
+//   VECTOR_PERF_THREADS   thread count (default: all physical cores)
+//   VECTOR_PERF_RESIDENCY none (default) | aligned
+TEST(VectorPerf, DISABLED_i8ScanBenchmark) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  BenchSetup s = setupIndexWithScalar(VectorScalar::I8, "i8");
+  const bool aligned = envStr("VECTOR_PERF_RESIDENCY", "none") == "aligned";
+  const int threads = static_cast<int>(
+      envSize("VECTOR_PERF_THREADS", static_cast<size_t>(maxHwThreads())));
+  auto residency = aligned ? VectorIndex::Residency::AlignedCopy
+                           : VectorIndex::Residency::None;
+
+  unsetenv("QLEVER_VECTOR_SEARCH_I8");
+  VectorIndex idx;
+  idx.open(s.basename, "perf", residency, residency);
+  setenv("QLEVER_VECTOR_SEARCH_I8", "off", 1);
+  VectorIndex idxOff;  // the pre-change punned baseline
+  idxOff.open(s.basename, "perf", residency, residency);
+  unsetenv("QLEVER_VECTOR_SEARCH_I8");
+
+  setThreads(threads);
+  (void)idx.searchExactCoarse(s.query, 500);  // warm (faults everything in)
+  (void)idxOff.searchExactCoarse(s.query, 500);
+
+  const size_t coarseRowBytes = s.dim;  // 1 byte per i8 component
+  printf(
+      "\n=== VectorPerf i8 coarse: n=%zu dim=%zu threads=%d residency=%s "
+      "===\n",
+      s.n, s.dim, threads, aligned ? "aligned" : "none");
+
+  // Agreement first: the fast path vs the punned baseline (top-100).
+  {
+    auto fast = idx.searchExactCoarse(s.query, 100);
+    auto base = idxOff.searchExactCoarse(s.query, 100);
+    ASSERT_EQ(fast.size(), base.size());
+    size_t sameId = 0;
+    float maxDiff = 0.f;
+    for (size_t i = 0; i < fast.size(); ++i) {
+      sameId += fast[i].entity_ == base[i].entity_;
+      maxDiff =
+          std::max(maxDiff, std::abs(fast[i].distance_ - base[i].distance_));
+      ASSERT_NEAR(fast[i].distance_, base[i].distance_, 1e-6f) << i;
+    }
+    printf(
+        "[agreement] top-100 vs punned baseline: %zu/%zu same entity, "
+        "max |d-diff| %.2e\n",
+        sameId, fast.size(), maxDiff);
+  }
+
+  struct Cfg {
+    const char* label;
+    VectorIndex* idx;
+    qlever::vector::I8Kernel kern;
+  };
+  const Cfg cfgs[] = {
+      {"auto (vnni block)", &idx, qlever::vector::I8Kernel::Auto},
+      {"punned dial (per-row, unified)", &idx,
+       qlever::vector::I8Kernel::Punned},
+      {"baseline OFF (usearch punned+heap)", &idxOff,
+       qlever::vector::I8Kernel::Auto},
+  };
+  for (size_t k : {size_t{100}, size_t{500}, size_t{10000}}) {
+    printf("\n--- whole-index i8 coarse top-k, k=%zu ---\n", k);
+    for (const Cfg& c : cfgs) {
+      (void)c.idx->searchExactCoarse(s.query, k, std::nullopt, std::nullopt, {},
+                                     nullptr, c.kern);
+      auto [mn, md] = timeReps(s.reps, [&] {
+        (void)c.idx->searchExactCoarse(s.query, k, std::nullopt, std::nullopt,
+                                       {}, nullptr, c.kern);
+      });
+      char label[80];
+      snprintf(label, sizeof label, "coarse k=%-6zu %-34s", k, c.label);
+      report(label, s.n, coarseRowBytes, mn, md);
+    }
+  }
+
+  // The production two-layer shape: coarse top-rerankK + fine rerank to k.
+  printf(
+      "\n--- coarse+rerank end to end (k=10, rerankK=100 / k=1000, "
+      "rerankK=10000) ---\n");
+  for (auto [k, rerankK] :
+       {std::pair<size_t, size_t>{10, 100}, {1000, 10000}}) {
+    for (const Cfg& c : cfgs) {
+      auto run = [&] {
+        auto rows = c.idx->searchExactCoarseWithRows(
+            s.query, rerankK, std::nullopt, std::nullopt, {}, nullptr, false,
+            c.kern);
+        (void)c.idx->searchExactByRows(
+            s.query, k, ql::span<const qlever::vector::ScoredRow>{rows});
+      };
+      run();
+      auto [mn, md] = timeReps(s.reps, run);
+      char label[80];
+      snprintf(label, sizeof label, "e2e k=%zu rK=%-6zu %-30s", k, rerankK,
+               c.label);
+      report(label, s.n, coarseRowBytes, mn, md);
+    }
+  }
+}
+
+// ___________________________________________________________________________
+// i8-vs-binary coarse-layer characterization: RECALL of the coarse
+// top-`rerankK` against the exact fine top-k (the rerank re-scores exactly,
+// so recall@k == |top-k(exact) ^ top-rerankK(coarse)| / k), plus the coarse
+// sweep cost of each layer -- the data for choosing i8+rerank (better
+// pre-ranking, 8x the coarse bytes) vs binary+rerank (cheap coarse, needs a
+// much larger rerankK). Builds/reuses BOTH synthetic indexes (identical
+// input vectors, so the exact ground truth coincides).
+//   VECTOR_PERF_QUERIES  number of random queries averaged (default 8)
+TEST(VectorPerf, DISABLED_i8RecallVsBinary) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  BenchSetup sBin = setupIndex();
+  BenchSetup sI8 = setupIndexWithScalar(VectorScalar::I8, "i8");
+  const int threads = static_cast<int>(
+      envSize("VECTOR_PERF_THREADS", static_cast<size_t>(maxHwThreads())));
+  const size_t numQueries = envSize("VECTOR_PERF_QUERIES", 8);
+
+  VectorIndex bin, i8;
+  bin.open(sBin.basename, "perf");
+  i8.open(sI8.basename, "perf");
+  setThreads(threads);
+  (void)bin.searchExactCoarse(sBin.query, 100);  // warm
+  (void)i8.searchExactCoarse(sI8.query, 100);
+  (void)i8.searchExact(sI8.query, 10);  // warm the shared-content fine layer
+
+  std::vector<std::vector<float>> queries(numQueries,
+                                          std::vector<float>(sI8.dim));
+  for (size_t q = 0; q < numQueries; ++q) {
+    SplitMix64 rng{0xfeed0000ULL + q};
+    rng.fill(queries[q]);
+  }
+
+  const size_t kMax = 100;
+  const std::vector<size_t> rerankKs{100,  200,  500,   1000,
+                                     2000, 5000, 10000, 20000};
+  printf(
+      "\n=== i8 vs binary coarse recall: n=%zu dim=%zu threads=%d "
+      "queries=%zu ===\n",
+      sI8.n, sI8.dim, threads, numQueries);
+
+  // Exact fine ground truth per query (both indexes share the fine content;
+  // use the i8 index's fine layer).
+  std::vector<std::vector<Id>> truth(numQueries);
+  for (size_t q = 0; q < numQueries; ++q) {
+    auto exact = i8.searchExact(queries[q], kMax);
+    truth[q].reserve(exact.size());
+    for (const auto& e : exact) {
+      truth[q].push_back(e.entity_);
+    }
+  }
+
+  auto recallOf = [&](const std::vector<ScoredEntity>& coarse,
+                      const std::vector<Id>& exact, size_t k) {
+    ad_utility::HashSet<Id> got;
+    for (const auto& e : coarse) {
+      got.insert(e.entity_);
+    }
+    size_t hit = 0;
+    for (size_t i = 0; i < std::min(k, exact.size()); ++i) {
+      hit += got.contains(exact[i]);
+    }
+    return static_cast<double>(hit) / static_cast<double>(k);
+  };
+
+  printf("%8s | %-28s | %-28s\n", "", "i8 coarse", "binary coarse");
+  printf("%8s | %9s %8s %8s | %9s %8s %8s\n", "rerankK", "recall@10", "rec@100",
+         "ms", "recall@10", "rec@100", "ms");
+  for (size_t rerankK : rerankKs) {
+    double r10i = 0, r100i = 0, r10b = 0, r100b = 0;
+    double msI = 0, msB = 0;
+    for (size_t q = 0; q < numQueries; ++q) {
+      auto t0 = std::chrono::steady_clock::now();
+      auto ci = i8.searchExactCoarse(queries[q], rerankK);
+      msI += toMs(std::chrono::steady_clock::now() - t0);
+      t0 = std::chrono::steady_clock::now();
+      auto cb = bin.searchExactCoarse(queries[q], rerankK);
+      msB += toMs(std::chrono::steady_clock::now() - t0);
+      r10i += recallOf(ci, truth[q], 10);
+      r100i += recallOf(ci, truth[q], 100);
+      r10b += recallOf(cb, truth[q], 10);
+      r100b += recallOf(cb, truth[q], 100);
+    }
+    const double nq = static_cast<double>(numQueries);
+    printf("%8zu | %9.4f %8.4f %8.2f | %9.4f %8.4f %8.2f\n", rerankK, r10i / nq,
+           r100i / nq, msI / nq, r10b / nq, r100b / nq, msB / nq);
+    fflush(stdout);
+  }
+  printf(
+      "\n(read: i8 needs the rerankK where its recall matches binary's at "
+      "binary's default rerankK=10000; the ms columns are the coarse cost "
+      "per query at these thread counts)\n");
 }

@@ -442,6 +442,12 @@ class VectorIndex {
   // `bf16Kernel` (the `vec:bf16Kernel` performance dial) selects the exact
   // bf16-cosine kernel of the FINE layer -- a no-op on any other layer and
   // always result-identical to ~1e-6 across kernels.
+  // `i8Kernel` (the `vec:i8Kernel` dial) is the i8-cosine sibling for the
+  // layer being searched (the COARSE scan layer of a two-layer index, or the
+  // single i8 layer): `Auto`/`Vnni` = the multi-row VNNI block engine,
+  // `Punned` = the per-row engine. On a VNNI CPU both engines compute the
+  // identical distances (one shared integer-dot + finalize), so the dial is
+  // a pure performance A/B; without VNNI it is a no-op (punned metric).
   // `keepAll` (the SERVICE's FORM P annotate form, which must score and
   // return EVERY bound candidate): clamp `k` only to the live/candidate
   // bound, NOT to the hard `MAX_SEARCH_RESULTS` cap -- the result size is
@@ -454,7 +460,7 @@ class VectorIndex {
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
       size_t* numScored = nullptr, Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
-      bool keepAll = false) const;
+      bool keepAll = false, I8Kernel i8Kernel = I8Kernel::Auto) const;
 
   // The fine pass of the two-layer rerank over a set of survivors whose store
   // ROWS are already known (from `searchExactCoarseWithRows`): score exactly
@@ -480,7 +486,7 @@ class VectorIndex {
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr) const;
+      size_t* numScored = nullptr, I8Kernel i8Kernel = I8Kernel::Auto) const;
 
   // Exactly `searchExactCoarse`, but each survivor ALSO carries its store row
   // (`ScoredRow`). This is the coarse half of the two-layer rerank: the
@@ -492,7 +498,8 @@ class VectorIndex {
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr, bool keepAll = false) const;
+      size_t* numScored = nullptr, bool keepAll = false,
+      I8Kernel i8Kernel = I8Kernel::Auto) const;
 
   // Approximate top-`k` via the HNSW graph over the whole index. Requires
   // `hasHnsw()`. Results are ascending by distance. `k` is clamped to the
@@ -515,13 +522,13 @@ class VectorIndex {
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
       size_t* numScored = nullptr, Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
-      bool keepAll = false) const;
+      bool keepAll = false, I8Kernel i8Kernel = I8Kernel::Auto) const;
   std::vector<ScoredEntity> searchExactCoarseByEntity(
       Id entity, size_t k,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr) const;
+      size_t* numScored = nullptr, I8Kernel i8Kernel = I8Kernel::Auto) const;
 
   // The by-entity coarse-with-rows / rerank-by-rows pair, mirroring
   // `searchExactCoarseWithRows` / `searchExactByRows` for a STORED entity as
@@ -531,7 +538,8 @@ class VectorIndex {
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      size_t* numScored = nullptr, bool keepAll = false) const;
+      size_t* numScored = nullptr, bool keepAll = false,
+      I8Kernel i8Kernel = I8Kernel::Auto) const;
   std::vector<ScoredEntity> searchExactByRowsByEntity(
       Id entity, size_t k, ql::span<const ScoredRow> rows,
       std::optional<float> maxDistance = std::nullopt,
@@ -586,7 +594,8 @@ class VectorIndex {
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
       size_t* numScored = nullptr, bool fullPrecision = false,
-      Bf16Kernel bf16Kernel = Bf16Kernel::Auto) const;
+      Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
+      I8Kernel i8Kernel = I8Kernel::Auto) const;
 
   // The same with a STORED entity's vector as the query point (its stored
   // bytes of the layer being swept are used directly -- the fine row for the
@@ -599,7 +608,8 @@ class VectorIndex {
       std::optional<float> maxDistance = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
       size_t* numScored = nullptr, bool fullPrecision = false,
-      Bf16Kernel bf16Kernel = Bf16Kernel::Auto) const;
+      Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
+      I8Kernel i8Kernel = I8Kernel::Auto) const;
 
   // Stage (a) of the coverage-mode `vec:autoCut` (the `cosine`/`csls`/`softmax`
   // signals): rerank the candidates to the TOP-ANCHORED depth -- widen in
@@ -616,8 +626,8 @@ class VectorIndex {
       float widenFraction, size_t rerankCap,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      bool fullPrecision = false,
-      Bf16Kernel bf16Kernel = Bf16Kernel::Auto) const;
+      bool fullPrecision = false, Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
+      I8Kernel i8Kernel = I8Kernel::Auto) const;
 
   // The same with a STORED entity's vector as the query point.
   CslsReranked computeCslsRerankedByEntity(
@@ -625,8 +635,8 @@ class VectorIndex {
       size_t rerankCap,
       std::optional<ql::span<const Id>> candidates = std::nullopt,
       const CheckInterruptCallback& checkInterrupt = {},
-      bool fullPrecision = false,
-      Bf16Kernel bf16Kernel = Bf16Kernel::Auto) const;
+      bool fullPrecision = false, Bf16Kernel bf16Kernel = Bf16Kernel::Auto,
+      I8Kernel i8Kernel = I8Kernel::Auto) const;
 
   // Stage (b): apply a coverage-mode `cut` (ZCut over the cosine/CSLS signal,
   // or Softmax) to an already-`computeCslsReranked` set. O(reranked), no
