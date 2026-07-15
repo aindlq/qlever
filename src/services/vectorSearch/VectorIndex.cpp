@@ -1214,6 +1214,14 @@ void makeLayerResident(LayerT& layer, VectorIndex::Residency residency,
       // `base()` + `stride_`).
       layer.alignedBuf_ = std::move(owned);
       layer.stride_ = rowBytes;
+      // The file mmap is now redundant: every read goes through `base()` ->
+      // `alignedBuf_`, and `SeqScanHint` is inert once aligned (its `active_`
+      // is `!alignedBuf_`). Release it so the process does NOT keep the matrix
+      // resident TWICE (the file pages AND the aligned copy) -- halving this
+      // layer's RSS. Doing it HERE, before the next layer's aligned copy +
+      // MADV_COLLAPSE, also frees physical pages that reduce the fragmentation
+      // which was starving THP for late-allocated layers in the first place.
+      layer.data_.close();
       break;
     }
   }
