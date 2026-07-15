@@ -1185,6 +1185,31 @@ void makeLayerResident(LayerT& layer, VectorIndex::Residency residency,
           std::memcpy(owned.get() + i * rowBytes, layer.rowPtr(i), rowBytes);
         }
       }
+#if defined(__linux__)
+      // MADV_HUGEPAGE above only ADVISES; under memory fragmentation (a layer
+      // allocated late into a large server process holding several other
+      // resident matrices) the fault-time allocator silently falls back to
+      // 4 KiB pages, leaving AnonHugePages=0 and the memory-bandwidth-bound
+      // sweep TLB-bound -- measured ~2.4x slower (36 vs 15 ms) than the same
+      // sweep on a hugepage-backed buffer in a lean process. MADV_COLLAPSE
+      // (Linux 6.1+) SYNCHRONOUSLY collapses the now-faulted region into
+      // transparent hugepages, defragmenting as needed -- a one-time cost at
+      // open for a DETERMINISTIC THP backing regardless of process state.
+      // Best-effort: ignore failure (older kernel returns EINVAL; genuine
+      // OOM returns ENOMEM) -- the MADV_HUGEPAGE hint above still applies.
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25  // stable UAPI value; may be absent from old headers
+#endif
+      if (madvise(owned.get(), n * rowBytes, MADV_COLLAPSE) != 0) {
+        AD_LOG_DEBUG << "Vector index \"" << indexName << "\": MADV_COLLAPSE on "
+                     << "the aligned " << layerLabel
+                     << " copy failed (errno " << errno
+                     << "); relying on MADV_HUGEPAGE. A slow whole-index sweep "
+                        "with AnonHugePages=0 indicates the layer is on 4 KiB "
+                        "pages -- reserve hugepages or set THP defrag=always."
+                     << std::endl;
+      }
+#endif
       // Repoint the read path at the aligned copy (rowPtr()/graphMetric() read
       // `base()` + `stride_`).
       layer.alignedBuf_ = std::move(owned);
