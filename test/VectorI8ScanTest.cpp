@@ -335,6 +335,42 @@ TEST(VectorI8Scan, histogramAndHeapRoutesAgree) {
   }
 }
 
+// ROUTING regression: the whole-index scan log line must NAME the route the
+// top-k takes, and the i8 histogram gate (`k >= I8_HISTOGRAM_MIN_K = 512` on
+// a tombstone-free VNNI store) must fire for a large k -- the production
+// two-layer rerankK shape. Without the route in the log, a silent fall-back
+// to a per-row engine (~2.4x slower at the same VNNI capability) is
+// indistinguishable from the fast path in production logs.
+TEST(VectorI8Scan, wholeIndexScanLogNamesTheRouteTaken) {
+  if (!i8kernels::vnniAvailable()) {
+    GTEST_SKIP() << "no AVX-512-VNNI on this CPU";
+  }
+  auto& f = fixture();
+  // k >= 512: the O(n) float-histogram select.
+  testing::internal::CaptureStdout();
+  (void)f.on.searchExactCoarse(f.query, 600);
+  std::string log = testing::internal::GetCapturedStdout();
+  EXPECT_NE(log.find("i8 block sweep + histogram select"), std::string::npos)
+      << log;
+  // k < 512: the blocked VNNI sweep + bounded heap.
+  testing::internal::CaptureStdout();
+  (void)f.on.searchExactCoarse(f.query, 100);
+  log = testing::internal::GetCapturedStdout();
+  EXPECT_NE(log.find("i8 block sweep + heap"), std::string::npos) << log;
+  // The `Punned` dial keeps the per-row sidecar engine (still exact).
+  testing::internal::CaptureStdout();
+  (void)f.on.searchExactCoarse(f.query, 600, std::nullopt, std::nullopt, {},
+                               nullptr, I8Kernel::Punned);
+  log = testing::internal::GetCapturedStdout();
+  EXPECT_NE(log.find("i8 per-row sweep + heap"), std::string::npos) << log;
+  // The disabled fast path (QLEVER_VECTOR_SEARCH_I8=off at open) has no i8
+  // kernel at all -> the usearch punned metric.
+  testing::internal::CaptureStdout();
+  (void)f.off.searchExactCoarse(f.query, 600);
+  log = testing::internal::GetCapturedStdout();
+  EXPECT_NE(log.find("punned per-row sweep + heap"), std::string::npos) << log;
+}
+
 // The `vec:i8Kernel` dial is a pure performance A/B on a VNNI CPU: `Punned`
 // (per-row engine) and `Auto` (block engine) return BIT-IDENTICAL results
 // (both compute the one shared integer-dot + finalize).

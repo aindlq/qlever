@@ -938,6 +938,119 @@ TEST(VectorPerf, DISABLED_i8ScanBenchmark) {
 }
 
 // ___________________________________________________________________________
+// The id-based two-layer top-k (the PRE-FIX `computeWholeIndexSearch` shape:
+// a coarse `searchExactCoarse` whose survivors are fed back as candidate IDS
+// into `searchExact`, kept here as the slow-path A/B reference) vs the
+// rows-based shape (`searchExactCoarseWithRows` + `searchExactByRows`, which
+// passes the survivors' store ROWS -- what both the join path and, since the
+// fix, the plain whole-index path run). Times the coarse and the rerank
+// phase separately -- exactly the two phases the server's "brute-force scan
+// (coarse layer)" and "rerank (fine layer)" log lines cover -- and asserts
+// the two shapes return the same top-k. Measured (2.14M x 1152, 12 threads,
+// aligned residency, k=1000, rerankK=10^4): rerank 5.8 ms (ids; 4.7 ms of it
+// the O(numVectors) `.rowmap` merge-join) -> 0.9 ms (rows), coarse equal.
+// Knobs: VECTOR_PERF_K (default 1000), VECTOR_PERF_RERANK_K (default 10000),
+// VECTOR_PERF_THREADS, VECTOR_PERF_RESIDENCY.
+TEST(VectorPerf, DISABLED_i8PlainPathBenchmark) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  BenchSetup s = setupIndexWithScalar(VectorScalar::I8, "i8");
+  const bool aligned = envStr("VECTOR_PERF_RESIDENCY", "none") == "aligned";
+  const int threads = static_cast<int>(
+      envSize("VECTOR_PERF_THREADS", static_cast<size_t>(maxHwThreads())));
+  auto residency = aligned ? VectorIndex::Residency::AlignedCopy
+                           : VectorIndex::Residency::None;
+  VectorIndex idx;
+  idx.open(s.basename, "perf", residency, residency);
+  setThreads(threads);
+  (void)idx.searchExactCoarse(s.query, 500);  // warm the coarse (i8) layer
+  (void)idx.searchExact(s.query, 10);         // warm the fine (bf16) layer
+
+  const size_t k = envSize("VECTOR_PERF_K", 1000);
+  const size_t rerankK = envSize("VECTOR_PERF_RERANK_K", 10000);
+  printf(
+      "\n=== VectorPerf i8 plain-vs-join path: n=%zu dim=%zu threads=%d "
+      "residency=%s k=%zu rerankK=%zu reps=%zu ===\n",
+      s.n, s.dim, threads, aligned ? "aligned" : "none", k, rerankK, s.reps);
+
+  using qlever::vector::Bf16Kernel;
+  using qlever::vector::I8Kernel;
+
+  // Shape A -- the id-based two-layer path (coarse ids -> candidate rerank),
+  // byte-for-byte the calls the PRE-FIX `computeWholeIndexSearch` made.
+  std::vector<ScoredEntity> plainRes;
+  auto runPlain = [&](double* coarseMs, double* rerankMs) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto coarse =
+        idx.searchExactCoarse(s.query, rerankK, std::nullopt, std::nullopt, {},
+                              nullptr, I8Kernel::Auto);
+    const auto t1 = std::chrono::steady_clock::now();
+    std::vector<Id> candidates;
+    candidates.reserve(coarse.size());
+    for (const auto& hit : coarse) {
+      candidates.push_back(hit.entity_);
+    }
+    plainRes = idx.searchExact(
+        s.query, k, std::optional<ql::span<const Id>>{candidates},
+        std::nullopt, {}, nullptr, Bf16Kernel::Auto, false, I8Kernel::Auto);
+    const auto t2 = std::chrono::steady_clock::now();
+    *coarseMs = toMs(t1 - t0);
+    *rerankMs = toMs(t2 - t1);
+  };
+
+  // Shape B -- the JOIN-shaped fast path (`VectorSearchJoin`): the coarse
+  // pass captures the survivors' store rows, the rerank scores exactly them.
+  std::vector<ScoredEntity> joinRes;
+  auto runJoin = [&](double* coarseMs, double* rerankMs) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto rows = idx.searchExactCoarseWithRows(s.query, rerankK, std::nullopt,
+                                              std::nullopt, {}, nullptr, false,
+                                              I8Kernel::Auto);
+    const auto t1 = std::chrono::steady_clock::now();
+    joinRes = idx.searchExactByRows(
+        s.query, k, ql::span<const qlever::vector::ScoredRow>{rows},
+        std::nullopt, {}, Bf16Kernel::Auto, false);
+    const auto t2 = std::chrono::steady_clock::now();
+    *coarseMs = toMs(t1 - t0);
+    *rerankMs = toMs(t2 - t1);
+  };
+
+  auto benchShape = [&](const char* name, auto& run) {
+    std::vector<double> coarse, rerank, total;
+    double c = 0, r = 0;
+    run(&c, &r);  // warm
+    for (size_t rep = 0; rep < s.reps; ++rep) {
+      run(&c, &r);
+      coarse.push_back(c);
+      rerank.push_back(r);
+      total.push_back(c + r);
+    }
+    std::sort(coarse.begin(), coarse.end());
+    std::sort(rerank.begin(), rerank.end());
+    std::sort(total.begin(), total.end());
+    printf(
+        "%-28s coarse min %8.2f ms med %8.2f | rerank min %8.2f ms med "
+        "%8.2f | total min %8.2f ms\n",
+        name, coarse.front(), coarse[coarse.size() / 2], rerank.front(),
+        rerank[rerank.size() / 2], total.front());
+    fflush(stdout);
+  };
+
+  benchShape("PLAIN (ids -> searchExact)", runPlain);
+  benchShape("JOIN  (rows -> ByRows)", runJoin);
+
+  // The two shapes must agree: same k results, same distances rank by rank
+  // (equal-distance ties may order differently; count entity agreement).
+  ASSERT_EQ(plainRes.size(), joinRes.size());
+  size_t sameId = 0;
+  for (size_t i = 0; i < plainRes.size(); ++i) {
+    ASSERT_EQ(plainRes[i].distance_, joinRes[i].distance_) << i;
+    sameId += plainRes[i].entity_ == joinRes[i].entity_;
+  }
+  printf("[agreement] plain vs join top-%zu: %zu/%zu same entity\n", k, sameId,
+         plainRes.size());
+}
+
+// ___________________________________________________________________________
 // i8-vs-binary coarse-layer characterization: RECALL of the coarse
 // top-`rerankK` against the exact fine top-k (the rerank re-scores exactly,
 // so recall@k == |top-k(exact) ^ top-rerankK(coarse)| / k), plus the coarse

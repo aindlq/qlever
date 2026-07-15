@@ -2427,6 +2427,31 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
                        I8Kernel i8Kernel = I8Kernel::Auto);
 }  // namespace
 
+// The human-readable name of the engine `scanWholeIndexIntoTopK` will pick
+// for this layer + kernel request -- for the whole-index scan log line, so
+// production logs distinguish the block-kernel routes from the per-row
+// fallbacks (they differ by >2x in scan speed but were otherwise
+// indistinguishable in the logs). MUST mirror the dispatch order in
+// `scanWholeIndexIntoTopK`.
+template <typename LayerT>
+const char* wholeIndexHeapRouteName([[maybe_unused]] const LayerT& layer,
+                                    [[maybe_unused]] Bf16Kernel bf16Kernel,
+                                    [[maybe_unused]] I8Kernel i8Kernel) {
+#if USEARCH_USE_NUMKONG
+  using BK = typename std::remove_reference_t<LayerT>::BlockKernel;
+  if (layer.resolveBlockKernel(bf16Kernel) != BK::PerRow) {
+    return "bf16 block sweep + heap";
+  }
+  if (layer.resolveI8Vnni(i8Kernel)) {
+    return "i8 block sweep + heap";
+  }
+  if (layer.hasI8VnniKernel_) {
+    return "i8 per-row sweep + heap";
+  }
+#endif
+  return "punned per-row sweep + heap";
+}
+
 // Minimum `k` for which the i8 whole-index top-k routes through the O(n)
 // float-histogram select (`selectSmallestPairsFloat`) instead of the blocked
 // sweep + bounded `TopK` heap. Measured crossover on a 2.14M x 1152 i8 sweep
@@ -2476,15 +2501,25 @@ std::vector<ScoredEntity> searchExactBytes(
   // Fill `outRows` (if requested) from the entities of a heap-sweep result
   // that did not carry rows itself (the non-integer coarse metric): one
   // `rowOf` lookup PER SURVIVOR (k of them, O(k log numVectors)) -- NOT the
-  // O(numVectors) whole-`.rowmap` merge-join the caller is avoiding.
+  // O(numVectors) whole-`.rowmap` merge-join the caller is avoiding. The
+  // lookups are independent binary searches, so they parallelize above the
+  // usual threshold (deterministic: `rows[i]` depends only on `out[i]`) --
+  // at the production rerankK=10^4 the serial loop was a measured ~4 ms.
   auto emitRowsFromEntities = [&](const std::vector<ScoredEntity>& out) {
     if (outRows == nullptr) {
       return;
     }
-    std::vector<uint64_t> rows;
-    rows.reserve(out.size());
-    for (const ScoredEntity& e : out) {
-      rows.push_back(static_cast<uint64_t>(impl.rowOf(e.entity_).value_or(0)));
+    std::vector<uint64_t> rows(out.size());
+#ifdef _OPENMP
+    const int rowThreads = out.size() >= VEC_SEARCH_PARALLEL_THRESHOLD
+                               ? vectorSearchThreadCap()
+                               : 1;
+#pragma omp parallel for schedule(static) num_threads(rowThreads) \
+    if (rowThreads > 1)
+#endif
+    for (size_t i = 0; i < out.size(); ++i) {
+      rows[i] =
+          static_cast<uint64_t>(impl.rowOf(out[i].entity_).value_or(0));
     }
     emitRows(std::move(rows));
   };
@@ -2602,7 +2637,12 @@ std::vector<ScoredEntity> searchExactBytes(
 #endif
     AD_LOG_INFO << "Vector index \"" << impl.meta_.config_.name_
                 << "\": whole-index scan (" << impl.numLive() << " vectors, "
-                << numThreads << " threads)" << std::endl;
+                << numThreads << " threads, "
+                << (histWholeIndex ? "hamming histogram select"
+                    : i8HistWholeIndex
+                        ? "i8 block sweep + histogram select"
+                        : wholeIndexHeapRouteName(layer, bf16Kernel, i8Kernel))
+                << ")" << std::endl;
     reportScored(impl.numLive());
     if (histWholeIndex) {
       return histSelect(

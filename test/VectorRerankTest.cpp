@@ -571,6 +571,56 @@ TEST(VectorRerank, serviceRerankMatchesExactFineSearch) {
 }
 
 // _____________________________________________________________________________
+// ROUTING regression (perf): the plain whole-index two-layer top-k reranks
+// the coarse survivors by their STORE ROWS (`searchExactCoarseWithRows` +
+// `searchExactByRows`, the same shape as the candidate-bound join path). It
+// must NOT feed the survivors back as candidate IDS through the id-based
+// merge-join / scattered-gather `searchExact` -- at the production shape
+// (2.14M rows, rerankK=10^4) that O(numVectors) `.rowmap` merge-join alone
+// cost ~6x the whole rows rerank. The rows path never logs a "filtered scan"
+// line; the id path always does.
+TEST(VectorRerank, wholeIndexRerankUsesRowsNotScatteredGather) {
+  auto* qec = qecWithRerankIndexes();
+  auto vidx = getVectorIndex(qec->getIndex(), "embrr");
+  ASSERT_TRUE(vidx != nullptr);
+  ASSERT_TRUE(vidx->hasRerankLayer());
+  // A query vector distinct from every other test's, so the result cannot be
+  // served from the query cache (the scan must actually run and log).
+  QueryExecutionTree qet = planQuery(
+      qec, std::string{PREFIX} +
+               "SELECT * WHERE { SERVICE vec: { _:c vec:index \"embrr\" ; "
+               "vec:queryVector \"0,0.9,0.1,0\" ; vec:result ?nn ; "
+               "vec:bindScore ?d ; vec:k 3 . } }");
+  testing::internal::CaptureStdout();
+  auto result = qet.getResult();
+  const IdTable& table = result->idTable();
+  std::string log = testing::internal::GetCapturedStdout();
+  // Both two-layer phases ran...
+  EXPECT_NE(log.find("brute-force scan (coarse layer)"), std::string::npos)
+      << log;
+  EXPECT_NE(log.find("rerank (fine layer)"), std::string::npos) << log;
+  // ...and the rerank did NOT go through the id-based candidate gather.
+  EXPECT_EQ(log.find("filtered scan"), std::string::npos) << log;
+  EXPECT_EQ(log.find("scattered gather"), std::string::npos) << log;
+  // The results equal the exact fine-layer top-k. The scores agree to the
+  // documented ~1e-6 cross-kernel tolerance of the bf16 layer: at this
+  // fixture's dim=4 (not a multiple of 32) the whole-index reference sweep
+  // scores through the ragged-depth GEMM while the by-rows rerank scores per
+  // row (pre-existing bf16 behavior, unrelated to the routing under test).
+  const std::vector<float> query{0.f, 0.9f, 0.1f, 0.f};
+  auto fineTop = vidx->searchExact(query, 3);
+  size_t nnCol = qet.getVariableColumn(Variable{"?nn"});
+  size_t dCol = qet.getVariableColumn(Variable{"?d"});
+  ASSERT_EQ(table.numRows(), fineTop.size());
+  for (size_t r = 0; r < fineTop.size(); ++r) {
+    EXPECT_EQ(table(r, nnCol), fineTop[r].entity_) << "row " << r;
+    EXPECT_NEAR(table(r, dCol).getDouble(),
+                static_cast<double>(fineTop[r].distance_), 1e-6)
+        << "row " << r;
+  }
+}
+
+// _____________________________________________________________________________
 // The BINARY SERVICE top-k: the coarse pass ranks by HAMMING distance over
 // the sign bits, the fine pass rescores exactly on bf16. On this fixture the
 // sign patterns keep the whole fine top set within the (wide) binary default
