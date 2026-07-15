@@ -41,6 +41,7 @@
 #include "services/vectorSearch/VectorI8Kernels.h"
 #include "services/vectorSearch/VectorMemory.h"
 #include "services/vectorSearch/VectorSelect.h"
+#include "services/vectorSearch/VectorSweepExecutor.h"
 #include "util/Exception.h"
 #include "util/HashSet.h"
 #include "util/Log.h"
@@ -309,11 +310,17 @@ struct VectorIndex::Impl {
     // that tolerance is accepted exactly like the bf16 batched cosine (the
     // HNSW graph only pre-selects, its candidates are re-scored by these).
     bool hasI8VnniKernel_ = false;
-    // Per-row sidecars built at open (8 B/row, e.g. ~17 MB at 2.14M rows):
+    // Per-row sidecars built at open (12 B/row, e.g. ~26 MB at 2.14M rows):
     // `sum(row)` (the exact-integer correction of the unsigned-biased VNNI
-    // dot, `dot = dotU - 128*sum`) and `sum(row^2)` (the finalize's |b|^2).
+    // dot, `dot = dotU - 128*sum`), `sum(row^2)` (the finalize's |b|^2), and
+    // the PRECOMPUTED inverse norm `finalizeInvSqrt(f32(sum(row^2)))` -- the
+    // bit-identical rsqrt+NR value `angularFinalize` would recompute per row,
+    // hoisted so the block finalize is a vectorized multiply
+    // (`angularFinalizeBlock`). 0 for a zero row (never read: dot == 0 rows
+    // take the 1.0f override).
     std::vector<int32_t> rowSumsI8_;
     std::vector<int32_t> rowNormSqI8_;
+    std::vector<float> rowInvNormI8_;
 
     // Whether a requested `vec:i8Kernel` resolves to the BLOCK (VNNI) engine
     // on this layer. `Punned` keeps the per-row engine; both return
@@ -342,6 +349,14 @@ struct VectorIndex::Impl {
       i8kernels::rowSums(reinterpret_cast<const int8_t*>(queryBytes), dim, &sum,
                          &normSq);
       return normSq;
+    }
+
+    // The query's inverse norm for the vectorized block finalize, hoisted
+    // ONCE per search: the identical rsqrt+NR value `angularFinalize`
+    // recomputed per row. 0 for a zero-norm query (the block paths then take
+    // the scalar fallback; see `angularBlockI8`).
+    static float queryInvNormI8(float qNormSq) {
+      return qNormSq > 0.0f ? i8kernels::finalizeInvSqrt(qNormSq) : 0.0f;
     }
 
     // Angular distance of an i8 query to store row `i`: exact signed dot +
@@ -374,13 +389,24 @@ struct VectorIndex::Impl {
 
     // Angular distances for a CONTIGUOUS block of `count` rows starting at
     // store row `rowStart`, via the multi-row VNNI dot (`qx` from
-    // `xorQueryI8`, `qNormSq` from `queryNormSqI8`) plus the per-row sidecar
-    // finalize. `dots` is caller scratch (>= count i32). Only valid when
-    // `hasI8VnniKernel_`.
+    // `xorQueryI8`, `qNormSq` from `queryNormSqI8`, `qInv` from
+    // `queryInvNormI8`) plus the VECTORIZED sidecar finalize
+    // (`angularFinalizeBlock`, bit-identical to the per-row
+    // `angularFinalize`). `dots` is caller scratch (>= count i32). Only
+    // valid when `hasI8VnniKernel_`.
     void angularBlockI8(size_t rowStart, size_t count, const uint8_t* qx,
-                        float qNormSq, int32_t* dots, float* out) const {
+                        float qNormSq, float qInv, int32_t* dots,
+                        float* out) const {
       i8kernels::dotBlockVnni(qx, base() + rowStart * stride_, stride_, count,
                               dim_, dots);
+      if (qNormSq != 0.0f) {
+        i8kernels::angularFinalizeBlock(dots, rowSumsI8_.data() + rowStart,
+                                        rowInvNormI8_.data() + rowStart, count,
+                                        qInv, out);
+        return;
+      }
+      // Zero-norm query (all dots are 0): the pinned scalar finalize handles
+      // the `a2 == 0` conventions (0 for a zero row, 1 otherwise) exactly.
       const int32_t* sums = rowSumsI8_.data() + rowStart;
       const int32_t* norms = rowNormSqI8_.data() + rowStart;
       for (size_t j = 0; j < count; ++j) {
@@ -780,8 +806,10 @@ void configureLayerFastPaths([[maybe_unused]] LayerT& layer,
       i8kernels::vnniAvailable() && i8FastPathEnabled()) {
     layer.rowSumsI8_.assign(numRows, 0);
     layer.rowNormSqI8_.assign(numRows, 0);
+    layer.rowInvNormI8_.assign(numRows, 0.0f);
     int32_t* sums = layer.rowSumsI8_.data();
     int32_t* norms = layer.rowNormSqI8_.data();
+    float* invs = layer.rowInvNormI8_.data();
     const size_t dimI8 = layer.dim_;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(numThreads)
@@ -789,6 +817,13 @@ void configureLayerFastPaths([[maybe_unused]] LayerT& layer,
     for (size_t i = 0; i < numRows; ++i) {
       i8kernels::rowSums(reinterpret_cast<const int8_t*>(layer.rowPtr(i)),
                          dimI8, &sums[i], &norms[i]);
+      // The precomputed inverse norm: bit-equal to the rsqrt+NR lane
+      // `angularFinalize` computes from `f32(norms[i])` (see
+      // `finalizeInvSqrt`). 0 for a zero row (never read by the finalize:
+      // its dot == 0 rows take the 1.0f override).
+      invs[i] = norms[i] > 0
+                    ? i8kernels::finalizeInvSqrt(static_cast<float>(norms[i]))
+                    : 0.0f;
     }
     layer.hasI8VnniKernel_ = true;
   }
@@ -873,6 +908,12 @@ VectorIndex& VectorIndex::operator=(VectorIndex&&) noexcept = default;
 void VectorIndex::open(const std::string& basename, const std::string& name,
                        Residency residency, Residency rerankResidency) {
   auto& impl = *impl_;
+
+  // 0. Create (and warm) the persistent sweep executor now, at open --
+  // deterministically at server startup rather than inside the first query
+  // (its worker pins itself and spins its OpenMP team up once; see
+  // `SweepExecutor`). A no-op when routing is disabled or already started.
+  SweepExecutor::ensureStarted();
 
   // 1. Metadata.
   std::ifstream metaIn{vectorMetaFile(basename, name)};
@@ -1593,6 +1634,7 @@ void VectorIndex::gatherSortedDistances(ql::span<const Id> ascendingEntities,
   const size_t numChunks = (n + GATHER_CHUNK - 1) / GATHER_CHUNK;
 #ifdef _OPENMP
   if (numThreads > 1 && n >= GATHER_PARALLEL_THRESHOLD) {
+    runVectorSweep({}, [&] {
 #pragma omp parallel for schedule(dynamic) num_threads(numThreads)
     for (size_t c = 0; c < numChunks; ++c) {
       // Non-throwing per-chunk cancellation poll: an exception must never
@@ -1605,6 +1647,7 @@ void VectorIndex::gatherSortedDistances(ql::span<const Id> ascendingEntities,
       size_t lo = c * GATHER_CHUNK;
       processChunk(lo, std::min(n, lo + GATHER_CHUNK));
     }
+    });
     return;
   }
 #else
@@ -1913,6 +1956,7 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
   if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
     std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
     std::atomic<bool> cancelled{false};
+    runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel num_threads(numThreads)
     {
       TopK& localTop = locals[static_cast<size_t>(omp_get_thread_num())];
@@ -1943,6 +1987,7 @@ void scanIntoTopK(TopK& top, [[maybe_unused]] size_t k, size_t n, LayerT& layer,
         scoreOne(localTop, i);
       }
     }
+    });
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
       checkInterrupt();  // re-raise the cancellation outside the parallel
                          // region
@@ -2022,6 +2067,7 @@ void scanWholeIndexBatchedBf16(
   if (numThreads > 1) {
     std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
     std::atomic<bool> cancelled{false};
+    runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel num_threads(numThreads)
     {
       const size_t tid = static_cast<size_t>(omp_get_thread_num());
@@ -2070,6 +2116,7 @@ void scanWholeIndexBatchedBf16(
         scoreBlock(localTop, s, count, dots.data(), dists.data());
       }
     }
+    });
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
       checkInterrupt();  // re-raise outside the parallel region
     }
@@ -2109,10 +2156,11 @@ void scanWholeIndexBatchedI8(TopK& top, size_t k, ImplT& impl, LayerT& layer,
   const std::vector<uint8_t> qx = layer.xorQueryI8(queryBytes);
   const float qNormSq =
       static_cast<float>(LayerT::queryNormSqI8(queryBytes, layer.dim_));
+  const float qInv = LayerT::queryInvNormI8(qNormSq);
   const uint8_t* qxp = qx.data();
   auto scoreBlock = [&](TopK& localTop, size_t blockStart, size_t count,
                         int32_t* dots, float* dists) {
-    layer.angularBlockI8(blockStart, count, qxp, qNormSq, dots, dists);
+    layer.angularBlockI8(blockStart, count, qxp, qNormSq, qInv, dots, dists);
     for (size_t j = 0; j < count; ++j) {
       const uint64_t id = impl.keys_[blockStart + j];
       if (id != TOMBSTONE_KEY && dists[j] <= maxDist) {
@@ -2124,6 +2172,12 @@ void scanWholeIndexBatchedI8(TopK& top, size_t k, ImplT& impl, LayerT& layer,
   if (numThreads > 1) {
     std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
     std::atomic<bool> cancelled{false};
+    runVectorSweep(checkInterrupt, [&] {
+    // Per-team-thread i32 dot scratch from the executor's reusable arena
+    // (slice `tid`); a plain per-thread vector off the executor. Pure output
+    // scratch either way -- bit-identical.
+    int32_t* dotsArena = SweepExecutor::int32Scratch(
+        static_cast<size_t>(numThreads) * VEC_I8_BATCH_ROWS);
 #pragma omp parallel num_threads(numThreads)
     {
       const size_t tid = static_cast<size_t>(omp_get_thread_num());
@@ -2131,7 +2185,11 @@ void scanWholeIndexBatchedI8(TopK& top, size_t k, ImplT& impl, LayerT& layer,
       TopK& localTop = locals[tid];
       const size_t first = n * tid / team;
       const size_t last = n * (tid + 1) / team;
-      std::vector<int32_t> dots(VEC_I8_BATCH_ROWS);
+      std::vector<int32_t> dotsLocal(dotsArena == nullptr ? VEC_I8_BATCH_ROWS
+                                                          : 0);
+      int32_t* dots = dotsArena == nullptr
+                          ? dotsLocal.data()
+                          : dotsArena + tid * VEC_I8_BATCH_ROWS;
       std::vector<float> dists(VEC_I8_BATCH_ROWS);
       for (size_t s = first; s < last; s += VEC_I8_BATCH_ROWS) {
         if (VEC_SEARCH_CHECK_CANCELLATION) {
@@ -2148,9 +2206,10 @@ void scanWholeIndexBatchedI8(TopK& top, size_t k, ImplT& impl, LayerT& layer,
           }
         }
         const size_t count = std::min(VEC_I8_BATCH_ROWS, last - s);
-        scoreBlock(localTop, s, count, dots.data(), dists.data());
+        scoreBlock(localTop, s, count, dots, dists.data());
       }
     }
+    });
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
       checkInterrupt();  // re-raise outside the parallel region
     }
@@ -2245,6 +2304,7 @@ void scanWholeIndexIntoTopK(
   if (numThreads > 1) {
     std::vector<TopK> locals(static_cast<size_t>(numThreads), TopK{k});
     std::atomic<bool> cancelled{false};
+    runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel num_threads(numThreads)
     {
       const size_t tid = static_cast<size_t>(omp_get_thread_num());
@@ -2299,6 +2359,7 @@ void scanWholeIndexIntoTopK(
         }
       }
     }
+    });
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
       checkInterrupt();  // re-raise the cancellation outside the parallel
                          // region
@@ -2383,6 +2444,7 @@ bool candidatesCoverAllRows(const RowmapT& rowmap,
 #ifdef _OPENMP
   if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
     std::atomic<bool> covered{true};
+    runVectorSweep({}, [&] {
 #pragma omp parallel num_threads(numThreads)
     {
       const size_t tid = static_cast<size_t>(omp_get_thread_num());
@@ -2394,6 +2456,7 @@ bool candidatesCoverAllRows(const RowmapT& rowmap,
         covered.store(false, std::memory_order_relaxed);
       }
     }
+    });
     return covered.load(std::memory_order_relaxed);
   }
 #endif
@@ -2547,13 +2610,20 @@ std::vector<ScoredEntity> searchExactBytes(
     const int rowThreads = out.size() >= VEC_SEARCH_PARALLEL_THRESHOLD
                                ? vectorSearchThreadCap()
                                : 1;
+    runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel for schedule(static) num_threads(rowThreads) \
     if (rowThreads > 1)
-#endif
     for (size_t i = 0; i < out.size(); ++i) {
       rows[i] =
           static_cast<uint64_t>(impl.rowOf(out[i].entity_).value_or(0));
     }
+    });
+#else
+    for (size_t i = 0; i < out.size(); ++i) {
+      rows[i] =
+          static_cast<uint64_t>(impl.rowOf(out[i].entity_).value_or(0));
+    }
+#endif
     emitRows(std::move(rows));
   };
   // Clamp `k` (user-supplied, unbounded) to the live vector count AND -- for
@@ -2575,28 +2645,41 @@ std::vector<ScoredEntity> searchExactBytes(
   // the histogram already resolved the row.
   auto histSelect = [&](size_t n, auto&& rowOf, auto&& idOf,
                         bool contiguous) -> std::vector<ScoredEntity> {
-    SeqScanHint hint{layer, contiguous && !layer.alignedBuf_};
-    std::unique_ptr<float[]> dists(new float[n]);
-    auto sel = coarseSweepSelectHistogram(layer, queryBytes, n, rowOf,
-                                          contiguous, dists.get(), k,
-                                          integerDistMax.value(), checkInterrupt);
-    const float maxDist =
-        maxDistance.value_or(std::numeric_limits<float>::infinity());
+    // The WHOLE select (sweep + histogram + collect) runs as ONE task on the
+    // persistent sweep executor: the inner parallel regions reuse its warm
+    // team (nested `runVectorSweep` calls run inline there), and the O(n)
+    // distance array comes from the executor's reusable scratch instead of a
+    // fresh (first-touch) allocation per query.
     std::vector<ScoredEntity> out;
-    out.reserve(sel.size());
-    std::vector<uint64_t> rows;
-    if (outRows != nullptr) {
-      rows.reserve(sel.size());
-    }
-    for (const auto& [dist, i] : sel) {
-      if (dist <= maxDist) {
-        out.push_back(ScoredEntity{Id::fromBits(idOf(i)), dist});
-        if (outRows != nullptr) {
-          rows.push_back(static_cast<uint64_t>(rowOf(i)));
+    runVectorSweep(checkInterrupt, [&] {
+      SeqScanHint hint{layer, contiguous && !layer.alignedBuf_};
+      float* dists = SweepExecutor::floatScratch(n);
+      std::unique_ptr<float[]> owned;
+      if (dists == nullptr) {  // inline (executor off): plain allocation
+        owned.reset(new float[n]);
+        dists = owned.get();
+      }
+      auto sel = coarseSweepSelectHistogram(layer, queryBytes, n, rowOf,
+                                            contiguous, dists, k,
+                                            integerDistMax.value(),
+                                            checkInterrupt);
+      const float maxDist =
+          maxDistance.value_or(std::numeric_limits<float>::infinity());
+      out.reserve(sel.size());
+      std::vector<uint64_t> rows;
+      if (outRows != nullptr) {
+        rows.reserve(sel.size());
+      }
+      for (const auto& [dist, i] : sel) {
+        if (dist <= maxDist) {
+          out.push_back(ScoredEntity{Id::fromBits(idOf(i)), dist});
+          if (outRows != nullptr) {
+            rows.push_back(static_cast<uint64_t>(rowOf(i)));
+          }
         }
       }
-    }
-    emitRows(std::move(rows));
+      emitRows(std::move(rows));
+    });
     return out;
   };
   // The whole-index histogram scans every row 0..numVectors with no per-row
@@ -2623,38 +2706,56 @@ std::vector<ScoredEntity> searchExactBytes(
   constexpr bool i8HistWholeIndex = false;  // no fast path without NumKong
 #endif
   auto histSelectFloatI8 = [&]() -> std::vector<ScoredEntity> {
-    const size_t n = impl.meta_.numVectors_;
-    std::unique_ptr<float[]> dists(new float[n]);
-    {
-      SeqScanHint hint{layer, !layer.alignedBuf_};
-      cslsDistanceSweep(
-          layer, queryBytes, n, [](size_t i) { return i; }, dists.get(),
-          checkInterrupt, /*contiguous=*/true, bf16Kernel, i8Kernel);
-    }
-    int selThreads = 1;
-#ifdef _OPENMP
-    if (n >= VEC_SEARCH_PARALLEL_THRESHOLD) {
-      selThreads = vectorSearchThreadCap();
-    }
-#endif
-    auto sel = selectSmallestPairsFloat(dists.get(), n, k, selThreads);
-    const float maxDist =
-        maxDistance.value_or(std::numeric_limits<float>::infinity());
+    // ONE executor task for the whole route (see `histSelect` above): warm
+    // team for the sweep AND the select, O(n) distance array from the
+    // executor's reusable scratch.
     std::vector<ScoredEntity> out;
-    out.reserve(sel.size());
-    std::vector<uint64_t> rows;
-    if (outRows != nullptr) {
-      rows.reserve(sel.size());
-    }
-    for (const auto& [dist, row] : sel) {
-      if (dist <= maxDist) {
-        out.push_back(ScoredEntity{Id::fromBits(impl.keys_[row]), dist});
-        if (outRows != nullptr) {
-          rows.push_back(row);
+    runVectorSweep(checkInterrupt, [&] {
+      const size_t n = impl.meta_.numVectors_;
+      float* dists = SweepExecutor::floatScratch(n);
+      std::unique_ptr<float[]> owned;
+      if (dists == nullptr) {  // inline (executor off): plain allocation
+        owned.reset(new float[n]);
+        dists = owned.get();
+      }
+      {
+        SeqScanHint hint{layer, !layer.alignedBuf_};
+        cslsDistanceSweep(
+            layer, queryBytes, n, [](size_t i) { return i; }, dists,
+            checkInterrupt, /*contiguous=*/true, bf16Kernel, i8Kernel);
+      }
+      int selThreads = 1;
+#ifdef _OPENMP
+      if (n >= VEC_SEARCH_PARALLEL_THRESHOLD) {
+        selThreads = vectorSearchThreadCap();
+      }
+#endif
+      size_t collected = 0;
+      auto sel = selectSmallestPairsFloat(dists, n, k, selThreads, &collected);
+      // Boundary-bucket diagnostic: `collected - k` is the boundary bucket's
+      // overshoot, i.e. how badly clustered scores inflate the final
+      // nth_element input.
+      AD_LOG_DEBUG << "Vector index \"" << impl.meta_.config_.name_
+                   << "\": i8 histogram select collected " << collected
+                   << " of " << n << " for k=" << k << " (boundary overshoot "
+                   << (collected > k ? collected - k : 0) << ")" << std::endl;
+      const float maxDist =
+          maxDistance.value_or(std::numeric_limits<float>::infinity());
+      out.reserve(sel.size());
+      std::vector<uint64_t> rows;
+      if (outRows != nullptr) {
+        rows.reserve(sel.size());
+      }
+      for (const auto& [dist, row] : sel) {
+        if (dist <= maxDist) {
+          out.push_back(ScoredEntity{Id::fromBits(impl.keys_[row]), dist});
+          if (outRows != nullptr) {
+            rows.push_back(row);
+          }
         }
       }
-    }
-    emitRows(std::move(rows));
+      emitRows(std::move(rows));
+    });
     return out;
   };
 
@@ -3341,21 +3442,32 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
     const float qNormSq = static_cast<float>(
         std::remove_reference_t<decltype(layer)>::queryNormSqI8(queryBytes,
                                                                 layer.dim_));
+    const float qInv =
+        std::remove_reference_t<decltype(layer)>::queryInvNormI8(qNormSq);
     const uint8_t* qxp = qx.data();
     if (contiguous) {
       auto block = [&](size_t s, size_t count, int32_t* scratch) {
-        layer.angularBlockI8(s, count, qxp, qNormSq, scratch, dists + s);
+        layer.angularBlockI8(s, count, qxp, qNormSq, qInv, scratch, dists + s);
       };
 #ifdef _OPENMP
       if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
         std::atomic<bool> cancelled{false};
+        runVectorSweep(checkInterrupt, [&] {
+        // Per-team-thread i32 dot scratch from the executor's reusable arena
+        // (slice `tid`); a plain per-thread vector off the executor.
+        int32_t* scratchArena = SweepExecutor::int32Scratch(
+            static_cast<size_t>(numThreads) * VEC_I8_BATCH_ROWS);
 #pragma omp parallel num_threads(numThreads)
         {
           const size_t tid = static_cast<size_t>(omp_get_thread_num());
           const size_t team = static_cast<size_t>(omp_get_num_threads());
           const size_t first = n * tid / team;
           const size_t last = n * (tid + 1) / team;
-          std::vector<int32_t> scratch(VEC_I8_BATCH_ROWS);
+          std::vector<int32_t> scratchLocal(
+              scratchArena == nullptr ? VEC_I8_BATCH_ROWS : 0);
+          int32_t* scratch = scratchArena == nullptr
+                                 ? scratchLocal.data()
+                                 : scratchArena + tid * VEC_I8_BATCH_ROWS;
           for (size_t s = first; s < last; s += VEC_I8_BATCH_ROWS) {
             if (VEC_SEARCH_CHECK_CANCELLATION) {
               if (cancelled.load(std::memory_order_relaxed)) break;
@@ -3368,9 +3480,10 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
                 }
               }
             }
-            block(s, std::min(VEC_I8_BATCH_ROWS, last - s), scratch.data());
+            block(s, std::min(VEC_I8_BATCH_ROWS, last - s), scratch);
           }
         }
+        });
         if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
           checkInterrupt();
         }
@@ -3403,6 +3516,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
 #ifdef _OPENMP
     if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
       std::atomic<bool> cancelled{false};
+      runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel num_threads(numThreads)
       {
         const size_t tid = static_cast<size_t>(omp_get_thread_num());
@@ -3427,6 +3541,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
                       scratch.data());
         }
       }
+      });
       if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
         checkInterrupt();
       }
@@ -3472,6 +3587,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
 #ifdef _OPENMP
     if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
       std::atomic<bool> cancelled{false};
+      runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel num_threads(numThreads)
       {
         const size_t tid = static_cast<size_t>(omp_get_thread_num());
@@ -3506,6 +3622,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
           block(s, std::min(VEC_BF16_BATCH_ROWS, last - s), scratch.data());
         }
       }
+      });
       if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
         checkInterrupt();
       }
@@ -3552,6 +3669,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
 #ifdef _OPENMP
     if (n >= VEC_SEARCH_PARALLEL_THRESHOLD && numThreads > 1) {
       std::atomic<bool> cancelled{false};
+      runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel num_threads(numThreads)
       {
         const size_t tid = static_cast<size_t>(omp_get_thread_num());
@@ -3576,6 +3694,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
                       scratch.data());
         }
       }
+      });
       if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
         checkInterrupt();
       }
@@ -3632,6 +3751,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
     // start-to-end -- the prefetch-friendly order, and no dynamic-dispatch
     // overhead. The result is a per-index `dists[i]` write, independent of the
     // iteration->thread mapping.
+    runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel for schedule(static) num_threads(numThreads)
     for (size_t i = 0; i < n; ++i) {
       // An exception must never unwind out of the OpenMP region: poll the
@@ -3651,6 +3771,7 @@ void cslsDistanceSweep(const LayerT& layer, const char* queryBytes, size_t n,
       prefetchSweepRow(layer, rowOf, i, n, pfAhead, compact);
       dists[i] = distAt(i);
     }
+    });
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
       checkInterrupt();  // re-raise outside the parallel region
     }
@@ -3693,6 +3814,7 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelect(
     std::vector<CoarseSelector> locals(static_cast<size_t>(numThreads),
                                        CoarseSelector{topM});
     std::atomic<bool> cancelled{false};
+    runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel num_threads(numThreads)
     {
       const size_t tid = static_cast<size_t>(omp_get_thread_num());
@@ -3723,6 +3845,7 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelect(
         localSel.offer(d, static_cast<uint64_t>(i));
       }
     }
+    });
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
       checkInterrupt();  // re-raise outside the parallel region
     }
@@ -3877,6 +4000,7 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
       }
       return false;
     };
+    runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel num_threads(numThreads)
     {
       const size_t tid = static_cast<size_t>(omp_get_thread_num());
@@ -3888,6 +4012,7 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
       const size_t last = n * (tid + 1) / t;
       computeBins(localHists[tid].data(), first, last, chunkBreak);
     }
+    });
     if (cancelled.load(std::memory_order_relaxed) && checkInterrupt) {
       checkInterrupt();  // re-raise outside the parallel region
     }
@@ -3999,10 +4124,12 @@ std::vector<std::pair<float, uint64_t>> coarseSweepSelectHistogram(
   };
 #ifdef _OPENMP
   if (parallel) {
+    runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel for schedule(static) num_threads(numThreads)
     for (size_t c = 0; c < nt; ++c) {
       scatterChunk(c);
     }
+    });
   } else
 #endif
   {
@@ -4595,7 +4722,15 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
         selThreads = vectorSearchThreadCap();
       }
 #endif
-      sel = selectSmallestPairsFloat(coarseDists.get(), n, floorM, selThreads);
+      size_t collected = 0;
+      sel = selectSmallestPairsFloat(coarseDists.get(), n, floorM, selThreads,
+                                     &collected);
+      AD_LOG_DEBUG << "Vector index \"" << impl.meta_.config_.name_
+                   << "\": i8 coarse histogram select collected " << collected
+                   << " of " << n << " for floorM=" << floorM
+                   << " (boundary overshoot "
+                   << (collected > floorM ? collected - floorM : 0) << ")"
+                   << std::endl;
     } else {
       // Pass null: the common no-widen path never needs the full
       // coarse-distance array, only the coarse-best batch (`sel`).
@@ -4629,12 +4764,18 @@ CslsReranked rerankCsls(ImplT& impl, LayerT& layer, const char* queryBytes,
     }
     keyed.resize(n);
 #ifdef _OPENMP
+    runVectorSweep(checkInterrupt, [&] {
 #pragma omp parallel for schedule(static) num_threads( \
         vectorSearchThreadCap()) if (n >= VEC_SEARCH_PARALLEL_THRESHOLD)
-#endif
     for (size_t i = 0; i < n; ++i) {
       keyed[i] = {coarseDists[i], i};
     }
+    });
+#else
+    for (size_t i = 0; i < n; ++i) {
+      keyed[i] = {coarseDists[i], i};
+    }
+#endif
     const size_t m = std::min(floorM, n);
     if (m < n) {
       std::nth_element(keyed.begin(),

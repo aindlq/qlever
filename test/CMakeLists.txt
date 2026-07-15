@@ -225,6 +225,12 @@ if (QLEVER_WITH_VECTOR_SEARCH)
     # the `vec:i8Kernel` dial, filtered gather, coarse+rerank recall).
     addLinkAndDiscoverTest(VectorI8ScanTest vectorStorage)
 
+    # The persistent sweep executor (`SweepExecutor` / `runVectorSweep`):
+    # executor-on == executor-off result identity, exception propagation,
+    # reentrancy (nested sweeps run inline), queued-task abandonment on
+    # cancellation, and the per-worker scratch contract.
+    addLinkAndDiscoverTest(VectorSweepExecutorTest vectorStorage)
+
     # The `QLEVER_VECTOR_SEARCH_ENDPOINTS` runtime override of the persisted
     # embedding endpoints (env parsing + the in-memory-only mutator).
     addLinkAndDiscoverTest(VectorIndexEndpointOverrideTest vectorStorage)

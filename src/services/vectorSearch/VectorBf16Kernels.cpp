@@ -7,7 +7,9 @@
 
 #include "services/vectorSearch/VectorBf16Kernels.h"
 
+#include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -120,22 +122,42 @@ dotOneSimd_(const uint16_t* q, const uint16_t* r, size_t dim) {
   return _mm512_reduce_add_ps(acc);
 }
 
-// A/B off-switch for the contiguous-sweep software prefetch below. Default ON
-// (measured net win where memory bandwidth exceeds what the compute-laden loop
-// pulls on its own; neutral where it doesn't). Set QLEVER_VECTOR_SEARCH_PREFETCH
-// to 0/false/off/no to disable. Memoized -- one env read per process.
+// Runtime-selectable software-prefetch policy for the contiguous-sweep block
+// below -- the same encoding and env knob (`QLEVER_VECTOR_SEARCH_PREFETCH`,
+// one process-wide policy) as the i8 kernels: 0 = off, else
+// `((hint + 1) << 8) | rowsAhead` with hint 0/1/2 = T0/T1/T2; `t<h>x<N>`
+// selects explicitly, anything else truthy = the measured default. One
+// relaxed atomic load per block call.
 namespace {
-bool simdPrefetchEnabled_() {
-  static const bool on = [] {
-    const char* v = std::getenv("QLEVER_VECTOR_SEARCH_PREFETCH");
-    if (v == nullptr) return true;
-    std::string s{v};
-    for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
-    return !(s == "0" || s == "false" || s == "off" || s == "no");
-  }();
-  return on;
+constexpr uint32_t PF_DEFAULT_BF16 =
+    ((/*T1*/ 1u + 1u) << 8) | 8u;  // T1, 8 rows ahead (measured)
+
+uint32_t parsePrefetchEnv_() {
+  const char* v = std::getenv("QLEVER_VECTOR_SEARCH_PREFETCH");
+  if (v == nullptr) return PF_DEFAULT_BF16;
+  std::string s{v};
+  for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
+  if (s == "0" || s == "false" || s == "off" || s == "no") return 0;
+  if (s.size() > 3 && s[0] == 't' && s[1] >= '0' && s[1] <= '2' &&
+      s[2] == 'x') {
+    const long rows = std::strtol(s.c_str() + 3, nullptr, 10);
+    if (rows >= 1 && rows <= 64) {
+      return ((static_cast<uint32_t>(s[1] - '0') + 1u) << 8) |
+             static_cast<uint32_t>(rows);
+    }
+  }
+  return PF_DEFAULT_BF16;
+}
+
+std::atomic<uint32_t>& pfConfig_() {
+  static std::atomic<uint32_t> cfg{parsePrefetchEnv_()};
+  return cfg;
 }
 }  // namespace
+
+void refreshPrefetchConfigFromEnv() {
+  pfConfig_().store(parsePrefetchEnv_(), std::memory_order_relaxed);
+}
 
 // 8 rows per iteration, 8 independent `vdpbf16ps` accumulator chains, query
 // reloaded from L1 each 64 B chunk -- the `dot8` prototype. `rowPtr(j)` yields
@@ -146,12 +168,12 @@ bool simdPrefetchEnabled_() {
 // so the sweep captures only a fraction of the DRAM bandwidth the box can
 // actually deliver -- measured: a matched-DIMM 8-channel DDR5-4400 part streams
 // at 226 GB/s (pure read) but this scan pulled only ~155 without prefetch. An
-// explicit T2 prefetch `pfBytes` ahead of each of the 8 row streams restores
-// that memory-level parallelism (+12-30% wall clock, output bit-identical).
-// OFF for the gather path (a fixed byte distance is meaningless across
-// scattered rows) and inert on a bandwidth-saturated box (it only reorders
-// demand loads that would be issued anyway; T2 keeps it out of L1).
-template <bool Prefetch, typename RowPtrFn>
+// explicit prefetch (`Hint` level) `pfBytes` ahead of each of the 8 row
+// streams restores that memory-level parallelism (+12-30% wall clock, output
+// bit-identical). OFF for the gather path (a fixed byte distance is
+// meaningless across scattered rows) and inert on a bandwidth-saturated box
+// (it only reorders demand loads that would be issued anyway).
+template <bool Prefetch, int Hint, typename RowPtrFn>
 __attribute__((target("avx512bf16,avx512vl,avx512bw,avx512f"))) static void
 dotMultiSimd_(const uint16_t* q, RowPtrFn rowPtr, size_t count, size_t dim,
               float* out, size_t pfBytes) {
@@ -173,14 +195,14 @@ dotMultiSimd_(const uint16_t* q, RowPtrFn rowPtr, size_t count, size_t dim,
       if constexpr (Prefetch) {
         // One prefetch per consumed 64 B line, each row's own stream pfBytes
         // ahead (contiguous rows -> this reaches into the following blocks).
-        _mm_prefetch(reinterpret_cast<const char*>(r0 + c) + pfBytes, _MM_HINT_T2);
-        _mm_prefetch(reinterpret_cast<const char*>(r1 + c) + pfBytes, _MM_HINT_T2);
-        _mm_prefetch(reinterpret_cast<const char*>(r2 + c) + pfBytes, _MM_HINT_T2);
-        _mm_prefetch(reinterpret_cast<const char*>(r3 + c) + pfBytes, _MM_HINT_T2);
-        _mm_prefetch(reinterpret_cast<const char*>(r4 + c) + pfBytes, _MM_HINT_T2);
-        _mm_prefetch(reinterpret_cast<const char*>(r5 + c) + pfBytes, _MM_HINT_T2);
-        _mm_prefetch(reinterpret_cast<const char*>(r6 + c) + pfBytes, _MM_HINT_T2);
-        _mm_prefetch(reinterpret_cast<const char*>(r7 + c) + pfBytes, _MM_HINT_T2);
+        _mm_prefetch(reinterpret_cast<const char*>(r0 + c) + pfBytes, static_cast<_mm_hint>(Hint));
+        _mm_prefetch(reinterpret_cast<const char*>(r1 + c) + pfBytes, static_cast<_mm_hint>(Hint));
+        _mm_prefetch(reinterpret_cast<const char*>(r2 + c) + pfBytes, static_cast<_mm_hint>(Hint));
+        _mm_prefetch(reinterpret_cast<const char*>(r3 + c) + pfBytes, static_cast<_mm_hint>(Hint));
+        _mm_prefetch(reinterpret_cast<const char*>(r4 + c) + pfBytes, static_cast<_mm_hint>(Hint));
+        _mm_prefetch(reinterpret_cast<const char*>(r5 + c) + pfBytes, static_cast<_mm_hint>(Hint));
+        _mm_prefetch(reinterpret_cast<const char*>(r6 + c) + pfBytes, static_cast<_mm_hint>(Hint));
+        _mm_prefetch(reinterpret_cast<const char*>(r7 + c) + pfBytes, static_cast<_mm_hint>(Hint));
       }
 #define QL_STEP(idx, acc, rp)                                              \
   acc = _mm512_dpbf16_ps(acc, qv,                                         \
@@ -215,19 +237,34 @@ void dotBlockSimd(const uint16_t* query, const char* rows,
   auto rowPtr = [&](size_t j) {
     return reinterpret_cast<const uint16_t*>(rows + j * rowStrideBytes);
   };
-  // Prefetch 4 rows ahead (== the tuned ~9 KB for a 2304 B row). Two compiled
-  // variants; the memoized flag picks one -- no per-row branch.
-  if (simdPrefetchEnabled_()) {
-    dotMultiSimd_<true>(query, rowPtr, count, dim, out, 4 * rowStrideBytes);
-  } else {
-    dotMultiSimd_<false>(query, rowPtr, count, dim, out, 0);
+  // The runtime policy (default: T1, 8 rows ahead -- measured) picks one of
+  // the compiled variants -- no per-row branch.
+  const uint32_t cfg = pfConfig_().load(std::memory_order_relaxed);
+  if (cfg == 0) {
+    dotMultiSimd_<false, _MM_HINT_T2>(query, rowPtr, count, dim, out, 0);
+    return;
+  }
+  const size_t pfBytes = static_cast<size_t>(cfg & 0xffu) * rowStrideBytes;
+  switch (cfg >> 8) {
+    case 1:  // t0
+      dotMultiSimd_<true, _MM_HINT_T0>(query, rowPtr, count, dim, out,
+                                       pfBytes);
+      break;
+    case 2:  // t1
+      dotMultiSimd_<true, _MM_HINT_T1>(query, rowPtr, count, dim, out,
+                                       pfBytes);
+      break;
+    default:  // t2
+      dotMultiSimd_<true, _MM_HINT_T2>(query, rowPtr, count, dim, out,
+                                       pfBytes);
+      break;
   }
 }
 
 void dotGatherSimd(const uint16_t* query, const char* base,
                    size_t rowStrideBytes, const size_t* rowOf, size_t count,
                    size_t dim, float* out) {
-  dotMultiSimd_<false>(
+  dotMultiSimd_<false, _MM_HINT_T2>(
       query,
       [&](size_t j) {
         return reinterpret_cast<const uint16_t*>(base +
@@ -346,6 +383,7 @@ dotBlockAmx(const void* packedQuery, const uint16_t* query, const char* rows,
 bool simdAvailable() { return false; }
 bool amxAvailable() { return false; }
 bool ensureAmxPermission() { return false; }
+void refreshPrefetchConfigFromEnv() {}
 void dotBlockSimd(const uint16_t*, const char*, size_t, size_t, size_t,
                   float*) {}
 void dotGatherSimd(const uint16_t*, const char*, size_t, const size_t*, size_t,

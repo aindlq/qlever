@@ -43,6 +43,13 @@ namespace qlever::vector::bf16kernels {
 bool simdAvailable();
 bool amxAvailable();
 
+// Re-read `QLEVER_VECTOR_SEARCH_PREFETCH` (the contiguous-sweep prefetch
+// policy: `off`, `t0x<N>`/`t1x<N>`/`t2x<N>` = hint + N-rows-ahead lead,
+// default = the measured winner). Parsed once at first use; this refresh
+// exists for the prefetch benchmark, which flips the env between timed
+// phases inside one process.
+void refreshPrefetchConfigFromEnv();
+
 // Request the process's AMX tile-data permission (Linux `arch_prctl`
 // `ARCH_REQ_XCOMP_PERM` for `XFEATURE_XTILEDATA`) and VERIFY it was granted
 // (`ARCH_GET_XCOMP_PERM`). Returns true iff the AMX tile state is usable, so a

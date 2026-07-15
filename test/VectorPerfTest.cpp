@@ -31,6 +31,15 @@
 
 #include <gtest/gtest.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <stdexcept>
+#include <thread>
 
 #include <algorithm>
 #include <chrono>
@@ -43,8 +52,11 @@
 
 #include "global/Id.h"
 #include "global/IndexTypes.h"
+#include "services/vectorSearch/VectorBf16Kernels.h"
+#include "services/vectorSearch/VectorI8Kernels.h"
 #include "services/vectorSearch/VectorIndex.h"
 #include "services/vectorSearch/VectorIndexBuilder.h"
+#include "services/vectorSearch/VectorSweepExecutor.h"
 #include "util/HashSet.h"
 
 using namespace qlever::vector;
@@ -1141,4 +1153,441 @@ TEST(VectorPerf, DISABLED_i8RecallVsBinary) {
       "\n(read: i8 needs the rerankK where its recall matches binary's at "
       "binary's default rerankK=10000; the ms columns are the coarse cost "
       "per query at these thread counts)\n");
+}
+
+// ___________________________________________________________________________
+// Footprint-reproduction benchmark: does MERELY HOLDING other large resident
+// (aligned, hugepage-backed) matrices slow the whole-index i8 coarse sweep?
+// Mirrors the production server process (several aligned i8+bf16 layers,
+// ~25 GB resident vector matrices, one query at a time): opens the SAME
+// on-disk i8+bf16 index BALLAST extra times at aligned residency (each open
+// owns its own aligned RAM copies, so N ballast opens add N * (i8 + bf16)
+// bytes of resident anonymous THP memory), then times `searchExactCoarse`
+// (k = VECTOR_PERF_K) on the FIRST instance BEFORE and AFTER the ballast,
+// and on a LATE-opened instance (allocation order / physical layout). Each
+// phase prints RSS, AnonHugePages, and the /proc/vmstat deltas that would
+// convict the kernel-background suspects (khugepaged THP churn, NUMA
+// balancing PTE scanning, compaction, swap).
+//
+// Knobs (on top of the shared VECTOR_PERF_N/DIM/DIR/REPS):
+//   VECTOR_PERF_BALLAST    extra aligned opens of the same index (default 2;
+//                          each is ~7.4 GB at the default N/DIM)
+//   VECTOR_PERF_ANON_GB    additional plain 4 KiB-page anonymous ballast in
+//                          GiB, touched once (the server's heap/query cache
+//                          shape; default 0)
+//   VECTOR_PERF_K          the coarse top-k (default 10000, the production
+//                          rerankK)
+//   VECTOR_PERF_THREADS    sweep threads (default: all physical cores)
+//   VECTOR_PERF_LOOP_SEC   if > 0, each phase loops the sweep for this many
+//                          seconds (for attaching `perf stat -p`) instead of
+//                          VECTOR_PERF_REPS repetitions
+//   VECTOR_PERF_INTERRUPT  1 = pass a server-shaped checkInterrupt callback
+//                          (relaxed atomic load + branch through a
+//                          std::function, like `handle->throwIfCancelled()`)
+//                          instead of the empty callback (default 0)
+//   VECTOR_PERF_GAP_MS     idle sleep between timed sweeps (default 0,
+//                          excluded from the timings). The SERVER shape is
+//                          one query at a time separated by idle gaps (the
+//                          OpenMP team sleeps, the cores go idle / downclock
+//                          between sweeps); the back-to-back loop keeps both
+//                          hot.
+TEST(VectorPerf, DISABLED_i8FootprintBenchmark) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  BenchSetup s = setupIndexWithScalar(VectorScalar::I8, "i8");
+  const size_t numBallast = envSize("VECTOR_PERF_BALLAST", 2);
+  const size_t anonGb = envSize("VECTOR_PERF_ANON_GB", 0);
+  const size_t k = envSize("VECTOR_PERF_K", 10000);
+  const int threads = static_cast<int>(
+      envSize("VECTOR_PERF_THREADS", static_cast<size_t>(maxHwThreads())));
+  const size_t loopSec = envSize("VECTOR_PERF_LOOP_SEC", 0);
+  const bool interrupt = envSize("VECTOR_PERF_INTERRUPT", 0) != 0;
+  const size_t gapMs = envSize("VECTOR_PERF_GAP_MS", 0);
+  // 1 = run every timed sweep from a FRESH std::thread (a new OpenMP master
+  // each time, like a server that executes each query on a different pool
+  // thread: libgomp keeps one worker team PER master thread, so a fresh
+  // master pays team creation + first-touch inside the timed region).
+  const bool freshThread = envSize("VECTOR_PERF_FRESH_THREAD", 0) != 0;
+  setThreads(threads);
+
+  // Server-shaped cancellation callback: the fast path of
+  // `CancellationHandle::throwIfCancelled` (a relaxed atomic load that never
+  // fires), reached through the same std::function indirection the sweep's
+  // per-chunk check uses in production.
+  std::atomic<int> cancelState{0};
+  CheckInterruptCallback checkInterrupt;
+  if (interrupt) {
+    checkInterrupt = [&cancelState]() {
+      if (cancelState.load(std::memory_order_relaxed) != 0) {
+        throw std::runtime_error("cancelled");
+      }
+    };
+  }
+
+  // ------------------------------------------------------------------ tools
+  // Selected /proc/vmstat counters: THP churn, compaction, NUMA balancing,
+  // reclaim/swap. Missing keys (kernel config) read as 0.
+  auto readVmstat = []() {
+    std::map<std::string, long long> out;
+    FILE* f = fopen("/proc/vmstat", "r");
+    if (f == nullptr) {
+      return out;
+    }
+    char key[128];
+    long long val;
+    while (fscanf(f, "%127s %lld", key, &val) == 2) {
+      out[key] = val;
+    }
+    fclose(f);
+    return out;
+  };
+  const char* watchedVmstat[] = {
+      "thp_fault_alloc",      "thp_collapse_alloc", "thp_split_pmd",
+      "thp_split_page",       "thp_deferred_split_page",
+      "compact_stall",        "compact_fail",       "pgmigrate_success",
+      "numa_pte_updates",     "numa_hint_faults",   "pgsteal_direct",
+      "pgsteal_kswapd",       "pswpin",             "pswpout",
+      "pgfault",
+  };
+  auto printMemState = [](const char* when) {
+    long long rssKb = 0, anonHugeKb = 0;
+    FILE* f = fopen("/proc/self/status", "r");
+    if (f != nullptr) {
+      char line[256];
+      while (fgets(line, sizeof line, f) != nullptr) {
+        sscanf(line, "VmRSS: %lld kB", &rssKb);
+      }
+      fclose(f);
+    }
+    f = fopen("/proc/self/smaps_rollup", "r");
+    if (f != nullptr) {
+      char line[256];
+      while (fgets(line, sizeof line, f) != nullptr) {
+        sscanf(line, "AnonHugePages: %lld kB", &anonHugeKb);
+      }
+      fclose(f);
+    }
+    printf("[mem] %-28s RSS %7.2f GiB   AnonHugePages %7.2f GiB\n", when,
+           rssKb / (1024.0 * 1024.0), anonHugeKb / (1024.0 * 1024.0));
+    fflush(stdout);
+  };
+
+  // One timed phase: warm once, then time the sweep (either REPS times or
+  // in a `loopSec`-second loop for external `perf stat -p` attachment),
+  // bracketing it with the vmstat deltas.
+  double lastMin = 0;
+  auto phase = [&](const char* name, VectorIndex& idx) {
+    (void)idx.searchExactCoarse(s.query, k, std::nullopt, std::nullopt,
+                                checkInterrupt, nullptr,
+                                qlever::vector::I8Kernel::Auto);  // warm
+    auto sweep = [&] {
+      (void)idx.searchExactCoarse(s.query, k, std::nullopt, std::nullopt,
+                                  checkInterrupt, nullptr,
+                                  qlever::vector::I8Kernel::Auto);
+    };
+    // FRESH_WARM: in fresh-thread mode, spin the new master's OpenMP team up
+    // with an EMPTY parallel region before the timed sweep -- separates team
+    // creation/placement (hoistable) from genuine sweep-time overhead.
+    const bool freshWarm = envSize("VECTOR_PERF_FRESH_WARM", 0) != 0;
+    auto run = [&] {
+      if (freshThread) {
+        std::thread t{[&] {
+          setThreads(threads);  // per-thread OpenMP ICV
+          if (freshWarm) {
+#ifdef _OPENMP
+            volatile int sink = 0;
+#pragma omp parallel num_threads(threads)
+            { sink = omp_get_thread_num(); }
+            (void)sink;
+#endif
+          }
+          sweep();
+        }};
+        t.join();
+      } else {
+        sweep();
+      }
+    };
+    auto before = readVmstat();
+    std::vector<double> ms;
+    printf("[phase] %s START pid=%d\n", name, static_cast<int>(getpid()));
+    fflush(stdout);
+    auto gap = [gapMs] {
+      if (gapMs > 0) {
+        usleep(static_cast<useconds_t>(gapMs) * 1000);
+      }
+    };
+    if (loopSec > 0) {
+      const auto until = std::chrono::steady_clock::now() +
+                         std::chrono::seconds(loopSec);
+      while (std::chrono::steady_clock::now() < until) {
+        gap();
+        ms.push_back(timeMs(run));
+      }
+    } else {
+      for (size_t r = 0; r < s.reps; ++r) {
+        gap();
+        ms.push_back(timeMs(run));
+      }
+    }
+    printf("[phase] %s END (%zu sweeps)\n", name, ms.size());
+    auto after = readVmstat();
+    std::sort(ms.begin(), ms.end());
+    char label[96];
+    snprintf(label, sizeof label, "i8 coarse k=%zu [%s]", k, name);
+    report(label, s.n, s.dim, ms.front(), ms[ms.size() / 2]);
+    printf("    p90 %.2f ms  max %.2f ms\n", ms[ms.size() * 9 / 10],
+           ms.back());
+    lastMin = ms.front();
+    bool any = false;
+    for (const char* key : watchedVmstat) {
+      const long long d = after[key] - before[key];
+      if (d != 0) {
+        printf("    vmstat %-24s +%lld\n", key, d);
+        any = true;
+      }
+    }
+    if (!any) {
+      printf("    vmstat: no watched counter moved\n");
+    }
+    fflush(stdout);
+  };
+
+  printf(
+      "\n=== VectorPerf i8 footprint: n=%zu dim=%zu threads=%d k=%zu "
+      "ballast=%zu anonGb=%zu interrupt=%d loopSec=%zu ===\n",
+      s.n, s.dim, threads, k, numBallast, anonGb, interrupt ? 1 : 0, loopSec);
+  printMemState("at start");
+
+  // 1. The measured instance, opened FIRST (like the server's first index).
+  VectorIndex idx0;
+  idx0.open(s.basename, "perf", VectorIndex::Residency::AlignedCopy,
+            VectorIndex::Residency::AlignedCopy);
+  printMemState("idx0 open (aligned i8+bf16)");
+  phase("lean (idx0, before ballast)", idx0);
+
+  // 2. Ballast: N more aligned opens of the same on-disk index. Each owns
+  //    its own aligned RAM copies of both layers. One warm sweep each so
+  //    they are "used" like the server's other indices, then left idle.
+  std::vector<std::unique_ptr<VectorIndex>> ballast;
+  for (size_t i = 0; i < numBallast; ++i) {
+    auto b = std::make_unique<VectorIndex>();
+    const double openMs = timeMs([&] {
+      b->open(s.basename, "perf", VectorIndex::Residency::AlignedCopy,
+              VectorIndex::Residency::AlignedCopy);
+    });
+    (void)b->searchExactCoarse(s.query, 100);
+    printf("[setup] ballast %zu opened in %.0f ms\n", i + 1, openMs);
+    ballast.push_back(std::move(b));
+  }
+  // Optional plain anonymous 4 KiB-page ballast (heap/query-cache shape).
+  std::vector<std::pair<void*, size_t>> anonBallast;
+  for (size_t g = 0; g < anonGb; ++g) {
+    const size_t bytes = size_t{1} << 30;
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(p, MAP_FAILED);
+    // Touch every page; NO MADV_HUGEPAGE (the server heap is 4 KiB pages).
+    std::memset(p, 0x5a, bytes);
+    anonBallast.emplace_back(p, bytes);
+  }
+  printMemState("ballast resident");
+
+  // 3. The SAME instance, same call, now inside the big process.
+  phase("fat (idx0, after ballast)", idx0);
+  const double fatMin = lastMin;
+
+  // 4. An instance opened LATE into the big process (allocation order /
+  //    physical layout of the aligned copy itself).
+  VectorIndex idxLate;
+  idxLate.open(s.basename, "perf", VectorIndex::Residency::AlignedCopy,
+               VectorIndex::Residency::AlignedCopy);
+  printMemState("idxLate open");
+  phase("late (idxLate, opened after ballast)", idxLate);
+
+  // 5. Drop the ballast and re-measure idx0: reversibility separates a
+  //    footprint effect (recovers) from within-process drift (does not).
+  ballast.clear();
+  for (auto [p, bytes] : anonBallast) {
+    munmap(p, bytes);
+  }
+  printMemState("ballast dropped");
+  phase("lean-again (idx0, ballast dropped)", idx0);
+  (void)fatMin;
+}
+
+// ___________________________________________________________________________
+// Persistent-sweep-executor A/B: the whole-index i8 coarse sweep
+// (`searchExactCoarse`, k = VECTOR_PERF_K) timed in four caller shapes:
+//   reused-off   the historical best case -- every sweep from the SAME
+//                (long-lived) master thread, executor disabled;
+//   fresh-off    the OLD server shape -- every sweep from a brand-new
+//                std::thread (a fresh libgomp master: team creation +
+//                placement inside the timed region), executor disabled;
+//   fresh-on     the NEW server shape -- the same fresh caller thread per
+//                sweep, but the sweep is handed to the persistent executor
+//                (one stable, warm, well-placed team);
+//   reused-on    same-thread caller routed through the executor (the
+//                executor handoff cost against reused-off).
+// Target: fresh-on ~ reused-off; fresh-off is the slow outlier.
+// Knobs: the shared VECTOR_PERF_N/DIM/DIR/REPS, VECTOR_PERF_K (default
+// 10000), VECTOR_PERF_THREADS (default: all physical cores),
+// VECTOR_PERF_GAP_MS (idle between timed sweeps, excluded from timings).
+TEST(VectorPerf, DISABLED_i8SweepExecutorBenchmark) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  // Executor OFF during setup/open so no pool exists until the -on phases.
+  setenv("QLEVER_VECTOR_SWEEP_MASTER", "off", 1);
+  BenchSetup s = setupIndexWithScalar(VectorScalar::I8, "i8");
+  const size_t k = envSize("VECTOR_PERF_K", 10000);
+  const int threads = static_cast<int>(
+      envSize("VECTOR_PERF_THREADS", static_cast<size_t>(maxHwThreads())));
+  const size_t gapMs = envSize("VECTOR_PERF_GAP_MS", 0);
+  const size_t reps = envSize("VECTOR_PERF_REPS", 15);
+  setThreads(threads);
+
+  VectorIndex idx;
+  idx.open(s.basename, "perf", VectorIndex::Residency::AlignedCopy,
+           VectorIndex::Residency::AlignedCopy);
+  auto sweep = [&] { (void)idx.searchExactCoarse(s.query, k); };
+  sweep();  // warm the store + the calling thread's team
+
+  printf("\n=== VectorPerf i8 sweep-executor A/B: n=%zu dim=%zu threads=%d "
+         "k=%zu reps=%zu gapMs=%zu ===\n",
+         s.n, s.dim, threads, k, reps, gapMs);
+
+  auto phase = [&](const char* name, bool freshThread, const char* master) {
+    setenv("QLEVER_VECTOR_SWEEP_MASTER", master, 1);
+    // One unmeasured warm sweep per phase (creates the executor pool for the
+    // -on phases so pool creation is not in the timings).
+    sweep();
+    std::vector<double> ms;
+    ms.reserve(reps);
+    for (size_t r = 0; r < reps; ++r) {
+      if (gapMs > 0) {
+        usleep(static_cast<useconds_t>(gapMs) * 1000);
+      }
+      ms.push_back(timeMs([&] {
+        if (freshThread) {
+          std::thread t{[&] {
+            setThreads(threads);  // per-thread OpenMP ICV
+            sweep();
+          }};
+          t.join();
+        } else {
+          sweep();
+        }
+      }));
+    }
+    std::sort(ms.begin(), ms.end());
+    char label[96];
+    snprintf(label, sizeof label, "i8 coarse k=%zu [%s]", k, name);
+    report(label, s.n, s.dim, ms.front(), ms[ms.size() / 2]);
+    printf("    p90 %.2f ms  max %.2f ms\n", ms[ms.size() * 9 / 10],
+           ms.back());
+    fflush(stdout);
+  };
+
+  phase("reused-off", false, "off");
+  phase("fresh-off (old server shape)", true, "off");
+  phase("fresh-on (new server shape)", true, "on");
+  phase("reused-on", false, "on");
+  unsetenv("QLEVER_VECTOR_SWEEP_MASTER");
+}
+
+// ___________________________________________________________________________
+// Software-prefetch matrix for BOTH contiguous block kernels (the i8 VNNI
+// coarse sweep and the bf16 SIMD fine sweep): OFF, T2/T1/T0 at 4-, 8-, and
+// 16-row leads. `QLEVER_VECTOR_SEARCH_PREFETCH` is flipped per phase and
+// re-parsed via `refreshPrefetchConfigFromEnv()`. k=100 keeps both routes on
+// the blocked-sweep + bounded-heap path, so the timing is dominated by the
+// sweep itself. Default VECTOR_PERF_THREADS here is 12 (the reviewer's
+// matrix point); override to taste. Bit-identical by construction (a
+// prefetch is a hint), so only wall clock is reported.
+TEST(VectorPerf, DISABLED_prefetchMatrixBenchmark) {
+  setenv("QLEVER_VECTOR_SEARCH_THREADS", "4096", 1);
+  BenchSetup s = setupIndexWithScalar(VectorScalar::I8, "i8");
+  const int threads =
+      static_cast<int>(envSize("VECTOR_PERF_THREADS", size_t{12}));
+  const size_t reps = envSize("VECTOR_PERF_REPS", 9);
+  setThreads(threads);
+
+  VectorIndex idx;
+  idx.open(s.basename, "perf", VectorIndex::Residency::AlignedCopy,
+           VectorIndex::Residency::AlignedCopy);
+  const size_t k = 100;  // heap route on both layers -> sweep-dominated
+  auto i8Sweep = [&] { (void)idx.searchExactCoarse(s.query, k); };
+  auto bf16Sweep = [&] { (void)idx.searchExact(s.query, k); };
+  i8Sweep();
+  bf16Sweep();  // warm
+
+  printf("\n=== VectorPerf prefetch matrix: n=%zu dim=%zu threads=%d "
+         "reps=%zu (i8 row %zu B, bf16 row %zu B) ===\n",
+         s.n, s.dim, threads, reps, s.dim, 2 * s.dim);
+  const char* configs[] = {"off",  "t2x4", "t2x8",  "t2x16", "t1x4",
+                           "t1x8", "t1x16", "t0x4", "t0x8",  "t0x16"};
+  for (const char* cfg : configs) {
+    setenv("QLEVER_VECTOR_SEARCH_PREFETCH", cfg, 1);
+    qlever::vector::i8kernels::refreshPrefetchConfigFromEnv();
+    qlever::vector::bf16kernels::refreshPrefetchConfigFromEnv();
+    auto [i8Min, i8Med] = timeReps(reps, i8Sweep);
+    auto [bfMin, bfMed] = timeReps(reps, bf16Sweep);
+    printf("  %-6s  i8  min %7.2f ms  median %7.2f ms   |  bf16  min %7.2f "
+           "ms  median %7.2f ms\n",
+           cfg, i8Min, i8Med, bfMin, bfMed);
+    fflush(stdout);
+  }
+  unsetenv("QLEVER_VECTOR_SEARCH_PREFETCH");
+  qlever::vector::i8kernels::refreshPrefetchConfigFromEnv();
+  qlever::vector::bf16kernels::refreshPrefetchConfigFromEnv();
+}
+
+// ___________________________________________________________________________
+// Microbenchmark of the i8 finalize alone (no index, no memory sweep): the
+// scalar per-row `angularFinalize` loop (one noinline call + rsqrt of BOTH
+// norm terms per row -- the pre-Task-2 shape) vs the vectorized
+// `angularFinalizeBlock` over precomputed inverse norms, over N production-
+// sized rows, single-threaded. This isolates the finalize's CPU cost from
+// the (memory-bound) block sweep it normally overlaps with; the e2e sweep
+// delta is this divided by the sweep's thread count AND masked by however
+// much of it hides under the DRAM wall.
+TEST(VectorPerf, DISABLED_i8FinalizeMicrobench) {
+  using namespace qlever::vector;
+  if (!i8kernels::vnniAvailable()) {
+    GTEST_SKIP() << "no AVX-512-VNNI on this CPU";
+  }
+  const size_t n = envSize("VECTOR_PERF_N", 2140516);
+  const size_t reps = envSize("VECTOR_PERF_REPS", 9);
+  std::vector<int32_t> dotsBiased(n), sums(n), normSq(n);
+  std::vector<float> invNorm(n), out(n);
+  SplitMix64 rng{42};
+  for (size_t i = 0; i < n; ++i) {
+    dotsBiased[i] = static_cast<int32_t>(rng.next() % 40'000'000u);
+    sums[i] = static_cast<int32_t>(rng.next() % 200'000u) - 100'000;
+    normSq[i] = 1 + static_cast<int32_t>(rng.next() % 19'000'000u);
+    invNorm[i] = i8kernels::finalizeInvSqrt(static_cast<float>(normSq[i]));
+  }
+  const float qNormSq = 14'000'000.f;
+  const float qInv = i8kernels::finalizeInvSqrt(qNormSq);
+  auto scalar = [&] {
+    for (size_t i = 0; i < n; ++i) {
+      const int32_t dot = dotsBiased[i] - 128 * sums[i];
+      out[i] = i8kernels::angularFinalize(static_cast<float>(dot), qNormSq,
+                                          static_cast<float>(normSq[i]));
+    }
+  };
+  auto vectorized = [&] {
+    i8kernels::angularFinalizeBlock(dotsBiased.data(), sums.data(),
+                                    invNorm.data(), n, qInv, out.data());
+  };
+  scalar();
+  vectorized();  // warm
+  auto [sMin, sMed] = timeReps(reps, scalar);
+  auto [vMin, vMed] = timeReps(reps, vectorized);
+  printf("\n=== VectorPerf i8 finalize microbench: n=%zu (single thread) "
+         "===\n",
+         n);
+  printf("  scalar angularFinalize loop   min %7.2f ms  median %7.2f ms\n",
+         sMin, sMed);
+  printf("  vectorized finalize block     min %7.2f ms  median %7.2f ms\n",
+         vMin, vMed);
+  fflush(stdout);
 }

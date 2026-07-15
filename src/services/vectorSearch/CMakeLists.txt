@@ -11,7 +11,8 @@ add_library(vectorStorage
         VectorBf16Kernels.cpp
         VectorI8Kernels.cpp
         VectorIndexBuilder.cpp
-        VectorInputReader.cpp)
+        VectorInputReader.cpp
+        VectorSweepExecutor.cpp)
 qlever_target_link_libraries(vectorStorage util global)
 # usearch is header-only; scope its include directory and configuration to the
 # targets that actually use it (PUBLIC keeps the macros ODR-consistent in every

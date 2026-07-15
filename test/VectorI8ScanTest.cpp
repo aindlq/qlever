@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <random>
 #include <string>
@@ -169,6 +170,65 @@ TEST(VectorI8Kernels, angularFinalizeEdgeCasesAndAccuracy) {
                                                  static_cast<float>(b2));
     EXPECT_NEAR(got, ref, 2e-6)
         << "a2=" << a2 << " b2=" << b2 << " dot=" << dot;
+  }
+}
+
+// The VECTORIZED block finalize (`angularFinalizeBlock` over precomputed
+// inverse norms) must be BIT-IDENTICAL to calling the pinned scalar
+// `angularFinalize(dot, qNormSq, rowNormSq)` per row -- the contract that
+// keeps every i8 route (block sweep, gather, per-row, pair) in exact
+// agreement. Random sidecar values plus the adversarial cases: dot == 0
+// rows (the scalar's 1.0f early-out), sim > 1 rows (the 0-clamp), negative
+// dots, huge dots (i32->f32 rounding), and every 16-lane tail size.
+TEST(VectorI8Kernels, vectorizedBlockFinalizeBitIdenticalToScalar) {
+  if (!i8kernels::vnniAvailable()) {
+    GTEST_SKIP() << "no AVX-512-VNNI on this CPU";
+  }
+  std::mt19937 rng(99);
+  std::uniform_int_distribution<int32_t> dSum(-120'000, 120'000);
+  std::uniform_int_distribution<int32_t> dDot(-40'000'000, 40'000'000);
+  std::uniform_int_distribution<int32_t> dNorm(1, 19'000'000);
+  for (size_t count : {size_t{1}, size_t{7}, size_t{15}, size_t{16},
+                       size_t{17}, size_t{33}, size_t{1000}}) {
+    std::vector<int32_t> dotsBiased(count), sums(count), normSq(count);
+    std::vector<float> invNorm(count);
+    for (size_t i = 0; i < count; ++i) {
+      sums[i] = dSum(rng);
+      dotsBiased[i] = dDot(rng);
+      normSq[i] = dNorm(rng);
+      invNorm[i] = i8kernels::finalizeInvSqrt(static_cast<float>(normSq[i]));
+    }
+    if (count >= 4) {
+      // dot == 0 (biased dot exactly cancels the 128*sum correction).
+      dotsBiased[0] = 128 * sums[0];
+      // sim >> 1 -> the 0-clamp: tiny norms, large positive dot.
+      normSq[1] = 1;
+      invNorm[1] = i8kernels::finalizeInvSqrt(1.0f);
+      dotsBiased[1] = 128 * sums[1] + 1'000'000;
+      // Large-magnitude negative dot (dist > 1 region).
+      dotsBiased[2] = 128 * sums[2] - 35'000'000;
+      // |dot| > 2^24: the i32->f32 conversion rounds; both paths must round
+      // identically.
+      dotsBiased[3] = 128 * sums[3] + ((1 << 24) + 3);
+    }
+    for (const int32_t qNormSqI : {12, 1'000'000, 19'000'000}) {
+      const float qNormSq = static_cast<float>(qNormSqI);
+      const float qInv = i8kernels::finalizeInvSqrt(qNormSq);
+      std::vector<float> got(count, -42.f);
+      i8kernels::angularFinalizeBlock(dotsBiased.data(), sums.data(),
+                                      invNorm.data(), count, qInv, got.data());
+      for (size_t i = 0; i < count; ++i) {
+        const int32_t dot = dotsBiased[i] - 128 * sums[i];
+        const float ref = i8kernels::angularFinalize(
+            static_cast<float>(dot), qNormSq, static_cast<float>(normSq[i]));
+        uint32_t gotBits, refBits;
+        std::memcpy(&gotBits, &got[i], sizeof(gotBits));
+        std::memcpy(&refBits, &ref, sizeof(refBits));
+        ASSERT_EQ(gotBits, refBits)
+            << "count=" << count << " i=" << i << " qNormSq=" << qNormSq
+            << " got=" << got[i] << " ref=" << ref;
+      }
+    }
   }
 }
 

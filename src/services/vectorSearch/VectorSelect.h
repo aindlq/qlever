@@ -18,6 +18,8 @@
 #include <utility>
 #include <vector>
 
+#include "services/vectorSearch/VectorSweepExecutor.h"
+
 namespace qlever::vector {
 
 // O(n) selection of the `m` smallest `(distance, index)` pairs -- ascending
@@ -55,9 +57,19 @@ namespace qlever::vector {
 // `numThreads` > 1 parallelizes the two O(n) passes (binning + collect) over
 // contiguous index ranges; the result is independent of the thread count
 // (each pass writes disjoint state; the merge/sort is deterministic).
+//
+// `collectedCount` (optional out-param): the number of pairs the collect
+// pass gathered, i.e. the `nth_element` input size -- `m` plus the boundary
+// bucket's overshoot. Clustered distances (many rows sharing the boundary
+// bucket) inflate it; callers log it so a pathological distribution is
+// visible in production.
 inline std::vector<std::pair<float, uint64_t>> selectSmallestPairsFloat(
-    const float* dists, size_t n, size_t m, int numThreads) {
+    const float* dists, size_t n, size_t m, int numThreads,
+    size_t* collectedCount = nullptr) {
   using Pair = std::pair<float, uint64_t>;
+  if (collectedCount != nullptr) {
+    *collectedCount = 0;
+  }
   m = std::min(m, n);
   if (m == 0) {
     return {};
@@ -88,10 +100,12 @@ inline std::vector<std::pair<float, uint64_t>> selectSmallestPairsFloat(
   };
 #ifdef _OPENMP
   if (nt > 1) {
+    runVectorSweep({}, [&] {
 #pragma omp parallel for schedule(static) num_threads(numThreads)
-    for (size_t t = 0; t < nt; ++t) {
-      binRange(t);
-    }
+      for (size_t t = 0; t < nt; ++t) {
+        binRange(t);
+      }
+    });
   } else
 #endif
   {
@@ -137,10 +151,12 @@ inline std::vector<std::pair<float, uint64_t>> selectSmallestPairsFloat(
   };
 #ifdef _OPENMP
   if (nt > 1) {
+    runVectorSweep({}, [&] {
 #pragma omp parallel for schedule(static) num_threads(numThreads)
-    for (size_t t = 0; t < nt; ++t) {
-      collectRange(t);
-    }
+      for (size_t t = 0; t < nt; ++t) {
+        collectRange(t);
+      }
+    });
   } else
 #endif
   {
@@ -158,6 +174,9 @@ inline std::vector<std::pair<float, uint64_t>> selectSmallestPairsFloat(
     for (const auto& p : parts) {
       all.insert(all.end(), p.begin(), p.end());
     }
+  }
+  if (collectedCount != nullptr) {
+    *collectedCount = all.size();
   }
   if (all.size() > m) {
     std::nth_element(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(m),

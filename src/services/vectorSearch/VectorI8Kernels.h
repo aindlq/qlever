@@ -61,6 +61,13 @@ namespace qlever::vector::i8kernels {
 // AVX-512-VNNI (+f/bw/vl) is present.
 bool vnniAvailable();
 
+// Re-read `QLEVER_VECTOR_SEARCH_PREFETCH` (the contiguous-sweep prefetch
+// policy: `off`, `t0x<N>`/`t1x<N>`/`t2x<N>` = hint + N-rows-ahead lead,
+// default = the measured winner). The policy is parsed once at first use;
+// this refresh exists for the prefetch benchmark, which flips the env
+// between timed phases inside one process.
+void refreshPrefetchConfigFromEnv();
+
 // The exact integer `sum(v)` and `sum(v^2)` of one i8 vector -- the per-row
 // sidecar terms (and the query-side `|q|^2`). Portable scalar (exact for the
 // full i8 range including -128); runs once per row at open / once per query.
@@ -97,6 +104,28 @@ void dotGatherVnni(const uint8_t* qx, const char* base, size_t rowStrideBytes,
 // calls exactly this function, so all agree to the bit. Works on any x86;
 // the (never-selected) non-x86 stub returns 0.
 float angularFinalize(float dot, float a2, float b2);
+
+// The rsqrt + one-NR-step refinement of `angularFinalize`, alone: bit-equal
+// to the inverse square root `angularFinalize` computes internally for `x`
+// (same estimate, same refinement sequence, pinned noinline in the same
+// baseline TU). For the per-row inverse-norm sidecar built at open and the
+// once-per-query inverse query norm of `angularFinalizeBlock`.
+float finalizeInvSqrt(float x);
+
+// The VECTORIZED (16 rows/iteration AVX-512) sibling of calling
+// `angularFinalize(dotBiased[j] - 128*rowSums[j], qNormSq, rowNormSq[j])`
+// per row, with both inverse norms PRECOMPUTED via `finalizeInvSqrt`:
+//   out[j] = max(0, 1 - (f32(dot) * qInv) * rowInvNorms[j]),   dot != 0
+//   out[j] = 1,                                                 dot == 0
+// BIT-IDENTICAL to the scalar finalize for every row (same integer dot, same
+// i32->f32 rounding, the identical rsqrt+NR inverse norms, the same multiply
+// order with contraction blocked). PRECONDITION: the query norm is nonzero
+// (`qInv = finalizeInvSqrt(qNormSq)`, qNormSq > 0) -- a zero-norm query must
+// take the scalar per-row fallback (its `a2 == 0 && b2 == 0 -> 0` convention
+// is not vectorized). Requires AVX-512F (guaranteed by `vnniAvailable()`).
+void angularFinalizeBlock(const int32_t* dotsBiased, const int32_t* rowSums,
+                          const float* rowInvNorms, size_t count, float qInv,
+                          float* out);
 
 }  // namespace qlever::vector::i8kernels
 
