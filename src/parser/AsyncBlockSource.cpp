@@ -13,6 +13,7 @@
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/post.hpp>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -48,7 +49,18 @@ BlockingBlockSource::BlockingBlockSource(const net::any_io_executor& exec,
 
 // ____________________________________________________________________________
 void BlockingBlockSource::asyncGetNextBlockImpl(Handler handler) {
-  net::post(strand_, [this, h = std::move(handler)]() mutable {
+  // NOTE: The `Handler` (an `absl::AnyInvocable`) is over-aligned: its inline
+  // storage has `alignof(std::max_align_t)` (16 on x86-64). A callable passed
+  // to `net::post` gets embedded into an Asio operation object, and Asio
+  // compiles all of its internal structures under `#pragma pack(push, 8)` on
+  // Windows (`boost/asio/detail/push_options.hpp`), which caps the member
+  // alignment at 8. GCC on MinGW silently lays the operation out with the
+  // `AnyInvocable` at an 8-byte-aligned offset but still emits aligned 16-byte
+  // SSE stores for its relocation -> guaranteed alignment fault (crash) at
+  // runtime. Box the handler so that the posted callable only captures
+  // pointers and can be embedded in a packed Asio operation on every platform.
+  auto boxedHandler = std::make_unique<Handler>(std::move(handler));
+  auto task = [this, h = std::move(boxedHandler)]() mutable {
     // NOTE: The handler is deliberately invoked *outside* the `try` block:
     // the `try` must only guard `getNextBlockImpl()`. Otherwise an exception
     // thrown from within the handler chain itself (which for wrapper sources
@@ -59,10 +71,14 @@ void BlockingBlockSource::asyncGetNextBlockImpl(Handler handler) {
     try {
       block = getNextBlockImpl();
     } catch (...) {
-      return h(std::current_exception(), std::nullopt);
+      return (*h)(std::current_exception(), std::nullopt);
     }
-    h(nullptr, std::move(block));
-  });
+    (*h)(nullptr, std::move(block));
+  };
+  static_assert(alignof(decltype(task)) <= 8,
+                "Callables posted to an Asio executor must not be "
+                "over-aligned, see the comment above");
+  net::post(strand_, std::move(task));
 }
 
 // ____________________________________________________________________________
