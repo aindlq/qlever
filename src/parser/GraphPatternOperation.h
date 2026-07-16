@@ -17,6 +17,7 @@
 #include "parser/DatasetClauses.h"
 #include "parser/ExternalValuesQuery.h"
 #include "parser/GraphPattern.h"
+#include "parser/MagicServiceQuery.h"
 #include "parser/MaterializedViewQuery.h"
 #include "parser/NamedCachedResult.h"
 #include "parser/PathQuery.h"
@@ -213,13 +214,23 @@ struct Bind {
   [[nodiscard]] std::string getDescriptor() const;
 };
 
+// A generic magic-`SERVICE` node holding a polymorphic configuration. A custom
+// operation registers a parser factory (`MagicServiceRegistry`) and a planner
+// handler (`MagicServicePlannerRegistry`) and lands here, without being added
+// to this variant or the parser/planner dispatch. Drop-in operations live under
+// `src/extensions/`. NOTE: the config is held by `shared_ptr`, so copies of a
+// `ParsedQuery` alias it; the planner treats it as read-only.
+struct MagicService {
+  std::shared_ptr<MagicServiceQuery> query_;
+};
+
 // TODO<joka921> Further refactor this, s.t. the whole `GraphPatternOperation`
 // class actually becomes `using GraphPatternOperation = std::variant<...>`
 using GraphPatternOperationVariant =
     std::variant<Optional, Union, Subquery, TransPath, Bind, BasicGraphPattern,
                  Values, Service, PathQuery, SpatialQuery, TextSearchQuery,
                  Minus, GroupGraphPattern, Describe, Load, NamedCachedResult,
-                 MaterializedViewQuery, ExternalValuesQuery>;
+                 MaterializedViewQuery, ExternalValuesQuery, MagicService>;
 struct GraphPatternOperation
     : public GraphPatternOperationVariant,
       public VisitMixin<GraphPatternOperation, GraphPatternOperationVariant> {

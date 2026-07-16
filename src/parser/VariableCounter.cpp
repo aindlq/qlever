@@ -175,4 +175,14 @@ void VariableCounter::operator()(const ExternalValuesQuery& op) {
   (*this)(op.variables_);
 }
 
+// _____________________________________________________________________________
+void VariableCounter::operator()(const MagicService& op) {
+  // Only the nested pattern is generically accessible; the config triples'
+  // variables are subtype-specific. This is safe because a `MagicService`
+  // disables the pattern trick (see `CheckUsePatternTrick`).
+  if (op.query_) {
+    (*this)(op.query_->childGraphPattern_);
+  }
+}
+
 }  // namespace parsedQuery

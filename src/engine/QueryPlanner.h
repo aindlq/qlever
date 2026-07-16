@@ -431,18 +431,25 @@ class QueryPlanner {
   static std::optional<SubtreePlan> createJoinWithPathSearch(
       const SubtreePlan& a, const SubtreePlan& b, const JoinColumns& jcs);
 
-  // Helper that returns `true` for each of the subtree plans `a` and `b` iff
-  // the subtree plan is a spatial join and it is not yet fully constructed
-  // (it does not have both children set)
-  static std::pair<bool, bool> checkSpatialJoin(const SubtreePlan& a,
-                                                const SubtreePlan& b);
+  // Returns `true` for each of `a` and `b` iff its root is an incomplete
+  // `IncompleteJoinOperation` (a `SpatialJoin` or a registry-based magic
+  // service, e.g. an outer-bound vector-search join) still missing a join
+  // child. Such an operation must not take part in a normal join.
+  static std::pair<bool, bool> checkIncompleteJoin(const SubtreePlan& a,
+                                                   const SubtreePlan& b);
 
-  // if one of the inputs is a spatial join which is compatible with the other
-  // input, then add that other input to the spatial join as a child instead of
-  // creating a normal join.
-  static std::optional<SubtreePlan> createSpatialJoin(const SubtreePlan& a,
-                                                      const SubtreePlan& b,
-                                                      const JoinColumns& jcs);
+  // If exactly one input is an incomplete `IncompleteJoinOperation` compatible
+  // with the other input, complete it by adding the other input as its missing
+  // child. `.completed` holds the resulting plan; if empty, `.fallThrough` says
+  // whether the caller should still try a normal join (spatial filter
+  // substitution) or block the pairing entirely (completion required).
+  struct IncompleteJoinResult {
+    std::optional<SubtreePlan> completed;
+    bool fallThrough = false;
+  };
+  static IncompleteJoinResult createIncompleteJoin(const SubtreePlan& a,
+                                                   const SubtreePlan& b,
+                                                   const JoinColumns& jcs);
 
   // Helper that generates `IndexScan` query plans on materialized views if they
   // can be used to avoid joins between some of the `triples`. The resulting
@@ -679,6 +686,10 @@ class QueryPlanner {
     void visitTransitivePath(parsedQuery::TransPath& transitivePath);
     void visitPathSearch(parsedQuery::PathQuery& config);
     void visitSpatialSearch(parsedQuery::SpatialQuery& config);
+    // Generic dispatch for a `MagicService` node: looks the concrete query type
+    // up in `MagicServicePlannerRegistry` and runs its registered handler via a
+    // stable façade. No per-service code in the planner.
+    void planMagicService(parsedQuery::MagicServiceQuery& query);
     void visitTextSearch(const parsedQuery::TextSearchQuery& config);
     void visitExternalValues(const parsedQuery::ExternalValuesQuery& config);
     void visitNamedCachedResult(const parsedQuery::NamedCachedResult& config);

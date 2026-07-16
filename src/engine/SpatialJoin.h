@@ -16,6 +16,7 @@
 #include <optional>
 #include <variant>
 
+#include "engine/MagicServicePlanning.h"
 #include "engine/Operation.h"
 #include "engine/SpatialJoinConfig.h"
 #include "global/Id.h"
@@ -45,7 +46,7 @@ struct PreparedSpatialJoinParams {
 // This class is implementing a SpatialJoin operation. This operations joins
 // two tables, using their positional column. It supports nearest neighbor
 // search as well as search of all points within a given range.
-class SpatialJoin : public Operation {
+class SpatialJoin : public Operation, public IncompleteJoinOperation {
  public:
   // creates a SpatialJoin operation: the required configuration object
   // can for example be obtained from the SpatialQuery class. Children are
@@ -99,6 +100,29 @@ class SpatialJoin : public Operation {
   // QueryPlanner stops trying to add children, after the SpatialJoin is
   // already constructed
   bool isConstructed() const;
+
+  // `IncompleteJoinOperation` interface (see `engine/MagicServicePlanning.h`);
+  // a spatial join has two potential join variables (`config_.left_`/`right_`).
+  bool isJoinConstructed() const override { return isConstructed(); }
+  bool canBindJoinVariable(const Variable& var) const override {
+    return var == config_.left_ || var == config_.right_;
+  }
+  // When a spatial join substitutes a geo filter it may legitimately share a
+  // variable with several joins; a normal join between the two is acceptable.
+  bool allowsNormalJoinOnMultipleVariables() const override {
+    return substitutesFilterOp_;
+  }
+  std::string multipleJoinVariablesError() const override {
+    // NOTE: message kept byte-for-byte (including the missing space in
+    // "theSpatialJoin") for backward compatibility with existing tests.
+    return "Currently, if both sides of a SpatialJoin are variables, then the"
+           "SpatialJoin must be the only connection between these variables";
+  }
+  std::shared_ptr<Operation> addJoinChild(
+      std::shared_ptr<QueryExecutionTree> child,
+      const Variable& var) const override {
+    return addChild(std::move(child), var);
+  }
 
   // this function is used to give the maximum distance for internal purposes
   std::optional<double> getMaxDist() const;
