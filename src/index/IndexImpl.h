@@ -12,6 +12,7 @@
 #include <re2/re2.h>
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -587,8 +588,8 @@ class IndexImpl {
       size_t numLines, size_t numFiles, size_t actualCurrentPartialSize,
       ItemMapArray items,
       std::vector<std::array<Id, NumColumnsIndexBuilding>> localIds,
-      ad_utility::Synchronized<std::unique_ptr<TripleVec>>* globalWritePtr)
-      const;
+      ad_utility::Synchronized<std::unique_ptr<TripleVec>, std::mutex>*
+          globalWritePtr) const;
 
   // Return a Turtle parser that parses the given file. The parser will be
   // configured to either parse in parallel or not, and to either use the
