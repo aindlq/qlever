@@ -24,6 +24,8 @@
 #include <unistd.h>
 
 #include <fstream>
+#elif defined(_WIN32)
+#include <psapi.h>
 #endif
 
 namespace ad_utility::resource_monitor {
@@ -44,6 +46,13 @@ std::optional<uint64_t> currentRssBytes() {
 #elif defined(__linux__)
   std::ifstream statm{"/proc/self/statm"};
   return rssBytesFromStatm(statm);
+#elif defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS counters{};
+  counters.cb = sizeof(counters);
+  if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+    return std::nullopt;
+  }
+  return static_cast<uint64_t>(counters.WorkingSetSize);
 #else
   return std::nullopt;
 #endif
@@ -77,6 +86,23 @@ std::optional<double> cpuTimeSeconds() {
            static_cast<double>(time.tv_usec) * 1e-6;
   };
   return toSeconds(usage.ru_utime) + toSeconds(usage.ru_stime);
+#elif defined(_WIN32)
+  FILETIME creationTime{};
+  FILETIME exitTime{};
+  FILETIME kernelTime{};
+  FILETIME userTime{};
+  if (!GetProcessTimes(GetCurrentProcess(), &creationTime, &exitTime,
+                       &kernelTime, &userTime)) {
+    return std::nullopt;
+  }
+  auto toTicks = [](const FILETIME& time) {
+    ULARGE_INTEGER ticks{};
+    ticks.LowPart = time.dwLowDateTime;
+    ticks.HighPart = time.dwHighDateTime;
+    return ticks.QuadPart;
+  };
+  // Process times are reported in 100-nanosecond ticks.
+  return static_cast<double>(toTicks(kernelTime) + toTicks(userTime)) * 1e-7;
 #else
   return std::nullopt;
 #endif
@@ -131,7 +157,6 @@ void ResourceMonitor::start(const ql::filesystem::path& path, Mode mode,
                     "ResourceMonitor::start may only be called once.");
   AD_CONTRACT_CHECK(interval > std::chrono::milliseconds{0},
                     "The resource-usage sampling interval must be positive.");
-#if defined(__APPLE__) || defined(__linux__)
   // Monitoring is optional: on an unwritable file, warn and let QLever run
   // on rather than aborting the process.
   namespace fs = ql::filesystem;
@@ -164,15 +189,6 @@ void ResourceMonitor::start(const ql::filesystem::path& path, Mode mode,
                    << std::endl;
     }
   }};
-#else
-  // No implementation for this platform, and monitoring is optional: skip
-  // it and let QLever run normally rather than failing.
-  (void)path;
-  (void)mode;
-  AD_LOG_WARN << "ResourceMonitor: not supported on this platform; "
-                 "continuing without a resource-usage log."
-              << std::endl;
-#endif
 }
 
 // _____________________________________________________________________________
