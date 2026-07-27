@@ -468,19 +468,6 @@ endif ()
 addLinkAndDiscoverTest(UniqueCleanupTest)
 
 addLinkAndDiscoverTest(WebSocketSessionTest http)
-if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # WORKAROUND: GCC 13 on MinGW (SEH, x64) miscompiles the SEH unwind tables
-    # (.pdata/.xdata) for some C++20 coroutine frames. When an exception (e.g. an
-    # Asio `operation_aborted` from a cancellation) unwinds through such a frame,
-    # `_Unwind_Resume` jumps to a NULL target -> STATUS_BAD_FUNCTION_TABLE crash.
-    # The faulting frame is a `.cold` clone; disabling the hot/cold block
-    # partitioning that creates `.cold`/`.text.unlikely` sections avoids it.
-    # set_source_files_properties (not target_compile_options) so this also works
-    # with SINGLE_TEST_BINARY=ON, where WebSocketSessionTest.cpp is compiled into
-    # QLeverAllUnitTestsMain and no per-test target exists.
-    set_source_files_properties(WebSocketSessionTest.cpp PROPERTIES
-            COMPILE_OPTIONS -fno-reorder-blocks-and-partition)
-endif ()
 
 addLinkAndDiscoverTest(QueryIdTest)
 

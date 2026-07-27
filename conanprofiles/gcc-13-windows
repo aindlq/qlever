@@ -19,12 +19,14 @@ compiler.threads=posix
 compiler.exception=seh
 
 [conf]
+{% set qlever_winlibs_dir = os.getenv("QLEVER_WINLIBS_DIR", "C:/winlibs13") %}
+{% set qlever_msys2_dir = os.getenv("QLEVER_MSYS2_DIR", "C:/msys64") %}
 # Absolute paths, not bare "gcc"/"g++": Boost's b2 writes `using gcc : : "g++" ;`
 # into user-config.jam and its find-compiler cannot resolve a bare/quoted command
 # on Windows, so a bare-name profile dies at b2 toolset init. Point at the winlibs
-# toolchain explicitly (adjust the prefix if winlibs is installed elsewhere).
-tools.build:compiler_executables={"c": "C:/winlibs13/mingw64/bin/gcc.exe", "cpp": "C:/winlibs13/mingw64/bin/g++.exe"}
+# toolchain explicitly. Override QLEVER_WINLIBS_DIR for a non-default location.
+tools.build:compiler_executables={"c": "{{ qlever_winlibs_dir }}/mingw64/bin/gcc.exe", "cpp": "{{ qlever_winlibs_dir }}/mingw64/bin/g++.exe"}
 # Autotools-based dependencies (OpenSSL, ICU) need a Unix shell + make; route
-# them through the runner's MSYS2 bash.
+# them through MSYS2 bash. Override QLEVER_MSYS2_DIR if needed.
 tools.microsoft.bash:subsystem=msys2
-tools.microsoft.bash:path=C:/msys64/usr/bin/bash.exe
+tools.microsoft.bash:path={{ qlever_msys2_dir }}/usr/bin/bash.exe
