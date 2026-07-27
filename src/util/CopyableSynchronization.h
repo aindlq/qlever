@@ -6,9 +6,10 @@
 #ifndef QLEVER_SRC_UTIL_COPYABLESYNCHRONIZATION_H
 #define QLEVER_SRC_UTIL_COPYABLESYNCHRONIZATION_H
 
+#include <absl/synchronization/mutex.h>
+
 #include <atomic>
 #include <mutex>
-#include <shared_mutex>
 
 namespace ad_utility {
 // A mutex that can be "copied". The semantics are that copying will create a
@@ -26,7 +27,7 @@ struct CopyableMutexImpl : Mutex {
 };
 
 using CopyableMutex = CopyableMutexImpl<std::mutex>;
-using CopyableSharedMutex = CopyableMutexImpl<std::shared_mutex>;
+using CopyableSharedMutex = CopyableMutexImpl<absl::Mutex>;
 
 // A `std::atomic` that can be "copied". The semantics are, that copying will
 // create a new atomic that is initialized with the value being copied. This is

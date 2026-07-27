@@ -7,8 +7,11 @@
 #ifndef QLEVER_SYNCHRONIZED_H
 #define QLEVER_SYNCHRONIZED_H
 
+#include <absl/synchronization/mutex.h>
+
 #include <atomic>
 #include <condition_variable>
+#include <mutex>
 #include <shared_mutex>
 
 #include "backports/atomic_flag.h"
@@ -72,10 +75,10 @@ class LockPtr;
  * simpler to only meet our needs)
  *
  * @tparam T The actual type that is stored
- * @tparam Mutex A Mutex like type (e.g. std::mutex or std::shared_mutex).
- * Defaults to std::shared_mutex
+ * @tparam Mutex A Mutex-like type (e.g. `std::mutex` or `absl::Mutex`).
+ * Defaults to `absl::Mutex`.
  */
-template <typename T, typename Mutex = std::shared_mutex,
+template <typename T, typename Mutex = absl::Mutex,
           typename = std::enable_if_t<AllowsLocking<Mutex>::value>>
 class Synchronized {
  public:

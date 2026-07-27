@@ -325,7 +325,8 @@ function(qlever_target_link_libraries target)
         set(QLEVER_BOOST_FILESYSTEM_LIB "")
     endif()
     target_link_libraries(${target} ${ARGN} absl::compare absl::flat_hash_map
-            absl::flat_hash_set absl::strings absl::str_format ICU::uc
+            absl::flat_hash_set absl::strings absl::str_format
+            absl::synchronization ICU::uc
             ICU::i18n OpenSSL::SSL OpenSSL::Crypto GTest::gtest GTest::gmock fsst nlohmann_json::nlohmann_json Boost::container ${QLEVER_BOOST_FILESYSTEM_LIB} uriparser)
 
     # memorySize is a utility library for defining memory sizes.
@@ -536,6 +537,19 @@ if (EMSCRIPTEN)
     add_compile_definitions(GTEST_HAS_PTHREAD=1)
 endif ()
 FetchContent_MakeAvailable(googletest ctre abseil re2 fsst s2 nlohmann-json antlr range-v3 spatialjoin uriparser opentelemetry-cpp)
+
+# ANTLR officially supports Abseil as an alternative synchronization and
+# container backend. Keep the definition and libraries transitive because
+# ANTLR's public headers select their types with this macro. Also define it for
+# QLever targets that include those headers without linking ANTLR directly.
+# Use the plain target_link_libraries signature to match ANTLR.
+target_compile_definitions(antlr4_static PUBLIC ANTLR4CPP_USING_ABSEIL=1)
+target_link_libraries(antlr4_static
+        absl::flat_hash_map
+        absl::flat_hash_set
+        absl::synchronization)
+add_compile_definitions(ANTLR4CPP_USING_ABSEIL=1)
+
 # Disable some warnings in RE2 and GTEST
 target_compile_options(s2 PRIVATE -Wno-sign-compare -Wno-unused-parameter -Wno-class-memaccess -Wno-comment -Wno-redundant-move -Wno-unknown-warning-option -Wno-maybe-uninitialized -Wno-class-memaccess -Wno-unused-but-set-variable -Wno-unused-function -Wno-nullability-completeness)
 target_compile_options(re2 PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations)
