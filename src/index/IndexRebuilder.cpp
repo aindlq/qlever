@@ -10,19 +10,23 @@
 #ifndef QLEVER_REDUCED_FEATURE_SET_FOR_CPP17
 #include "index/IndexRebuilder.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 
 #include <array>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/this_coro.hpp>
-#include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/use_future.hpp>
 #include <cstdint>
 #include <fstream>
+#include <future>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -43,6 +47,7 @@
 #include "util/HashMap.h"
 #include "util/InputRangeUtils.h"
 #include "util/Log.h"
+#include "util/jthread.h"
 
 namespace qlever::indexRebuilder {
 
@@ -471,19 +476,27 @@ indexRebuilder::IndexRebuildMapping materializeToIndex(
   auto patternThreads = static_cast<size_t>(index.usePatterns());
   size_t numberOfPermutations = index.hasAllPermutations() ? 8 : 4;
   namespace net = boost::asio;
-  net::thread_pool threadPool{patternThreads + numberOfPermutations};
-
-  // Collect the first exception thrown by any worker so it can be rethrown to
-  // the caller after `threadPool.join()`. Without this, exceptions escaping a
-  // `net::post` handler call `std::terminate` and exceptions from a detached
-  // `co_spawn` are silently swallowed. NOTE: `exceptionCollector` must outlive
-  // `threadPool`, since the worker callables capture a pointer to it via
-  // `wrap()` / `std::ref`; the declaration order here guarantees that.
+  // Keep the scheduler and exception collector alive until all workers join.
+  net::io_context ioContext;
   ad_utility::ExceptionCollector exceptionCollector;
+  auto ioWorkGuard = net::make_work_guard(ioContext);
+  std::vector<ad_utility::JThread> poolThreads;
+  poolThreads.reserve(patternThreads + numberOfPermutations);
+  for (size_t i = 0; i < patternThreads + numberOfPermutations; ++i) {
+    poolThreads.emplace_back([&ioContext]() { ioContext.run(); });
+  }
+  absl::Cleanup joinPool{[&ioWorkGuard, &poolThreads]() {
+    ioWorkGuard.reset();
+    for (auto& t : poolThreads) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
+  }};
 
   if (index.usePatterns()) {
-    net::post(threadPool, exceptionCollector.wrap([&newIndex, &index,
-                                                   &insertionPositions]() {
+    net::post(ioContext, exceptionCollector.wrap([&newIndex, &index,
+                                                  &insertionPositions]() {
       newIndex.getPatterns() = index.getPatterns().cloneAndRemap(
           [&insertionPositions](const Id& oldId) {
             return remapVocabId(oldId, insertionPositions);
@@ -504,6 +517,7 @@ indexRebuilder::IndexRebuildMapping materializeToIndex(
     permutationSettings.push_back({{OPS, OSP}, false});
   }
 
+  std::vector<std::future<void>> writerFutures;
   for (const auto& [permutationEnums, isInternal] : permutationSettings) {
     auto [a, b] = permutationEnums;
     auto getPermutation =
@@ -512,16 +526,20 @@ indexRebuilder::IndexRebuildMapping materializeToIndex(
       return isInternal ? perm.internalPermutation() : perm;
     };
 
-    net::co_spawn(
-        threadPool,
+    writerFutures.push_back(net::co_spawn(
+        ioContext,
         createPermutationWriterTask(
             newIndex, getPermutation(a), getPermutation(b), isInternal,
             locatedTriplesSharedState, localVocabMapping, insertionPositions,
             blankNodeBlocks, minBlankNodeIndex, cancellationHandle),
-        std::ref(exceptionCollector));
+        net::use_future));
   }
 
-  threadPool.join();
+  for (auto& writerFuture : writerFutures) {
+    writerFuture.get();
+  }
+  // Join before rethrowing an exception collected by the pattern task.
+  std::move(joinPool).Invoke();
   exceptionCollector.rethrowIfException();
 
   REBUILD_LOG_INFO << "Index rebuild completed" << std::endl;
