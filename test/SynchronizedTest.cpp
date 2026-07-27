@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <shared_mutex>
+
 #include "util/Synchronized.h"
 
 using ad_utility::Synchronized;

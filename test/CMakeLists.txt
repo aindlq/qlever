@@ -249,6 +249,8 @@ addLinkAndDiscoverTest(PriorityQueueTest)
 
 addLinkAndDiscoverTestNoLibs(SynchronizedTest)
 
+addLinkAndDiscoverTestNoLibs(AbslMutexTest)
+
 addLinkAndDiscoverTest(AllocatorWithLimitTest)
 
 addLinkAndDiscoverTest(VectorWithMemoryLimitTest)
