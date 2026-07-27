@@ -43,7 +43,7 @@ using ad_utility::testing::readLines;
 
 // _____________________________________________________________________________
 TEST(ResourceMonitor, ReadsCurrentMemoryAndCpuUsage) {
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
   // Both readings are implemented here, so each returns a value: the
   // running process always has some resident memory and has spent a
   // non-negative amount of CPU time.
