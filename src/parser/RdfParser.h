@@ -15,6 +15,7 @@
 
 #include <future>
 #include <locale>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -709,7 +710,8 @@ class RdfParallelParser : public Parser {
   // Collect error messages in case of multiple failures. The `size_t` is the
   // start position of the corresponding batch, used to order the errors in case
   // the batches are finished out of order.
-  ad_utility::Synchronized<std::vector<std::pair<size_t, std::string>>>
+  ad_utility::Synchronized<std::vector<std::pair<size_t, std::string>>,
+                           std::mutex>
       errorMessages_;
   // The parallel parsers need to know when the last batch has been parsed, s.t.
   // the parser threads can be destroyed. The following two members are needed

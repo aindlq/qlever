@@ -9,6 +9,7 @@
 #define QLEVER_SRC_COMPILATIONINFO_H
 
 #include <atomic>
+#include <mutex>
 #include <string_view>
 
 #include "util/Synchronized.h"
@@ -29,13 +30,13 @@ extern const std::string_view ProjectVersion;
 // They only have meaningful values once the `copyVersionInfo` function (below)
 // was called. This is currently done in the `main` functions of
 // `IndexBuilderMain.cpp` and `ServerMain.cpp`.
-inline ad_utility::Synchronized<std::string_view> gitShortHashWithoutLinking{
-    std::string_view{"git short hash not set"}};
-inline ad_utility::Synchronized<std::string_view>
+inline ad_utility::Synchronized<std::string_view, std::mutex>
+    gitShortHashWithoutLinking{std::string_view{"git short hash not set"}};
+inline ad_utility::Synchronized<std::string_view, std::mutex>
     datetimeOfCompilationWithoutLinking{
         std::string_view{"datetime of compilation not set"}};
-inline ad_utility::Synchronized<std::string_view> projectVersionWithoutLinking{
-    std::string_view{"project version not set"}};
+inline ad_utility::Synchronized<std::string_view, std::mutex>
+    projectVersionWithoutLinking{std::string_view{"project version not set"}};
 
 // Copy the values from the constants that require linking to the `inline`
 // variables that don't require linking. For details see above.

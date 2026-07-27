@@ -7,6 +7,7 @@
 
 #include <gtest/gtest_prod.h>
 
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -285,8 +286,9 @@ AD_SERIALIZE_FUNCTION(CompressedRelationMetadata) {
 /// build.
 class CompressedRelationWriter {
  private:
-  ad_utility::Synchronized<ad_utility::File> outfile_;
-  ad_utility::Synchronized<std::vector<CompressedBlockMetadataNoBlockIndex>>
+  ad_utility::Synchronized<ad_utility::File, std::mutex> outfile_;
+  ad_utility::Synchronized<std::vector<CompressedBlockMetadataNoBlockIndex>,
+                           std::mutex>
       blockBuffer_;
   // If multiple small relations are stored in the same block, keep track of the
   // first and last `col0Id`.
