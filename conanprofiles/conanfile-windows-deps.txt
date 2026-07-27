@@ -18,6 +18,7 @@ bzip2/1.0.8
 jemalloc/5.3.0
 
 [options]
+*:shared=False
 # jemalloc: keep the je_ prefix so plain malloc/free stay UNexported. The default
 # prefix="" exports C malloc/free and creates the mixed-heap hazard QLever avoids
 # on Windows; prefix=je_ leaves only the (unprefixable) C++ operator new/delete

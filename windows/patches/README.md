@@ -8,8 +8,9 @@ are completely unaffected. `ApplyPatch.cmake` makes the application
 idempotent (re-running the patch step on an already-patched tree is a no-op).
 
 Each patch can be deleted here once the pinned `GIT_TAG` of the dependency
-contains the corresponding fix (the I/O patches have been submitted upstream;
-the ANTLR one is a candidate to upstream).
+contains the corresponding fix. The spatialjoin I/O fixes have been submitted
+upstream; the fsst and ANTLR changes are still candidates for focused upstream
+submissions.
 
 ## `fsst-windows.patch` (for cwida/fsst)
 

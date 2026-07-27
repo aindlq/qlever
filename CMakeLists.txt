@@ -186,11 +186,11 @@ if (WIN32)
     # it needs no MinGW runtime DLLs at the target site, only the Windows system
     # DLLs that ship with every Windows 10+/Server 2016+ (ucrtbase, kernel32, …).
     # Off by default (a normal dev build links them dynamically against winlibs);
-    # turn on for distributable release builds. `-static` is the superset that
-    # also covers winpthread/libgomp; the two `-static-lib*` are kept explicit.
+    # turn on for distributable release builds. The actual link option is added
+    # after OpenMP detection below, because adding it here would also affect
+    # FindOpenMP's probe and make a usable static libgomp appear unavailable.
     option(STATIC_LINKING "Statically link the GCC/OpenMP/pthread runtimes for self-contained, redistributable Windows binaries" OFF)
     if (STATIC_LINKING)
-        add_link_options(-static -static-libgcc -static-libstdc++)
         message(STATUS "STATIC_LINKING=ON: self-contained Windows binaries (no MinGW runtime DLLs)")
     endif()
 
@@ -306,6 +306,8 @@ option(QLEVER_REQUIRE_JEMALLOC "Fail the build if jemalloc is not found" OFF)
 # JEMALLOC
 ###################################
 
+set(QLEVER_HAS_PREFIXED_JEMALLOC OFF)
+set(QLEVER_JEMALLOC_LINK_ARCHIVE "")
 find_package(jemalloc QUIET)
 if (TARGET jemalloc::jemalloc)
     MESSAGE(STATUS "Use jemalloc that was installed via conan")
@@ -316,19 +318,33 @@ if (TARGET jemalloc::jemalloc)
         # strings, IdTables, ...) through it. jemalloc and libstdc++ BOTH export a
         # strong operator new/delete, and link ORDER decides the winner (jemalloc
         # has no plain-malloc fallback, so if it loses it is bypassed entirely).
-        # Link the archive BY PATH, not the imported target: a raw lib in
-        # link_libraries() lands at the FRONT of the link, ahead of the -lstdc++
-        # that ICU's Conan usage-requirements inject, so jemalloc's operators are
-        # scanned first and win (and libstdc++'s new_op.o is never pulled -> no
-        # "multiple definition"). The imported target gets reordered after
-        # -lstdc++ and loses, silently dropping jemalloc. Path via Conan's data
-        # vars (Release-only, which is all the Windows port builds).
-        # The override also needs a fully STATIC libstdc++: PE has no cross-module
-        # symbol interposition, and `-static-libstdc++` without `-static` collides
-        # libstdc++.a vs .dll.a. So jemalloc implies a fully static binary here,
-        # which is also what we ship.
-        link_libraries("${jemalloc_LIB_DIRS_RELEASE}/lib${jemalloc_LIBS_RELEASE}.a")
-        add_link_options(-static -static-libgcc -static-libstdc++)
+        # Link the archive BY PATH and as a link option, not through the imported
+        # interface target. This places it once, before libstdc++, so jemalloc's
+        # operator new/delete win without propagating a duplicate archive through
+        # every static library. Obtain the path from Conan's imported library
+        # target instead of synthesizing a Release-only file name.
+        #
+        # PE has no cross-module symbol interposition, so this setup requires a
+        # fully static libstdc++. Keep that choice explicit: normal dynamic
+        # developer builds fall back to the default allocator.
+        if (NOT STATIC_LINKING)
+            if (QLEVER_REQUIRE_JEMALLOC)
+                message(FATAL_ERROR "Conan jemalloc on MinGW requires STATIC_LINKING=ON")
+            endif ()
+            message(WARNING "Ignoring Conan jemalloc on MinGW because STATIC_LINKING is OFF")
+        else ()
+            list(LENGTH jemalloc_LIBRARIES_TARGETS QLEVER_NUM_JEMALLOC_LIBRARIES)
+            if (NOT QLEVER_NUM_JEMALLOC_LIBRARIES EQUAL 1)
+                message(FATAL_ERROR "Expected exactly one Conan jemalloc library target, got: ${jemalloc_LIBRARIES_TARGETS}")
+            endif ()
+            list(GET jemalloc_LIBRARIES_TARGETS 0 QLEVER_JEMALLOC_IMPORTED_TARGET)
+            get_target_property(QLEVER_JEMALLOC_LINK_ARCHIVE
+                    ${QLEVER_JEMALLOC_IMPORTED_TARGET} IMPORTED_LOCATION_RELEASE)
+            if (NOT QLEVER_JEMALLOC_LINK_ARCHIVE)
+                message(FATAL_ERROR "Conan's jemalloc target has no Release archive")
+            endif ()
+            set(QLEVER_HAS_PREFIXED_JEMALLOC ON)
+        endif ()
     else ()
         link_libraries(jemalloc::jemalloc)
     endif ()
@@ -361,9 +377,14 @@ endif ()
 # installs jemalloc-backed allocators for those libraries (see
 # src/util/JemallocLibraryHooks). No-op on non-Windows; toggle for benchmarking.
 option(QLEVER_JEMALLOC_LIBRARY_HOOKS "Route ICU (and other C-library) allocations to jemalloc on Windows" ON)
-# The definition is applied narrowly to the `util` target (which owns
-# JemallocLibraryHooks.cpp) rather than globally, so toggling it only recompiles
-# that library.
+set(QLEVER_ENABLE_JEMALLOC_LIBRARY_HOOKS OFF)
+if (WIN32 AND QLEVER_JEMALLOC_LIBRARY_HOOKS)
+    if (QLEVER_HAS_PREFIXED_JEMALLOC)
+        set(QLEVER_ENABLE_JEMALLOC_LIBRARY_HOOKS ON)
+    else ()
+        message(WARNING "QLEVER_JEMALLOC_LIBRARY_HOOKS requested without a prefixed jemalloc archive; disabling the hooks")
+    endif ()
+endif ()
 
 ### io_uring (optional, for asynchronous batch vocabulary I/O)
 option(USE_IO_URING "Enable io_uring support for batch vocabulary I/O (requires liburing)" ON)
@@ -539,6 +560,14 @@ if (USE_PARALLEL)
     endif ()
 endif ()
 
+# Add artifact-only link inputs after FindOpenMP has completed its probes.
+if (WIN32 AND STATIC_LINKING)
+    add_link_options(-static)
+endif ()
+if (QLEVER_JEMALLOC_LINK_ARCHIVE)
+    add_link_options("${QLEVER_JEMALLOC_LINK_ARCHIVE}")
+endif ()
+
 OPTION(_NO_TIMING_TESTS "Disable timing tests on platforms where `sleep` is unreliable" OFF)
 if (_NO_TIMING_TESTS)
     add_compile_definitions(_QLEVER_NO_TIMING_TESTS)
@@ -652,6 +681,14 @@ if (EMSCRIPTEN)
     add_compile_definitions(GTEST_HAS_PTHREAD=1)
 endif ()
 FetchContent_MakeAvailable(googletest ctre abseil re2 fsst s2 nlohmann-json antlr range-v3 spatialjoin uriparser opentelemetry-cpp)
+
+# Conan's CMakeDeps packages expose zlib and bzip2 via imported targets. The
+# pinned spatialjoin/util CMake still consumes legacy variables and consequently
+# loses their include directories. Attach the targets narrowly to the only util
+# library QLever builds instead of exporting compiler-wide include paths in CI.
+if (WIN32)
+    target_link_libraries(pb_util BZip2::BZip2 ZLIB::ZLIB)
+endif ()
 
 # On Windows, force-include the macro-hygiene prelude into all QLever
 # translation units (see the comment in that header). Placed AFTER the
