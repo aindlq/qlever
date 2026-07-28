@@ -100,7 +100,8 @@ inline DirectoryRange directoryRange(filesystem::path directory) {
 inline filesystem::path pathFilename(const filesystem::path& path) {
   const auto& native = path.native();
   if (!native.empty() &&
-      native.back() == filesystem::path::preferred_separator) {
+      (native.back() == filesystem::path::preferred_separator ||
+       native.back() == '/')) {
     return {};
   }
   return path.filename();

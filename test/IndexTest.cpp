@@ -1154,8 +1154,10 @@ TEST(IndexImpl, allIndexFilesAreListed) {
       continue;
     }
     std::string name = entry.path().filename().string();
-    if (!ql::starts_with(name, baseName) ||
-        listedSet.contains(entry.path().string())) {
+    bool isListed = ql::ranges::any_of(listedPaths, [&entry](const auto& path) {
+      return ql::filesystem::equivalent(path, entry.path());
+    });
+    if (!ql::starts_with(name, baseName) || isListed) {
       continue;
     }
     std::string_view rest{name};
