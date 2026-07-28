@@ -28,27 +28,22 @@ namespace fs = ql::filesystem;
 std::vector<fs::path> filesWithBaseNameAndSuffix(const fs::path& onDiskBase,
                                                  std::string_view suffix) {
   fs::path parent = onDiskBase.parent_path();
-  // For a base name without a directory component, iterate the current
-  // directory, but do NOT prepend it to the returned paths (see below).
+  // Use the current directory for iteration without making returned paths
+  // absolute.
   fs::path directory = parent.empty() ? fs::current_path() : parent;
-  std::string prefix =
-      absl::StrCat(ql::pathFilename(onDiskBase).string(), suffix);
+  std::string baseName = ql::pathFilename(onDiskBase).string();
+  std::string prefix = absl::StrCat(baseName, suffix);
   namespace v = ql::views;
   // With an InputRangeTypeErased (instead of `to_vector`), `ql::directoryRange`
   // backed by the boost filesystem library doesn't work.
   return ad_utility::OwningView{
              ::ranges::to_vector(ql::directoryRange(directory))} |
          v::filter([](const auto& entry) { return entry.is_regular_file(); }) |
-         // Return the paths in the same form as `onDiskBase` (directory part of
-         // `onDiskBase` plus the file name; an empty `parent` yields the bare
-         // file name), so that they textually start with `onDiskBase`. Callers
-         // like `Qlever::moveRebuiltIndexIntoPlace` rely on this to replace the
-         // base-name prefix of each file.
+         v::filter([&prefix](const auto& entry) {
+           return ql::starts_with(entry.path().filename().string(), prefix);
+         }) |
          v::transform([&parent](const auto& entry) {
            return parent / entry.path().filename();
-         }) |
-         v::filter([&prefix](const auto& path) {
-           return ql::starts_with(path.filename().string(), prefix);
          }) |
          ::ranges::to_vector;
 }

@@ -458,11 +458,18 @@ void Qlever::moveRebuiltIndexIntoPlace(IndexAndViews& newIndexAndViews,
   // (e.g. `<from>.index.pso` -> `<to>.index.pso`).
   auto moveByBasename = [](const fs::path& file, std::string_view fromBasename,
                            std::string_view toBasename) {
-    std::string fileString = file.string();
-    AD_CORRECTNESS_CHECK(ql::starts_with(fileString, fromBasename));
-    fs::rename(file,
-               absl::StrCat(toBasename, std::string_view{fileString}.substr(
-                                            fromBasename.size())));
+    std::string fromFilename =
+        ql::pathFilename(fs::path{fromBasename}).string();
+    std::string filename = ql::pathFilename(file).string();
+    AD_CORRECTNESS_CHECK(ql::starts_with(filename, fromFilename));
+
+    std::string_view suffix{filename};
+    suffix.remove_prefix(fromFilename.size());
+
+    fs::path targetBase{toBasename};
+    std::string targetFilename =
+        absl::StrCat(ql::pathFilename(targetBase).string(), suffix);
+    fs::rename(file, targetBase.parent_path() / targetFilename);
   };
 
   // Move all files that make up an index from the `source` base name to the
