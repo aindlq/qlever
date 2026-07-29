@@ -23,6 +23,8 @@
 #include "util/Exception.h"
 #include "util/Forward.h"
 #include "util/Log.h"
+#include "util/sys/PortableFileOpen.h"
+#include "util/sys/PositionedReader.h"
 
 namespace ad_utility {
 //! Wrapper class for file access. Is supposed to provide
@@ -37,6 +39,7 @@ class File {
 
   string name_;
   FILE* file_;
+  PositionedReader positionedReader_;
 
  public:
   //! Default constructor
@@ -66,11 +69,14 @@ class File {
 
     file_ = std::exchange(rhs.file_, nullptr);
     name_ = std::move(rhs.name_);
+    positionedReader_ = std::move(rhs.positionedReader_);
     return *this;
   }
 
   File(File&& rhs) noexcept
-      : name_{std::move(rhs.name_)}, file_{std::exchange(rhs.file_, nullptr)} {}
+      : name_{std::move(rhs.name_)},
+        file_{std::exchange(rhs.file_, nullptr)},
+        positionedReader_{std::move(rhs.positionedReader_)} {}
 
   //! Destructor closes file if still open
   ~File() {
@@ -79,7 +85,8 @@ class File {
 
   //! OPEN FILE (exit with error if fails, returns true otherwise)
   bool open(const char* filename, const char* mode) {
-    file_ = fopen(filename, mode);
+    positionedReader_.close();
+    file_ = detail::openFile(filename, mode);
     if (file_ == NULL) {
       std::stringstream err;
       err << "! ERROR opening file \"" << filename << "\" with mode \"" << mode
@@ -111,9 +118,8 @@ class File {
   // runtime, see #2832).
   //
   // NOTE: The duplicate shares the file offset with the original, so on the
-  // two `File`s only the positioned `read` overload (which uses `pread`) can
-  // be used independently; the sequential `read`/`seek` interface must not
-  // be mixed across duplicates.
+  // two `File`s only the positioned `read` overload can be used independently;
+  // the sequential `read`/`seek` interface must not be mixed across duplicates.
   [[nodiscard]] File duplicateForReading() const {
     AD_CONTRACT_CHECK(isOpen());
     int newFd = ::dup(fd());
@@ -135,6 +141,7 @@ class File {
     if (not isOpen()) {
       return true;
     }
+    positionedReader_.close();
     if (fclose(file_) != 0) {
       std::cout << "! ERROR closing file \"" << name_ << "\" ("
                 << strerror(errno) << ")" << std::endl;
@@ -177,8 +184,7 @@ class File {
   }
 
   //! Read nofBytesToRead bytes from file starting at the given offset.
-  //! Returns the number of bytes read or the error returned by pread()
-  //! which is < 0
+  //! Returns the number of bytes read, or a negative value on error.
   ssize_t read(void* targetBuffer, size_t nofBytesToRead, off_t offset) const {
     assert(file_);
     const int fd = fileno(file_);
@@ -187,7 +193,8 @@ class File {
     while (bytesRead < nofBytesToRead) {
       size_t toRead = nofBytesToRead - bytesRead;
 
-      const ssize_t ret = pread(fd, to + bytesRead, toRead, offset + bytesRead);
+      const ssize_t ret = positionedReader_.readAtOffset(
+          fd, to + bytesRead, toRead, offset + bytesRead);
 
       if (ret < 0) {
         return ret;
@@ -247,6 +254,9 @@ inline void deleteFile(const ql::filesystem::path& path,
 namespace detail {
 template <typename Stream, bool forWriting, typename... Args>
 Stream makeFilestream(const ql::filesystem::path& path, Args&&... args) {
+  if constexpr (forWriting) {
+    prepareTruncatingRewrite(path, args...);
+  }
   Stream stream{path.string(), AD_FWD(args)...};
   std::string_view mode = forWriting ? "for writing" : "for reading";
   if (!stream.is_open()) {
