@@ -1,0 +1,94 @@
+diff --git a/Misc.cpp b/Misc.cpp
+index 650326f..46c45f2 100644
+--- a/Misc.cpp
++++ b/Misc.cpp
+@@ -5,7 +5,9 @@
+ #include "./Misc.h"
+ 
+ #include <fcntl.h>
++#ifndef _WIN32
+ #include <pwd.h>
++#endif
+ #include <stdio.h>
+ #include <unistd.h>
+ 
+@@ -19,6 +21,59 @@
+ #include "3rdparty/fmt/core.h"
+ #include "String.h"
+ 
++#if defined(_WIN32)
++#include <io.h>
++
++#include <mutex>
++
++// Windows has no pread()/pwrite(). The emulations below preserve the file
++// position like their POSIX counterparts by saving and restoring it around
++// the positioned operation; a mutex makes the save/IO/restore sequence atomic
++// with respect to other positioned operations in the same process. (Opening
++// an independent handle per call is not an option here, because the
++// temporary files used with these functions are typically unlinked right
++// after creation and can therefore not be re-opened by name.)
++
++// _____________________________________________________________________________
++static std::mutex& positionedIoMutex() {
++  static std::mutex mtx;
++  return mtx;
++}
++
++// _____________________________________________________________________________
++static ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
++  std::lock_guard<std::mutex> lock(positionedIoMutex());
++  HANDLE h = (HANDLE)_get_osfhandle(fd);
++  if (h == INVALID_HANDLE_VALUE) return -1;
++  int64_t oldPos = _lseeki64(fd, 0, SEEK_CUR);
++  OVERLAPPED ov = {};
++  ov.Offset = (DWORD)(uint64_t)offset;
++  ov.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
++  DWORD n = 0;
++  BOOL ok = ReadFile(h, buf, (DWORD)count, &n, &ov);
++  DWORD err = ok ? 0 : GetLastError();
++  if (oldPos >= 0) _lseeki64(fd, oldPos, SEEK_SET);
++  if (!ok) return (err == ERROR_HANDLE_EOF) ? 0 : -1;
++  return (ssize_t)n;
++}
++
++// _____________________________________________________________________________
++static ssize_t pwrite(int fd, const void* buf, size_t count, int64_t offset) {
++  std::lock_guard<std::mutex> lock(positionedIoMutex());
++  HANDLE h = (HANDLE)_get_osfhandle(fd);
++  if (h == INVALID_HANDLE_VALUE) return -1;
++  int64_t oldPos = _lseeki64(fd, 0, SEEK_CUR);
++  OVERLAPPED ov = {};
++  ov.Offset = (DWORD)(uint64_t)offset;
++  ov.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
++  DWORD n = 0;
++  BOOL ok = WriteFile(h, buf, (DWORD)count, &n, &ov);
++  if (oldPos >= 0) _lseeki64(fd, oldPos, SEEK_SET);
++  if (!ok) return -1;
++  return (ssize_t)n;
++}
++#endif  // defined(_WIN32)
++
+ // cached first 10 powers of 10
+ static int util_first_10_pow_10[10] = {1,      10,      100,      1000,      10000,
+                         100000, 1000000, 10000000, 100000000, 1000000000};
+@@ -209,6 +264,11 @@ double util::atof(const char* p) { return atof(p, 38); }
+ 
+ // _____________________________________________________________________________
+ std::string util::getHomeDir() {
++#if defined(_WIN32)
++  /* Windows -------------------------------------------------- */
++  const char* homedir = getenv("USERPROFILE");
++  return std::string(homedir ? homedir : "");
++#else
+   // parse implicit paths
+   const char* homedir = 0;
+   char* buf = 0;
+@@ -231,6 +291,7 @@ std::string util::getHomeDir() {
+   if (buf) free(buf);
+ 
+   return ret;
++#endif
+ }
+ 
+ // _____________________________________________________________________________

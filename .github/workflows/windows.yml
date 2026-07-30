@@ -1,0 +1,266 @@
+name: Native build on Windows
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+  merge_group:
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# The Windows port is built against a PINNED toolchain that matches the Linux CI
+# (GCC 13.3), reproduced from scratch the first time and then served from the
+# caches below. See WINDOWS.md for the rationale.
+#
+#   - winlibs MinGW-w64 GCC 13.3.0 (UCRT, posix, seh)  -> cached in C:\winlibs13
+#   - Conan builds ICU/OpenSSL/zstd/zlib/bzip2/Boost/jemalloc from source
+#     -> cached in CONAN_HOME
+#
+# A cold cache pays the full ~60 min build once; warm runs restore the prebuilt
+# dependencies and only compile QLever + run the tests.
+env:
+  # Pinned winlibs GCC 13.3.0 release (UCRT runtime, posix threads, SEH EH).
+  WINLIBS_VERSION: "13.3.0posix-11.0.1-ucrt-r1"
+  WINLIBS_URL: "https://github.com/brechtsanders/winlibs_mingw/releases/download/13.3.0posix-11.0.1-ucrt-r1/winlibs-x86_64-posix-seh-gcc-13.3.0-mingw-w64ucrt-11.0.1-r1.zip"
+  WINLIBS_SHA256: "6c90485da4d9966683a83a1e5f3a0b1084d2a5ba2e57e8b27c0634afe3983776"
+  WINLIBS_DIR: "C:\\winlibs13"
+  QLEVER_WINLIBS_DIR: "C:/winlibs13"
+  QLEVER_MSYS2_DIR: "C:/msys64"
+  CONAN_VERSION: "2.29.1"
+  # Pin the Conan home so the cache path is stable.
+  CONAN_HOME: "C:\\conan2"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: [Release]
+
+    steps:
+      # QLever's test data contains binary files; CRLF translation corrupts them,
+      # so disable autocrlf BEFORE the checkout clones the repo.
+      - name: Disable CRLF translation
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: actions/checkout@v7
+
+      # --- winlibs GCC 13.3 (cached) -------------------------------------------
+      # restore/save are split (not the combined actions/cache) so each cache is
+      # written the moment its artifact is built — surviving a later step's failure
+      # or a cancelled run, instead of only at the post-job step at the very end.
+      - name: Cache winlibs GCC (restore)
+        id: cache-winlibs
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.WINLIBS_DIR }}
+          key: winlibs-${{ env.WINLIBS_VERSION }}
+
+      - name: Download winlibs GCC
+        if: steps.cache-winlibs.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          curl.exe -fSL -o winlibs.zip "$env:WINLIBS_URL"
+          $actualHash = (Get-FileHash winlibs.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:WINLIBS_SHA256) {
+            throw "winlibs checksum mismatch: expected $env:WINLIBS_SHA256, got $actualHash"
+          }
+          Expand-Archive -Path winlibs.zip -DestinationPath "$env:WINLIBS_DIR" -Force
+
+      - name: Cache winlibs GCC (save)
+        if: steps.cache-winlibs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.WINLIBS_DIR }}
+          key: winlibs-${{ env.WINLIBS_VERSION }}
+
+      - name: Put winlibs (gcc, cmake, ninja) on PATH
+        shell: pwsh
+        run: |
+          "$env:WINLIBS_DIR\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Print compiler version
+        shell: bash
+        run: g++ --version && cmake --version && ninja --version
+
+      # --- Conan dependencies (ICU/OpenSSL/zstd/zlib/bzip2/Boost/jemalloc, cached) -------------
+      - name: Install Conan
+        shell: bash
+        run: |
+          python -m pip install "conan==$CONAN_VERSION"
+          conan --version
+
+      - name: Cache Conan packages (restore)
+        id: cache-conan
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.CONAN_HOME }}\p
+          key: conan-windows-${{ env.WINLIBS_VERSION }}-conan-${{ env.CONAN_VERSION }}-${{ hashFiles('conanprofiles/gcc-13-windows', 'conanprofiles/conanfile-windows-deps.txt', 'conanprofiles/windows.lock') }}
+          restore-keys: |
+            conan-windows-${{ env.WINLIBS_VERSION }}-conan-${{ env.CONAN_VERSION }}-
+            conan-windows-${{ env.WINLIBS_VERSION }}-
+
+      # Autotools-based Conan dependencies need MSYS2 make/perl/autoconf/gawk.
+      # An exact cache hit already contains every locked package, so avoid
+      # updating the rolling MSYS2 package set on that fast path.
+      - name: Install MSYS2 build tools
+        if: steps.cache-conan.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          C:\msys64\usr\bin\pacman.exe -S --noconfirm --needed make perl autoconf automake libtool tar gawk
+
+      - name: Conan install (all dependencies)
+        shell: bash
+        run: |
+          conan install conanprofiles/conanfile-windows-deps.txt \
+            -pr:a conanprofiles/gcc-13-windows \
+            --lockfile=conanprofiles/windows.lock \
+            --output-folder=build --build=missing
+
+      - name: Cache Conan packages (save)
+        if: steps.cache-conan.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CONAN_HOME }}\p
+          key: conan-windows-${{ env.WINLIBS_VERSION }}-conan-${{ env.CONAN_VERSION }}-${{ hashFiles('conanprofiles/gcc-13-windows', 'conanprofiles/conanfile-windows-deps.txt', 'conanprofiles/windows.lock') }}
+
+      # --- Configure / build / test (one static + jemalloc build) ---------------
+      # CI explicitly requests the fully static jemalloc artifact configuration.
+      # SINGLE_TEST_BINARY=ON links all
+      # unit tests into one executable: static test exes are large, and one binary
+      # keeps the runner's disk in check. _NO_TIMING_TESTS=ON: the sleep-precision
+      # timing tests are flaky on the shared-CPU runner (~15.6 ms tick), as on macOS.
+      # COMPILER_SUPPORTS_MARCH_NATIVE=FALSE keeps the shipped binary portable: fsst
+      # (the vocabulary compressor) otherwise compiles with -march=native, targeting
+      # the build runner's CPU, so the artifact SIGILLs on any host with an older ISA
+      # -- e.g. the separate runner the e2e job runs on. Matches the Dockerfile and
+      # macOS CI.
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} \
+            -DCMAKE_TOOLCHAIN_FILE="$(pwd)/build/conan_toolchain.cmake" \
+            -DSTATIC_LINKING=ON \
+            -DQLEVER_REQUIRE_JEMALLOC=ON \
+            -DSINGLE_TEST_BINARY=ON \
+            -D_NO_TIMING_TESTS=ON \
+            -DCOMPILER_SUPPORTS_MARCH_NATIVE=FALSE
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config ${{ matrix.build-type }} -- -j 4
+
+      - name: Test
+        working-directory: build/test
+        shell: bash
+        run: env CTEST_OUTPUT_ON_FAILURE=1 ctest --no-tests=error -C ${{ matrix.build-type }} -j 4 .
+
+      # --- Distributable artifact -----------------------------------------------
+      # The binaries are already fully static, so just
+      # collect + verify them. They are byte-for-byte the code the suite just ran,
+      # and need no MinGW DLLs at the target site (only the Windows system DLLs on
+      # Windows 10+/Server 2016+).
+      - name: Collect + verify self-contained binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/qlever-server.exe build/qlever-index.exe dist/
+
+          # The prefixed jemalloc archive must occur once (and be extracted)
+          # before the implicit static libstdc++ so its C++ allocation operators
+          # win. Guard both the link construction and the resulting binary.
+          index_link="$(ninja -C build -t commands qlever-index | tail -n 1)"
+          jemalloc_count="$(awk -F'libjemalloc_s[.]a' '{print NF - 1}' <<<"$index_link")"
+          if [[ "$jemalloc_count" != 1 ]]; then
+            echo "ERROR: expected one jemalloc archive in qlever-index's link command, got $jemalloc_count"
+            exit 1
+          fi
+          if ! nm dist/qlever-index.exe | grep -E '[[:space:]][Tt][[:space:]]+je_malloc$' >/dev/null; then
+            echo "ERROR: qlever-index.exe does not contain jemalloc's je_malloc"
+            exit 1
+          fi
+
+          allowed_system_dlls='^(ADVAPI32|bcrypt|CRYPT32|dbghelp|KERNEL32|MSWSOCK|USER32|WS2_32|api-ms-win-crt-[a-z0-9-]+)\.dll$'
+          for binary in dist/qlever-server.exe dist/qlever-index.exe; do
+            imports="$(objdump -p "$binary" | sed -n 's/^[[:space:]]*DLL Name: //p')"
+            unexpected="$(printf '%s\n' "$imports" | grep -ivE "$allowed_system_dlls" || true)"
+            if [[ -n "$unexpected" ]]; then
+              echo "ERROR: $binary imports non-system DLLs:"
+              echo "$unexpected"
+              exit 1
+            fi
+          done
+          echo "qlever-server.exe / qlever-index.exe are self-contained."
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: qlever-windows-x64-static
+          path: dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # End-to-end tests, run against the SHIPPED self-contained binary.
+  #
+  # A dedicated job (not a step in `build`) so it exercises exactly the static
+  # artifact users download: it pulls qlever-index/-server from the build job and
+  # needs no compiler — only a Python with PyICU + PyYAML to drive e2e/queryit.py.
+  # The catch is PyICU (queryit.py uses icu.Collator): pip has no Windows wheel for
+  # the runner's Python, but MSYS2 ships a prebuilt mingw package, and e2e.sh runs
+  # under bash anyway. So we use the MSYS2 mingw Python via setup-msys2 and point
+  # e2e.sh at it with PYTHON_BINARY. The harness then builds the scientist index
+  # INCLUDING the text index, serves it, and runs the same query battery as the
+  # Linux e2e — covering the text-index path that the unit tests don't reach.
+  e2e:
+    name: End-to-end tests (static binary)
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      # The scientist-collection test data is binary; keep CRLF off (as in build).
+      - name: Disable CRLF translation
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: actions/checkout@v7
+
+      - name: Download the self-contained binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: qlever-windows-x64-static
+          path: e2e-bin
+
+      # MSYS2 mingw Python is the one path that ships a prebuilt PyICU; setup-msys2
+      # manages a fresh pacman db + keyring and the MINGW64 shell (which puts
+      # /mingw64/bin on PATH so that Python finds its ICU/yaml DLLs).
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-yaml
+            mingw-w64-x86_64-python-icu
+            unzip
+            curl
+
+      - name: Run end-to-end tests
+        shell: 'msys2 {0}'
+        run: |
+          chmod +x e2e-bin/*.exe || true
+          /mingw64/bin/python -c "import icu, yaml; print('PyICU', icu.ICU_VERSION, '/ PyYAML', yaml.__version__)"
+          PYTHON_BINARY=/mingw64/bin/python ./e2e/e2e.sh -d e2e-bin

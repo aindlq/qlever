@@ -1,0 +1,37 @@
+# Conan profile for the native Windows port: winlibs MinGW-w64 GCC 13.3 (UCRT,
+# posix threads, SEH) — the same GCC major as the Linux CI. Used to build all of
+# the dependencies from source on Windows (ICU, OpenSSL, zstd, zlib, bzip2, Boost,
+# jemalloc). See conanfile-windows-deps.txt and WINDOWS.md.
+[settings]
+os=Windows
+arch=x86_64
+build_type=Release
+compiler=gcc
+compiler.version=13
+# gnu20, not 20: with strict -std=c++20 winlibs GCC 13 defines __STRICT_ANSI__,
+# which disables the GNU `Q` __float128 literal suffix that libstdc++ <numbers>
+# relies on — building ICU then fails with "unable to find numeric literal
+# operator operator\"\"Q". gnu++20 keeps the suffix; the C deps don't need
+# strict ANSI. (The benchmark harness passes the same via -s:a compiler.cppstd.)
+compiler.cppstd=gnu20
+compiler.libcxx=libstdc++11
+compiler.threads=posix
+compiler.exception=seh
+
+[conf]
+{% set qlever_winlibs_dir = os.getenv("QLEVER_WINLIBS_DIR", "C:/winlibs13") %}
+{% set qlever_msys2_dir = os.getenv("QLEVER_MSYS2_DIR", "C:/msys64") %}
+# Absolute paths, not bare "gcc"/"g++": Boost's b2 writes `using gcc : : "g++" ;`
+# into user-config.jam and its find-compiler cannot resolve a bare/quoted command
+# on Windows, so a bare-name profile dies at b2 toolset init. Point at the winlibs
+# toolchain explicitly. Override QLEVER_WINLIBS_DIR for a non-default location.
+tools.build:compiler_executables={"c": "{{ qlever_winlibs_dir }}/mingw64/bin/gcc.exe", "cpp": "{{ qlever_winlibs_dir }}/mingw64/bin/g++.exe"}
+# Autotools-based dependencies (OpenSSL, ICU) need a Unix shell + make; route
+# them through MSYS2 bash. Override QLEVER_MSYS2_DIR if needed.
+tools.microsoft.bash:subsystem=msys2
+tools.microsoft.bash:path={{ qlever_msys2_dir }}/usr/bin/bash.exe
+
+[buildenv]
+# Keep MinGW's runtime DLLs visible when Conan starts an MSYS2 login shell.
+MSYS2_PATH_TYPE=inherit
+PATH=+(path){{ qlever_winlibs_dir }}/mingw64/bin

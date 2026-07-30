@@ -157,6 +157,19 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         MESSAGE(FATAL_ERROR "G++ versions older than 11.0 are not supported by QLever")
     elseif (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER "11.0.0")
         add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fcoroutines>)
+        if (WIN32)
+            # WORKAROUND (build-wide): GCC 13 on MinGW (SEH, x64) miscompiles the
+            # SEH unwind tables (.pdata/.xdata) for some C++20 coroutine frames.
+            # An exception (e.g. an Asio `operation_aborted` from a cancellation)
+            # unwinding through such a `.cold` coroutine clone makes
+            # `_Unwind_Resume` jump to a NULL target -> STATUS_BAD_FUNCTION_TABLE
+            # crash. It first surfaced in the Asio/Beast WebSocket code, but it is
+            # a codegen bug that can hit ANY coroutine translation unit (Server,
+            # IndexRebuilder, ...), so we disable the hot/cold block partitioning
+            # that creates the `.cold`/`.text.unlikely` sections everywhere,
+            # rather than per-target. Cf. GCC PR 101736 and PR target/103274.
+            add_compile_options(-fno-reorder-blocks-and-partition)
+        endif ()
     endif ()
     if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS "12.0.0")
         # GCC 11's libstdc++ doesn't yet provide `std::ranges::owning_view`, on
@@ -239,6 +252,57 @@ else ()
 endif ()
 
 ###############################################################################
+##### Windows (MinGW-w64) port #####
+###############################################################################
+if (WIN32)
+    # Keep windows.h lean: no min/max macros, no GDI (whose `ERROR` macro
+    # collides with antlr4), and none of the rarely used API families. The
+    # #undefs for the remaining macro collisions live in
+    # `src/util/sys/windows/WindowsUndefs.h`, which is force-included into all
+    # QLever translation units (see below, after the FetchContent block).
+    add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX NOGDI)
+    # M_PI and friends from <cmath>.
+    add_compile_definitions(_USE_MATH_DEFINES)
+    # 64-bit off_t/fseeko/ftello on MinGW (LLP64: plain `long` is 32 bits).
+    add_compile_definitions(_FILE_OFFSET_BITS=64)
+    # The ANTLR runtime is linked statically; its headers apply dllimport
+    # decorations unless this is defined in every TU that includes them.
+    add_compile_definitions(ANTLR4CPP_STATIC)
+    # System libraries required by QLever and its dependencies (winsock for
+    # Boost.Asio and s2, bcrypt for Boost.UUID). Added as "standard" libraries
+    # (i.e. at the very end of every link line) so they satisfy symbols from
+    # any archive regardless of order.
+    set(CMAKE_CXX_STANDARD_LIBRARIES
+            "${CMAKE_CXX_STANDARD_LIBRARIES} -lws2_32 -lmswsock -lbcrypt")
+
+    # Optionally fold the compiler runtimes (libstdc++, libgcc, OpenMP's libgomp
+    # and winpthread) into the binaries so the resulting .exe is self-contained:
+    # it needs no MinGW runtime DLLs at the target site, only the Windows system
+    # DLLs that ship with every Windows 10+/Server 2016+ (ucrtbase, kernel32, …).
+    # Off by default (a normal dev build links them dynamically against winlibs);
+    # turn on for distributable release builds. The actual link option is added
+    # after OpenMP detection below, because adding it here would also affect
+    # FindOpenMP's probe and make a usable static libgomp appear unavailable.
+    option(STATIC_LINKING "Statically link the GCC/OpenMP/pthread runtimes for self-contained, redistributable Windows binaries" OFF)
+    if (STATIC_LINKING)
+        message(STATUS "STATIC_LINKING=ON: self-contained Windows binaries (no MinGW runtime DLLs)")
+    endif()
+
+    # Windows portability patches for fetched dependencies (see
+    # `windows/patches/README.md`). Only applied on Windows; on all other
+    # platforms the variables below stay empty and the dependencies are
+    # built completely unpatched.
+    set(QLEVER_PATCH_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/windows/patches/ApplyPatch.cmake)
+    set(QLEVER_PATCH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/windows/patches)
+    set(QLEVER_FSST_PATCH_COMMAND PATCH_COMMAND
+            ${CMAKE_COMMAND} -P ${QLEVER_PATCH_SCRIPT} ${QLEVER_PATCH_DIR}/fsst-windows.patch .)
+    set(QLEVER_SPATIALJOIN_PATCH_COMMAND PATCH_COMMAND
+            ${CMAKE_COMMAND} -P ${QLEVER_PATCH_SCRIPT} ${QLEVER_PATCH_DIR}/spatialjoin-windows.patch .
+            COMMAND
+            ${CMAKE_COMMAND} -P ${QLEVER_PATCH_SCRIPT} ${QLEVER_PATCH_DIR}/spatialjoin-util-windows.patch src/util)
+endif ()
+
+###############################################################################
 ##### Essential settings #####
 ###############################################################################
 include(FetchContent)
@@ -308,6 +372,7 @@ FetchContent_Declare(
         spatialjoin
         GIT_REPOSITORY https://github.com/ad-freiburg/spatialjoin
         GIT_TAG 344a3fa41e96db38ac775cc78224847255d0152f
+        ${QLEVER_SPATIALJOIN_PATCH_COMMAND}
         SYSTEM
         EXCLUDE_FROM_ALL
 )
@@ -332,13 +397,60 @@ if (NOT QLEVER_NO_UNICODE)
 endif()
 
 ###################################
+# When ON, a missing jemalloc is a hard build error instead of a silent
+# fallback to the default allocator, so release/CI builds never ship a
+# non-jemalloc binary by accident (jemalloc is QLever's default allocator and
+# roughly halves index-build time).
+option(QLEVER_REQUIRE_JEMALLOC "Fail the build if jemalloc is not found" OFF)
+
 # JEMALLOC
 ###################################
 
+set(QLEVER_HAS_PREFIXED_JEMALLOC OFF)
+set(QLEVER_JEMALLOC_LINK_ARCHIVE "")
 find_package(jemalloc QUIET)
 if (TARGET jemalloc::jemalloc)
     MESSAGE(STATUS "Use jemalloc that was installed via conan")
-    link_libraries(jemalloc::jemalloc)
+    if (MINGW)
+        # jemalloc's C API is je_-prefixed by design on pecoff, so C malloc/free
+        # stay on the UCRT heap; but its C++ operator new/delete are exported
+        # UNPREFIXED, so linking jemalloc routes all C++ allocations (containers,
+        # strings, IdTables, ...) through it. jemalloc and libstdc++ BOTH export a
+        # strong operator new/delete, and link ORDER decides the winner (jemalloc
+        # has no plain-malloc fallback, so if it loses it is bypassed entirely).
+        # Link the archive BY PATH and as a whole-archive link option, not through
+        # the imported interface target. This places it once, before libstdc++,
+        # so jemalloc's operator new/delete win without propagating a duplicate
+        # archive through every static library. Whole-archive extraction is
+        # required because link options precede QLever's input libraries, whose
+        # references to the je_-prefixed C API would otherwise appear too late
+        # for the linker's one-pass archive scan. Obtain the path from Conan's
+        # imported target instead of synthesizing a Release-only file name.
+        #
+        # PE has no cross-module symbol interposition, so this setup requires a
+        # fully static libstdc++. Keep that choice explicit: normal dynamic
+        # developer builds fall back to the default allocator.
+        if (NOT STATIC_LINKING)
+            if (QLEVER_REQUIRE_JEMALLOC)
+                message(FATAL_ERROR "Conan jemalloc on MinGW requires STATIC_LINKING=ON")
+            endif ()
+            message(WARNING "Ignoring Conan jemalloc on MinGW because STATIC_LINKING is OFF")
+        else ()
+            list(LENGTH jemalloc_LIBRARIES_TARGETS QLEVER_NUM_JEMALLOC_LIBRARIES)
+            if (NOT QLEVER_NUM_JEMALLOC_LIBRARIES EQUAL 1)
+                message(FATAL_ERROR "Expected exactly one Conan jemalloc library target, got: ${jemalloc_LIBRARIES_TARGETS}")
+            endif ()
+            list(GET jemalloc_LIBRARIES_TARGETS 0 QLEVER_JEMALLOC_IMPORTED_TARGET)
+            get_target_property(QLEVER_JEMALLOC_LINK_ARCHIVE
+                    ${QLEVER_JEMALLOC_IMPORTED_TARGET} IMPORTED_LOCATION_RELEASE)
+            if (NOT QLEVER_JEMALLOC_LINK_ARCHIVE)
+                message(FATAL_ERROR "Conan's jemalloc target has no Release archive")
+            endif ()
+            set(QLEVER_HAS_PREFIXED_JEMALLOC ON)
+        endif ()
+    else ()
+        link_libraries(jemalloc::jemalloc)
+    endif ()
 
 elseif (${JEMALLOC_MANUALLY_INSTALLED})
     link_libraries(jemalloc)
@@ -350,6 +462,8 @@ else ()
     if (${JEMALLOC_FOUND})
         include_directories(${JEMALLOC_INCLUDE_DIRS})
         link_libraries(${JEMALLOC_LIBRARIES})
+    elseif (QLEVER_REQUIRE_JEMALLOC)
+        message(FATAL_ERROR "jemalloc not found but QLEVER_REQUIRE_JEMALLOC is ON. Install jemalloc (e.g. `apt install libjemalloc-dev`) or set -DJEMALLOC_MANUALLY_INSTALLED=True.")
     else ()
         message(WARNING "Jemalloc could not be found via
     pkg-config. If you are sure that you have installed jemalloc on your system
@@ -548,6 +662,17 @@ if (USE_PARALLEL)
     endif ()
 endif ()
 
+# Add artifact-only link inputs after FindOpenMP has completed its probes.
+if (WIN32 AND STATIC_LINKING)
+    add_link_options(-static)
+endif ()
+if (QLEVER_JEMALLOC_LINK_ARCHIVE)
+    add_link_options(
+            "LINKER:--whole-archive"
+            "${QLEVER_JEMALLOC_LINK_ARCHIVE}"
+            "LINKER:--no-whole-archive")
+endif ()
+
 OPTION(_NO_TIMING_TESTS "Disable timing tests on platforms where `sleep` is unreliable" OFF)
 if (_NO_TIMING_TESTS)
     add_compile_definitions(_QLEVER_NO_TIMING_TESTS)
@@ -583,6 +708,7 @@ FetchContent_Declare(
         fsst
         GIT_REPOSITORY https://github.com/cwida/fsst.git
         GIT_TAG b228af6356196095eaf9f8f5654b0635f969661e # main branch from 27th May 2025
+        ${QLEVER_FSST_PATCH_COMMAND}
         SYSTEM
         EXCLUDE_FROM_ALL
 )
@@ -638,6 +764,10 @@ set(WITH_STL ON CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(WITH_ABI_VERSION_2 ON CACHE BOOL "" FORCE)
 set(WITH_ABI_VERSION_1 OFF CACHE BOOL "" FORCE)
+# The ETW exporter (Windows-only, ON by default there) is unused by QLever and
+# would pull in opentelemetry's vendored nlohmann-json, whose targets collide
+# with QLever's own nlohmann-json. A no-op on other platforms (already OFF).
+set(WITH_ETW OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
         opentelemetry-cpp
         GIT_REPOSITORY https://github.com/open-telemetry/opentelemetry-cpp
@@ -669,6 +799,25 @@ else ()
     target_compile_options(antlr4_static PRIVATE -Wno-all -Wno-extra -Wno-error -Wno-deprecated-declarations)
     add_library(antlr4_umbrella ALIAS antlr4_static)
 endif ()
+
+# Conan's CMakeDeps packages expose zlib and bzip2 via imported targets. The
+# pinned spatialjoin/util CMake still consumes legacy variables and consequently
+# loses their include directories. Attach the targets narrowly to the only util
+# library QLever builds instead of exporting compiler-wide include paths in CI.
+if (WIN32)
+    target_link_libraries(pb_util BZip2::BZip2 ZLIB::ZLIB)
+endif ()
+
+# On Windows, force-include the macro-hygiene prelude into all QLever
+# translation units (see the comment in that header). Placed AFTER the
+# FetchContent block so that third-party targets are NOT affected.
+if (WIN32)
+    if (MSVC)
+        add_compile_options(/FI${CMAKE_CURRENT_SOURCE_DIR}/src/util/sys/windows/WindowsUndefs.h)
+    else ()
+        add_compile_options(-include ${CMAKE_CURRENT_SOURCE_DIR}/src/util/sys/windows/WindowsUndefs.h)
+    endif ()
+endif ()
 # Disable some warnings in RE2 and GTEST
 target_compile_options(s2 PRIVATE -Wno-sign-compare -Wno-unused-parameter -Wno-class-memaccess -Wno-comment -Wno-redundant-move -Wno-unknown-warning-option -Wno-maybe-uninitialized -Wno-class-memaccess -Wno-unused-but-set-variable -Wno-unused-function -Wno-nullability-completeness)
 target_compile_options(re2 PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations)
@@ -697,6 +846,14 @@ message(STATUS ---)
 ###############################################################################
 
 include_directories(src)
+
+if (WIN32)
+    # Process-wide Windows runtime fixes and the long-path manifest, linked
+    # into every QLever target defined below (see the comment in that
+    # directory's CMakeLists.txt for the details).
+    add_subdirectory(src/util/sys/windows)
+    link_libraries(qleverWindowsInit)
+endif ()
 
 # Run the script `CompilationInfo.cmake` that creates the file `CompilationInfo.cpp`
 # with the current git hash and the current time and date. When specifying

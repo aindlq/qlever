@@ -36,7 +36,7 @@ template <typename... Args>
 void prepareTruncatingRewrite(const ql::filesystem::path& path,
                               const Args&... args) {
 #ifdef _WIN32
-  auto isAppend = [](const auto& arg) {
+  [[maybe_unused]] auto isAppend = [](const auto& arg) {
     if constexpr (std::is_convertible_v<std::decay_t<decltype(arg)>,
                                         std::ios_base::openmode>) {
       return (static_cast<std::ios_base::openmode>(arg) &

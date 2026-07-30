@@ -26,10 +26,19 @@ endfunction()
 # if a test binary requires multiple sources
 function(linkAndDiscoverTest basename)
     linkTest(${basename} ${ARGN})
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename})
     if (QLEVER_ONE_TEST_CASE_PER_FILE)
         add_test(NAME ${basename} COMMAND ${basename})
+        set_tests_properties(${basename} PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename})
     else ()
-        gtest_discover_tests(${basename} ${basename} DISCOVERY_TIMEOUT 600 PROPERTIES LABELS "${basename}")
+        set(_resourceLock "")
+        if (WIN32)
+            set(_resourceLock RESOURCE_LOCK "${basename}")
+        endif ()
+        gtest_discover_tests(${basename} ${basename} DISCOVERY_TIMEOUT 600
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename}
+                PROPERTIES LABELS "${basename}" ${_resourceLock})
     endif ()
 endfunction()
 
@@ -41,12 +50,15 @@ endfunction()
 # issues should be fixed via per-test unique filenames instead.
 function(linkAndDiscoverTestSerial basename)
     linkTest(${basename} ${ARGN})
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename})
     if (QLEVER_ONE_TEST_CASE_PER_FILE)
         add_test(NAME ${basename} COMMAND ${basename})
-        set_tests_properties(${basename} PROPERTIES RUN_SERIAL TRUE)
+        set_tests_properties(${basename} PROPERTIES RUN_SERIAL TRUE
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename})
     else ()
-        gtest_discover_tests(${basename} ${basename} DISCOVERY_TIMEOUT 600 PROPERTIES RUN_SERIAL
-                TRUE LABELS "${basename}")
+        gtest_discover_tests(${basename} ${basename} DISCOVERY_TIMEOUT 600
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wd_${basename}
+                PROPERTIES RUN_SERIAL TRUE LABELS "${basename}")
     endif ()
 endfunction()
 
