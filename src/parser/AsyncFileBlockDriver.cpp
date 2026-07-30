@@ -22,10 +22,11 @@ AsyncFileBlockDriver::AsyncFileBlockDriver(
     AsyncStatementBoundaryBlockSource::EndPositionFinder findEndPosition,
     std::string description) {
   fileBuffer_ = std::make_unique<AsyncStatementBoundaryBlockSource>(
-      ioPool_.get_executor(),
-      spec.makeAsyncBlockSource(ioPool_.get_executor(), blocksize),
+      ioContext_.get_executor(),
+      spec.makeAsyncBlockSource(ioContext_.get_executor(), blocksize),
       std::move(findEndPosition), std::move(description));
   pendingBlock_ = fileBuffer_->asyncGetNextBlock(boost::asio::use_future);
+  ioThread_ = ad_utility::JThread{[this] { ioContext_.run(); }};
 }
 
 // ____________________________________________________________________________
@@ -34,9 +35,10 @@ AsyncFileBlockDriver::~AsyncFileBlockDriver() {
   if (pendingBlock_.valid()) {
     pendingBlock_.wait();
   }
-  // Additionally make sure that `fileBuffer_` is no longer used before it is
-  // destroyed.
-  ioPool_.join();
+  workGuard_.reset();
+  if (ioThread_.joinable()) {
+    ioThread_.join();
+  }
 }
 
 // ____________________________________________________________________________

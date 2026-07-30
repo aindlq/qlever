@@ -10,7 +10,8 @@
 #ifndef QLEVER_SRC_PARSER_ASYNCFILEBLOCKDRIVER_H
 #define QLEVER_SRC_PARSER_ASYNCFILEBLOCKDRIVER_H
 
-#include <boost/asio/thread_pool.hpp>
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/io_context.hpp>
 #include <future>
 #include <memory>
 #include <optional>
@@ -20,6 +21,7 @@
 #include "index/InputFileSpecification.h"
 #include "parser/AsyncBlockSource.h"
 #include "util/MemorySize/MemorySize.h"
+#include "util/jthread.h"
 
 namespace qlever::parser {
 
@@ -27,7 +29,7 @@ namespace qlever::parser {
 // while the rest of the index builder pipeline is not yet migrated to
 // Boost::Asio. It internally holds a
 // `unique_ptr<AsyncStatementBoundaryBlockSource>` and schedules it on a thread
-// pool with a single thread. The public interface is a synchronous
+// dedicated I/O thread. The public interface is a synchronous
 // `getNextBlock()` function, the asynchronous prefetching of the next block is
 // purely internal.
 class AsyncFileBlockDriver {
@@ -51,9 +53,11 @@ class AsyncFileBlockDriver {
   ~AsyncFileBlockDriver();
 
  private:
-  // `ioPool_` is declared before `fileBuffer_` so that the I/O thread outlives
-  // the source it drives.
-  boost::asio::thread_pool ioPool_{1};
+  // The execution members must outlive the source that holds their executors.
+  boost::asio::io_context ioContext_;
+  boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
+      workGuard_{ioContext_.get_executor()};
+  ad_utility::JThread ioThread_;
   std::unique_ptr<AsyncBlockSource> fileBuffer_;
   std::future<std::optional<ByteBlock>> pendingBlock_;
 };
